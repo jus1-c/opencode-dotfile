@@ -149,7 +149,7 @@ def healthcheck():
     # Sync mirror (documented unavoidable external integration)
     sync_mirror(source)
 
-    if PYEXE:
+    if PYEXE and MIRROR_WIN:
         # Re-install editable into Windows env (deps may have changed)
         subprocess.run(
             [PYEXE, "-m", "pip", "install", "-e", MIRROR_WIN],

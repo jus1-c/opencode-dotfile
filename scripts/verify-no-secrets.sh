@@ -5,6 +5,12 @@ set -euo pipefail
 
 PATTERNS=(
   'sk-[A-Za-z0-9]{16,}'
+  'sk-ant-[A-Za-z0-9_-]{8,}'
+  'sk-proj-[A-Za-z0-9_-]{8,}'
+  'ghp_[A-Za-z0-9]{8,}'
+  'github_pat_[A-Za-z0-9_]{8,}'
+  'xox[baprs]-[A-Za-z0-9-]{8,}'
+  'AKIA[A-Z0-9]{12,}'
   'ctx7sk-[a-z0-9-]{8,}'
   'as_sk_[a-z0-9]{8,}'
   '/home/[a-z0-9]+/'

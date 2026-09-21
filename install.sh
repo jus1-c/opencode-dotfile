@@ -35,6 +35,16 @@ fi
 
 sed "s|__HOME__|$HOME|g" "$REPO/component-updater/components.json.tmpl" \
   > "$DEST/component-updater/components.json"
+FRIDA_ON=false
+[[ -n "${FRIDA_PYTHON:-}" ]] && FRIDA_ON=true
+FRIDA_ON="$FRIDA_ON" python3 - "$DEST/opencode.json" <<'PYEOF'
+import json, os, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+cfg["mcp"]["frida-game-hacking"]["enabled"] = os.environ["FRIDA_ON"] == "true"
+json.dump(cfg, open(p, "w"), indent=2)
+PYEOF
+echo "frida-game-hacking enabled=$FRIDA_ON (FRIDA_PYTHON ${FRIDA_PYTHON:+set})"
 echo "rendered components.json"
 
 if [[ ! -f "$DEST/secrets.env" ]]; then
@@ -46,10 +56,14 @@ fi
 
 echo "npm deps ..."
 (cd "$REPO" && npm install --silent)
-for c in goal opencode-dir opencode-md-table-formatter ponytail; do
+for c in goal opencode-dir opencode-md-table-formatter opencode-pty ponytail llmgate-provider; do
   (cd "$REPO/plugins/$c" && npm ci --silent)
 done
 (cd "$REPO/mcps/cloakbrowser/runtime" && npm ci --silent)
+
+if ! uv tool list 2>/dev/null | grep -q '^headroom-ai '; then
+  uv tool install headroom-ai || echo "WARN: uv tool install headroom-ai failed; headroom-memory MCP disabled until installed"
+fi
 
 echo "python MCP venvs ..."
 for d in "$REPO"/mcps/*/; do

@@ -23,3 +23,4 @@ mcps/.component-updater-stage-*/
 mcps/frida-game-hacking/source/
 mcps/ghidra-mcp/source/
 component-updater/components.json
+.caveman-mode-log.jsonl

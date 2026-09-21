@@ -20,3 +20,5 @@ mcps/.component-updater-stage-*/
 
 # sdd scratch
 .superpowers/
+mcps/frida-game-hacking/source/
+mcps/ghidra-mcp/source/

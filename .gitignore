@@ -22,3 +22,4 @@ mcps/.component-updater-stage-*/
 .superpowers/
 mcps/frida-game-hacking/source/
 mcps/ghidra-mcp/source/
+component-updater/components.json

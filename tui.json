@@ -1,9 +1,9 @@
 {
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
-    "file:///home/c/.config/opencode/plugins/quota",
-    "file:///home/c/.config/opencode/plugins/goal/node_modules/@prevalentware/opencode-goal-plugin",
-    "file:///home/c/.config/opencode/plugins/opencode-component-updater",
-    "file:///home/c/.config/opencode/plugins/vilao-provider"
+    "file://{env:HOME}/.config/opencode/plugins/quota",
+    "file://{env:HOME}/.config/opencode/plugins/goal/node_modules/@prevalentware/opencode-goal-plugin",
+    "file://{env:HOME}/.config/opencode/plugins/opencode-component-updater",
+    "file://{env:HOME}/.config/opencode/plugins/vilao-provider"
   ]
 }

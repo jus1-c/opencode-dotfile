@@ -1,0 +1,517 @@
+{
+  "schemaVersion": 2,
+  "defaults": {
+    "checkIntervalHours": 24,
+    "checkTimeoutMs": 60000,
+    "updateTimeoutMs": 1800000,
+    "maxOutputBytes": 65536
+  },
+  "components": {
+    "mcp.anysearch": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "anysearch",
+      "enabled": false,
+      "source": {},
+      "policy": {
+        "apply": "manual",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "mcp.cloakbrowser": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "cloakbrowser",
+      "target": "__HOME__/.config/opencode/mcps/cloakbrowser",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "mcp.codegraph": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "codegraph",
+      "target": "__HOME__/.config/opencode/mcps/codegraph",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "mcp.context7": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "context7",
+      "enabled": false,
+      "source": {},
+      "policy": {
+        "apply": "manual",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "mcp.disk-forensics": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "disk-forensics",
+      "target": "__HOME__/.config/opencode/mcps/disk-forensics",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "mcp.forensics-utils": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "forensics-utils",
+      "target": "__HOME__/.config/opencode/mcps/forensics-utils",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "mcp.frida-game-hacking": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "frida-game-hacking",
+      "target": "__HOME__/.config/opencode/mcps/frida-game-hacking",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "mcp.ghidra-mcp": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "ghidra-mcp",
+      "target": "__HOME__/.config/opencode/mcps/ghidra-mcp",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "mcp.headroom-ctl": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "headroom-ctl",
+      "target": "__HOME__/.config/opencode/mcps/headroom-ctl",
+      "enabled": false,
+      "source": {},
+      "policy": {
+        "apply": "manual",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "mcp.headroom-memory": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "headroom-memory",
+      "target": null,
+      "enabled": false,
+      "source": {},
+      "policy": {
+        "apply": "manual",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "mcp.log-analyzer": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "log-analyzer",
+      "target": "__HOME__/.config/opencode/mcps/log-analyzer",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "mcp.markitdown": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "markitdown",
+      "target": "__HOME__/.config/opencode/mcps/markitdown",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "mcp.mem-forensics": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "mem-forensics",
+      "target": "__HOME__/.config/opencode/mcps/mem-forensics",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "mcp.network-forensics": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "network-forensics",
+      "target": "__HOME__/.config/opencode/mcps/network-forensics",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "mcp.windows-forensics": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "windows-forensics",
+      "target": "__HOME__/.config/opencode/mcps/windows-forensics",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "plugin.caveman": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "caveman",
+      "target": "__HOME__/.config/opencode/plugins/caveman",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "plugin.goal": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "goal",
+      "target": "__HOME__/.config/opencode/plugins/goal",
+      "enabled": true,
+      "source": {
+        "type": "npm",
+        "name": "@prevalentware/opencode-goal-plugin"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "plugin.headroom": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "headroom",
+      "target": "__HOME__/.config/opencode/plugins/headroom",
+      "enabled": true,
+      "source": {
+        "mode": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse",
+        "allowedPaths": [
+          "dist",
+          "hook-shim",
+          "VERSION",
+          "component-updater"
+        ]
+      },
+      "check": {
+        "command": [
+          "__HOME__/.config/opencode/plugins/headroom/component-updater",
+          "check"
+        ]
+      },
+      "update": {
+        "command": [
+          "__HOME__/.config/opencode/plugins/headroom/component-updater",
+          "update"
+        ],
+        "healthcheck": [
+          "__HOME__/.config/opencode/plugins/headroom/component-updater",
+          "healthcheck"
+        ]
+      }
+    },
+    "plugin.headroom-ctl": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "headroom-ctl",
+      "target": "__HOME__/.config/opencode/plugins/headroom-ctl",
+      "enabled": false,
+      "source": {},
+      "policy": {
+        "apply": "manual",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "plugin.llmgate-provider": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "llmgate-provider",
+      "target": "__HOME__/.config/opencode/plugins/llmgate-provider",
+      "enabled": false,
+      "source": {},
+      "policy": {
+        "apply": "manual",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "plugin.opencode-component-updater": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "opencode-component-updater",
+      "target": "__HOME__/.config/opencode/plugins/opencode-component-updater",
+      "enabled": false,
+      "source": {},
+      "policy": {
+        "apply": "manual",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "plugin.opencode-dir": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "opencode-dir",
+      "target": "__HOME__/.config/opencode/plugins/opencode-dir",
+      "enabled": true,
+      "source": {
+        "type": "npm",
+        "name": "opencode-dir"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "plugin.opencode-md-table-formatter": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "opencode-md-table-formatter",
+      "target": "__HOME__/.config/opencode/plugins/opencode-md-table-formatter",
+      "enabled": true,
+      "source": {
+        "type": "npm",
+        "name": "@franlol/opencode-md-table-formatter"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "plugin.opencode-pty": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "opencode-pty",
+      "target": "__HOME__/.config/opencode/plugins/opencode-pty",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "plugin.ponytail": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "ponytail",
+      "target": "__HOME__/.config/opencode/plugins/ponytail",
+      "enabled": true,
+      "source": {
+        "type": "npm",
+        "name": "@dietrichgebert/ponytail"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "plugin.quota": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "quota",
+      "target": "__HOME__/.config/opencode/plugins/quota",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "plugin.rtk": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "rtk",
+      "target": "__HOME__/.config/opencode/plugins/rtk",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "plugin.superpowers": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "superpowers",
+      "target": "__HOME__/.config/opencode/plugins/superpowers",
+      "enabled": true,
+      "source": {
+        "mode": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse",
+        "allowedPaths": [
+          "package.json",
+          "skills",
+          ".opencode",
+          ".component-updater-provenance.json"
+        ]
+      },
+      "check": {
+        "command": [
+          "__HOME__/.config/opencode/plugins/superpowers/component-updater",
+          "check"
+        ]
+      },
+      "update": {
+        "command": [
+          "__HOME__/.config/opencode/plugins/superpowers/component-updater",
+          "update"
+        ],
+        "healthcheck": [
+          "__HOME__/.config/opencode/plugins/superpowers/component-updater",
+          "healthcheck"
+        ]
+      }
+    },
+    "plugin.taste-skill": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "taste-skill",
+      "target": "__HOME__/.config/opencode/plugins/taste-skill",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "plugin.vilao-provider": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "vilao-provider",
+      "target": "__HOME__/.config/opencode/plugins/vilao-provider",
+      "enabled": false,
+      "source": {},
+      "policy": {
+        "apply": "manual",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    }
+  }
+}

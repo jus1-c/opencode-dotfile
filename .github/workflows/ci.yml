@@ -1,0 +1,14 @@
+name: verify
+on: [push, pull_request]
+jobs:
+  secrets-and-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with: { install: false }
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+      - run: ./scripts/verify-no-secrets.sh
+      - run: bash -n install.sh && bash -n scripts/verify-no-secrets.sh
+      - run: python3 -m json.tool opencode.json > /dev/null && python3 -m json.tool tui.json > /dev/null && python3 -m json.tool component-updater/components.json.tmpl > /dev/null
+      - run: for f in mcps/*/component-updater; do python3 -m py_compile "$f"; done

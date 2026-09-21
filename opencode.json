@@ -112,7 +112,7 @@
         "-m",
         "frida_game_hacking_mcp"
       ],
-      "enabled": true,
+      "enabled": false,
       "timeout": 300000
     },
     "headroom-memory": {

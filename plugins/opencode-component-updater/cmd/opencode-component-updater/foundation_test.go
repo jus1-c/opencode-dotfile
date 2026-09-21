@@ -53,7 +53,7 @@ func TestCheckPreservesLastGoodAfterFailure(t *testing.T) {
 }
 
 func TestOpenCodeProcessClassification(t *testing.T) {
-	if !isOpenCodeProcess("/home/c/.opencode/bin/opencode", "other", true) {
+	if !isOpenCodeProcess("/opt/tester/.opencode/bin/opencode", "other", true) {
 		t.Fatal("expected exact executable name to match")
 	}
 	if isOpenCodeProcess("/usr/bin/not-opencode", "opencode", true) {

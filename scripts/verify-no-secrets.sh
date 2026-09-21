@@ -10,7 +10,6 @@ PATTERNS=(
   '/home/[a-z0-9]+/'
   '/mnt/c/Users/[A-Za-z]+'
   'home_ts'
-  'jus1-c'
   'Administrator'
   '--user "?c"?'
 )

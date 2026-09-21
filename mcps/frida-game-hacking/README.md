@@ -10,7 +10,7 @@ WSL (OpenCode stdio) ──WSL interop──▶ Windows Python 3.12 ──Frida�
 ```
 
 - **WSL**: `mcps/frida-game-hacking/source/` (canonical Git repo)
-- **Windows mirror**: `C:\Users\Administrator\AppData\Local\FridaMCP\` (no .git, editable pip install)
+- **Windows mirror**: `C:\Users\<you>\AppData\Local\FridaMCP\` (no .git, editable pip install)
 - **Windows Python**: Scoop `python312` (3.12.10) — frida 17.17.0, mcp 1.30.0
 
 ## Dependencies

@@ -5,7 +5,7 @@ import { get } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const HEADROOM_BIN = "/home/c/.local/bin/headroom";
+const HEADROOM_BIN = process.env.HEADROOM_BIN || join(homedir(), ".local", "bin", "headroom");
 const PROXY_URL = process.env.HEADROOM_PROXY_URL || "http://127.0.0.1:8787";
 const PORT = new URL(PROXY_URL).port || "8787";
 
@@ -20,7 +20,7 @@ const HEALTH_TIMEOUT_MS = 60_000;
 const POLL_MS = 250;
 const DEBUG = process.env.HEADROOM_CTL_DEBUG === "1";
 const DASH_URL = "http://127.0.0.1:8788";
-const DASH_SCRIPT = "/home/c/.config/opencode/mcps/headroom-ctl/dashboard.py";
+const DASH_SCRIPT = join(homedir(), ".config", "opencode", "mcps", "headroom-ctl", "dashboard.py");
 
 function log(...args: unknown[]): void {
   if (DEBUG) console.error("[headroom-ctl]", ...args);

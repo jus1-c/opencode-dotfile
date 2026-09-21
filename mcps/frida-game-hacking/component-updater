@@ -17,9 +17,11 @@ from pathlib import Path
 
 TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
 REMOTE = "https://github.com/jus1-c/frida-game-hacking-mcp.git"
-MIRROR = Path("/mnt/c/Users/Administrator/AppData/Local/FridaMCP")
-MIRROR_WIN = r"C:\Users\Administrator\AppData\Local\FridaMCP"
-PYEXE = "/mnt/c/Users/Administrator/scoop/apps/python312/current/python.exe"
+# Windows-mirror integration (WSL only). Set FRIDA_MIRROR / FRIDA_MIRROR_WIN /
+# FRIDA_PYTHON in secrets.env to enable; otherwise the mirror steps are skipped.
+MIRROR = Path(os.environ["FRIDA_MIRROR"]) if os.environ.get("FRIDA_MIRROR") else None
+MIRROR_WIN = os.environ.get("FRIDA_MIRROR_WIN", "")
+PYEXE = os.environ.get("FRIDA_PYTHON", "")
 
 
 def output(*command, cwd=None):
@@ -30,7 +32,7 @@ def output(*command, cwd=None):
 
 def mirror_matches(source):
     """Check mirror files match source (excluding .git), by relative path."""
-    if not MIRROR.is_dir():
+    if MIRROR is None or not MIRROR.is_dir():
         return False
 
     def rel_files(root):
@@ -55,6 +57,8 @@ def mirror_matches(source):
 
 def sync_mirror(source):
     """Replace mirror contents with source (no .git)."""
+    if MIRROR is None:
+        return
     MIRROR.mkdir(parents=True, exist_ok=True)
     for path in MIRROR.iterdir():
         if path.is_dir():
@@ -145,17 +149,17 @@ def healthcheck():
     # Sync mirror (documented unavoidable external integration)
     sync_mirror(source)
 
-    # Re-install editable into Windows env (deps may have changed)
-    subprocess.run(
-        [PYEXE, "-m", "pip", "install", "-e", MIRROR_WIN],
-        check=True,
-    )
-
-    # Verify import on Windows
-    subprocess.run(
-        [PYEXE, "-c", "import frida_game_hacking_mcp"],
-        check=True,
-    )
+    if PYEXE:
+        # Re-install editable into Windows env (deps may have changed)
+        subprocess.run(
+            [PYEXE, "-m", "pip", "install", "-e", MIRROR_WIN],
+            check=True,
+        )
+        # Verify import on Windows
+        subprocess.run(
+            [PYEXE, "-c", "import frida_game_hacking_mcp"],
+            check=True,
+        )
 
 
 def main():

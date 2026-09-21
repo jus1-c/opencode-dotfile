@@ -86,7 +86,7 @@ Keep direct requirements in `requirements.in` and reproducible resolved requirem
 {
   "type": "local",
   "command": [
-    "/home/c/.config/opencode/mcps/example/.venv/bin/example-mcp"
+    "~/.config/opencode/mcps/example/.venv/bin/example-mcp"
   ],
   "enabled": true
 }
@@ -107,7 +107,7 @@ For a remote endpoint, use `type: "remote"`, its URL, and `{env:VAR}` for any ne
 ## Plugin Rules
 
 1. Put local source, `package.json`, lockfile, `node_modules/`, config, and build output under `plugins/<name>/`.
-2. Add local plugins to `opencode.json` with an absolute `file:///home/c/.config/opencode/plugins/...` target. Use a directory target when it has `package.json`; use its explicit entry file otherwise.
+2. Add local plugins to `opencode.json` with an absolute `file://~/.config/opencode/plugins/...` target. Use a directory target when it has `package.json`; use its explicit entry file otherwise.
 3. Add a plugin to `tui.json` only when it exports a TUI plugin and needs TUI loading. Keep its server entry in `opencode.json` when it also has server hooks.
 4. For a published npm plugin, prefer an isolated `plugins/<name>/` owner containing `package.json`, lockfile, and `node_modules`, load its package through an absolute `file://` target, and register its npm source with `opencode-component-updater`.
 5. Use an exact npm spec such as `@scope/package@x.y.z` only when local updater ownership is not supported or the user explicitly chooses OpenCode cache ownership. Never use a bare package or `@latest` by default.

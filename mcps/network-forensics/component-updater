@@ -7,7 +7,7 @@ import subprocess
 import sys
 import urllib.parse
 
-UV = "/home/c/.local/bin/uv"
+UV = os.path.expanduser("~/.local/bin/uv")
 
 
 def fail(message):

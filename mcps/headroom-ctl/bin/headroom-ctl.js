@@ -7,7 +7,7 @@ const http = require("http");
 const os = require("os");
 const path = require("path");
 
-const HEADROOM_BIN = "/home/c/.local/bin/headroom";
+const HEADROOM_BIN = process.env.HEADROOM_BIN || path.join(os.homedir(), ".local", "bin", "headroom");
 const PROXY_URL = process.env.HEADROOM_PROXY_URL || "http://127.0.0.1:8787";
 const PORT = new URL(PROXY_URL).port || "8787";
 

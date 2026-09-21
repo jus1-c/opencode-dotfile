@@ -12,7 +12,7 @@ PACKAGE = "codesdevs-log-analyzer"
 MODULE = "codesdevs_log_analyzer"
 ENTRY_POINT = ("codesdevs-log-analyzer", "codesdevs_log_analyzer.cli:main")
 PYTHON = "/usr/sbin/python3.14"
-UV = "/home/c/.local/bin/uv"
+UV = os.path.expanduser("~/.local/bin/uv")
 
 
 def fail(message):

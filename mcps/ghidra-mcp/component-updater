@@ -247,7 +247,7 @@ def update():
 
     staged_venv = staged_runtime / ".venv"
     if not staged_venv.exists():
-        uv = shutil.which("uv") or "/home/c/.local/bin/uv"
+        uv = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv")
         r = run([uv, "venv", str(staged_venv)], java_home=staged_jdk, maven_home=staged_maven)
         if r.returncode != 0:
             fail(f"uv venv failed: {r.stderr}")

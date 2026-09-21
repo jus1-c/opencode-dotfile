@@ -1,0 +1,168 @@
+#!/usr/sbin/python3.14
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import urllib.request
+import zipfile
+
+TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
+PACKAGE = "headroom-ai"
+PYPI_JSON = f"https://pypi.org/pypi/{PACKAGE}/json"
+ENTRY_IN_WHEEL = "headroom/providers/opencode/_dist/entry.opencode.js"
+SHIM_IN_WHEEL = "headroom/providers/opencode/hook-shim/handler.js"
+MANAGED_PATHS = ["dist", "hook-shim", "VERSION", "component-updater"]
+SEMVER = re.compile(r"\d+\.\d+\.\d+")
+INTEGRITY = re.compile(r"(sha256|sha384|sha512)-([A-Za-z0-9+/]+={0,2})")
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+def run(*command, cwd=None):
+    subprocess.run(command, cwd=cwd, check=True)
+
+
+def sri(algorithm, digest_bytes):
+    return f"{algorithm}-{base64.b64encode(digest_bytes).decode()}"
+
+
+def current_version(root):
+    version = (root / "VERSION").read_text().strip()
+    if not SEMVER.fullmatch(version):
+        fail("VERSION is not exact semver")
+    return version
+
+
+def wheel_for(release):
+    wheels = [
+        item
+        for item in release
+        if item.get("packagetype") == "bdist_wheel" and item.get("digests", {}).get("sha256")
+    ]
+    machine = platform.machine()
+    preferred = next(
+        (item for item in wheels if "manylinux" in item["filename"] and machine in item["filename"]),
+        None,
+    )
+    if preferred is None:
+        preferred = next((item for item in wheels if "manylinux" in item["filename"]), None)
+    if preferred is None and wheels:
+        preferred = wheels[0]
+    if preferred is None:
+        fail("no wheel with sha256 digest published")
+    return preferred
+
+
+def check():
+    current = current_version(TARGET)
+    with urllib.request.urlopen(PYPI_JSON, timeout=60) as response:
+        metadata = json.load(response)
+    latest = metadata["info"]["version"]
+    if not SEMVER.fullmatch(latest):
+        fail("PyPI metadata has no exact version")
+    if current == latest:
+        result = {
+            "schemaVersion": 1,
+            "status": "current",
+            "current": current,
+            "latest": latest,
+            "summary": current,
+        }
+    else:
+        wheel = wheel_for(metadata["releases"][latest])
+        digest = bytes.fromhex(wheel["digests"]["sha256"])
+        result = {
+            "schemaVersion": 1,
+            "status": "update-available",
+            "current": current,
+            "latest": latest,
+            "summary": f"{current} -> {latest}",
+            "artifact": {
+                "url": wheel["url"],
+                "integrity": sri("sha256", digest),
+            },
+        }
+    Path(os.environ["OPENCODE_UPDATER_CHECK_RESULT"]).write_text(json.dumps(result) + "\n")
+
+
+def update():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    latest = os.environ["OPENCODE_UPDATER_LATEST"]
+    if not SEMVER.fullmatch(latest):
+        fail("OPENCODE_UPDATER_LATEST is not exact semver")
+    match = INTEGRITY.fullmatch(os.environ["OPENCODE_UPDATER_ARTIFACT_INTEGRITY"])
+    if match is None:
+        fail("artifact integrity must be sha256/sha384/sha512 base64")
+    algorithm, expected = match.group(1), match.group(2)
+
+    with urllib.request.urlopen(os.environ["OPENCODE_UPDATER_ARTIFACT_URL"], timeout=300) as response:
+        wheel_bytes = response.read()
+    if sri(algorithm, hashlib.new(algorithm, wheel_bytes).digest()) != f"{algorithm}-{expected}":
+        fail("artifact digest mismatch")
+
+    archive = stage / "headroom-ai.whl"
+    archive.write_bytes(wheel_bytes)
+    with zipfile.ZipFile(archive) as wheel:
+        for source, destination in (
+            (ENTRY_IN_WHEEL, "dist/entry.opencode.js"),
+            (SHIM_IN_WHEEL, "hook-shim/handler.js"),
+        ):
+            if source not in wheel.namelist():
+                fail(f"wheel is missing {source}")
+            target = stage / destination
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(wheel.read(source))
+    archive.unlink()
+
+    (stage / "VERSION").write_text(f"{latest}\n")
+    shutil.copy2(Path(__file__), stage / "component-updater")
+    (stage / "component-updater").chmod(0o755)
+
+    manifest = {
+        "schemaVersion": 2,
+        "planSha256": os.environ["OPENCODE_UPDATER_PLAN_SHA256"],
+        "paths": MANAGED_PATHS,
+    }
+    Path(os.environ["OPENCODE_UPDATER_MANIFEST"]).write_text(json.dumps(manifest) + "\n")
+
+
+def healthcheck():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    expected = os.environ["OPENCODE_UPDATER_LATEST"]
+    staged = (stage / "VERSION").read_text().strip()
+    if staged != expected:
+        fail(f"staged VERSION {staged} does not match plan {expected}")
+
+    entry = stage / "dist/entry.opencode.js"
+    shim = stage / "hook-shim/handler.js"
+    if not entry.is_file() or entry.stat().st_size == 0:
+        fail("staged dist/entry.opencode.js is missing")
+    if not shim.is_file() or shim.stat().st_size == 0:
+        fail("staged hook-shim/handler.js is missing")
+    if not (stage / "component-updater").is_file():
+        fail("staged component-updater is missing")
+
+    probe = (
+        f"import({json.dumps(str(entry))}).then("
+        "m=>process.exit(typeof m.default==='function'?0:2)).catch(()=>process.exit(3))"
+    )
+    run("node", "--input-type=module", "-e", probe)
+
+
+def main():
+    actions = {"check": check, "update": update, "healthcheck": healthcheck}
+    if len(sys.argv) != 2 or sys.argv[1] not in actions:
+        fail("usage: component-updater check|update|healthcheck")
+    actions[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()

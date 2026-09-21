@@ -1,0 +1,22 @@
+# secrets / machine-local
+secrets.env
+*.bak
+.caveman-active
+
+# generated
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# heavy runtime (installed by install.sh / component-updater)
+mcps/ghidra-mcp/ghidra-releases/
+mcps/ghidra-mcp/runtime/
+mcps/ghidra-mcp/ghidra
+mcps/ghidra-mcp/source/target/
+mcps/ghidra-mcp/source/logs/
+mcps/cloakbrowser/runtime/node_modules/
+mcps/.component-updater-stage-*/
+
+# sdd scratch
+.superpowers/

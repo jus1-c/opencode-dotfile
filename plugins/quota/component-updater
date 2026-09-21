@@ -1,0 +1,83 @@
+#!/usr/sbin/python3.14
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
+REMOTE = "https://github.com/jus1-c/opencode-quota.git"
+
+
+def output(*command, cwd=None):
+    return subprocess.check_output([str(value) for value in command], cwd=cwd, text=True).strip()
+
+
+def check():
+    current = json.loads((TARGET / ".component-updater-provenance.json").read_text())["commit"]
+    latest = output("git", "ls-remote", REMOTE, "HEAD").split()[0]
+    result = {
+        "schemaVersion": 1,
+        "status": "current" if current == latest else "update-available",
+        "current": current,
+        "latest": latest,
+        "summary": current if current == latest else f"{current} -> HEAD ({latest})",
+        "sourceCommit": latest,
+    }
+    Path(os.environ["OPENCODE_UPDATER_CHECK_RESULT"]).write_text(json.dumps(result) + "\n")
+
+
+def update():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    latest = os.environ["OPENCODE_UPDATER_LATEST"]
+    source = stage / "source"
+    subprocess.run(["git", "init", "--quiet", source], check=True)
+    subprocess.run(["git", "-C", source, "remote", "add", "origin", REMOTE], check=True)
+    subprocess.run(["git", "-C", source, "fetch", "--quiet", "--depth", "1", "origin", latest], check=True)
+    subprocess.run(["git", "-C", source, "checkout", "--quiet", "--detach", "FETCH_HEAD"], check=True)
+    subprocess.run(["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false"], cwd=source, check=True)
+    subprocess.run(["npm", "run", "build"], cwd=source, check=True)
+    for name in ["package.json", "README.md", "LICENSE", "dist"]:
+        shutil.move(source / name, stage / name)
+    package = json.loads((stage / "package.json").read_text())
+    plugin_version = package["devDependencies"].pop("@opencode-ai/plugin")
+    package.setdefault("dependencies", {})["@opencode-ai/plugin"] = plugin_version
+    (stage / "package.json").write_text(json.dumps(package, indent=2) + "\n")
+    subprocess.run([
+        "npm", "install", "--ignore-scripts", "--omit=dev", "--no-bin-links",
+        "--no-audit", "--no-fund", "--package-lock=false",
+    ], cwd=stage, check=True)
+    shutil.rmtree(stage / "node_modules/.bin", ignore_errors=True)
+    shutil.rmtree(source)
+    provenance = {"schemaVersion": 1, "remote": REMOTE, "commit": latest}
+    (stage / ".component-updater-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    for path in stage.rglob("*"):
+        if path.is_symlink():
+            raise SystemExit(f"build created unsupported symlink: {path}")
+    manifest = {
+        "schemaVersion": 2,
+        "planSha256": os.environ["OPENCODE_UPDATER_PLAN_SHA256"],
+        "paths": ["package.json", "README.md", "LICENSE", "dist", "node_modules", ".component-updater-provenance.json"],
+    }
+    Path(os.environ["OPENCODE_UPDATER_MANIFEST"]).write_text(json.dumps(manifest) + "\n")
+
+
+def healthcheck():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    provenance = json.loads((stage / ".component-updater-provenance.json").read_text())
+    if provenance["remote"] != REMOTE or provenance["commit"] != os.environ["OPENCODE_UPDATER_LATEST"]:
+        raise SystemExit("staged Quota build does not match planned commit")
+    subprocess.run(["node", "-e", f"import({json.dumps((stage / 'dist/index.js').as_uri())})"], check=True)
+    subprocess.run(["node", "-e", f"import({json.dumps((stage / 'dist/tui.js').as_uri())})"], check=True)
+
+
+def main():
+    actions = {"check": check, "update": update, "healthcheck": healthcheck}
+    if len(sys.argv) != 2 or sys.argv[1] not in actions:
+        raise SystemExit("usage: component-updater check|update|healthcheck")
+    actions[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()

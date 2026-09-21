@@ -1,0 +1,98 @@
+#!/usr/sbin/python3.14
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.request
+
+TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
+RELEASE_API = "https://api.github.com/repos/rtk-ai/rtk/releases/latest"
+ASSET = "rtk-x86_64-unknown-linux-musl.tar.gz"
+
+
+def fetch_json(url):
+    request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "opencode-component-updater"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
+def current_version():
+    binary = TARGET / "bin/rtk"
+    return subprocess.check_output([binary if binary.is_file() else "rtk", "--version"], text=True).split()[1]
+
+
+def release():
+    data = fetch_json(RELEASE_API)
+    asset = next((item for item in data["assets"] if item["name"] == ASSET), None)
+    if not asset or not asset.get("digest", "").startswith("sha256:"):
+        raise SystemExit(f"release has no verified {ASSET} asset")
+    digest = bytes.fromhex(asset["digest"].split(":", 1)[1])
+    return data["tag_name"].lstrip("v"), asset["browser_download_url"], "sha256-" + base64.b64encode(digest).decode()
+
+
+def check():
+    current = current_version()
+    latest, url, integrity = release()
+    result = {
+        "schemaVersion": 1,
+        "status": "current" if current == latest else "update-available",
+        "current": current,
+        "latest": latest,
+        "summary": current if current == latest else f"{current} -> {latest}",
+        "artifact": {"url": url, "integrity": integrity},
+    }
+    Path(os.environ["OPENCODE_UPDATER_CHECK_RESULT"]).write_text(json.dumps(result) + "\n")
+
+
+def update():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    url = os.environ["OPENCODE_UPDATER_ARTIFACT_URL"]
+    algorithm, expected = os.environ["OPENCODE_UPDATER_ARTIFACT_INTEGRITY"].split("-", 1)
+    if algorithm != "sha256":
+        raise SystemExit("RTK artifact must use SHA-256")
+    with tempfile.TemporaryDirectory() as directory:
+        archive = Path(directory) / ASSET
+        with urllib.request.urlopen(url, timeout=60) as response, archive.open("wb") as output:
+            shutil.copyfileobj(response, output)
+        digest = base64.b64encode(hashlib.sha256(archive.read_bytes()).digest()).decode()
+        if digest != expected:
+            raise SystemExit("RTK artifact checksum mismatch")
+        with tarfile.open(archive, "r:gz") as bundle:
+            member = bundle.getmember("rtk")
+            if not member.isfile():
+                raise SystemExit("RTK release has no regular rtk binary")
+            binary = bundle.extractfile(member)
+            if binary is None:
+                raise SystemExit("cannot extract RTK binary")
+            (stage / "bin").mkdir()
+            (stage / "bin/rtk").write_bytes(binary.read())
+            (stage / "bin/rtk").chmod(0o755)
+    (stage / "plugin.ts").write_bytes((TARGET / "plugin.ts").read_bytes())
+    manifest = {"schemaVersion": 2, "planSha256": os.environ["OPENCODE_UPDATER_PLAN_SHA256"], "paths": ["bin", "plugin.ts"]}
+    Path(os.environ["OPENCODE_UPDATER_MANIFEST"]).write_text(json.dumps(manifest) + "\n")
+
+
+def healthcheck():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    version = subprocess.check_output([stage / "bin/rtk", "--version"], text=True).split()[1]
+    if version != os.environ["OPENCODE_UPDATER_LATEST"]:
+        raise SystemExit("staged RTK binary does not match planned version")
+    if (stage / "plugin.ts").read_bytes() != (TARGET / "plugin.ts").read_bytes():
+        raise SystemExit("staged RTK adapter changed")
+
+
+def main():
+    actions = {"check": check, "update": update, "healthcheck": healthcheck}
+    if len(sys.argv) != 2 or sys.argv[1] not in actions:
+        raise SystemExit("usage: component-updater check|update|healthcheck")
+    actions[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()

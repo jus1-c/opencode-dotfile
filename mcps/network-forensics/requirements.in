@@ -1,0 +1,2 @@
+mcp-network-forensics @ git+https://github.com/jus1-c/mcp-network-forensics.git@5ace8327ed9404f26b2ef9f1691c4a6403953db1
+mcp==1.29.0

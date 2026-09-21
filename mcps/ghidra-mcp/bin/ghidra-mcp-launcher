@@ -1,0 +1,41 @@
+#!/bin/bash
+set -euo pipefail
+
+COMPONENT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PID_FILE="${COMPONENT_DIR}/runtime/state/headless.pid"
+LOG_FILE="${COMPONENT_DIR}/runtime/logs/headless.log"
+HEALTH_URL="http://127.0.0.1:8089/check_connection"
+HEALTH_TIMEOUT=90
+
+is_running() {
+    [ -f "$PID_FILE" ] || return 1
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null) || return 1
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
+    rm -f "$PID_FILE"
+    return 1
+}
+
+wait_healthy() {
+    local elapsed=0
+    while [ $elapsed -lt $HEALTH_TIMEOUT ]; do
+        if curl -sf "$HEALTH_URL" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    return 1
+}
+
+if ! is_running; then
+    "${COMPONENT_DIR}/bin/start-headless"
+    if ! wait_healthy; then
+        echo "ghidra-mcp-launcher: headless server failed health check after ${HEALTH_TIMEOUT}s" >&2
+        "${COMPONENT_DIR}/bin/stop-headless" 2>/dev/null || true
+        exit 1
+    fi
+fi
+
+export GHIDRA_MCP_URL="http://127.0.0.1:8089"
+exec "${COMPONENT_DIR}/runtime/.venv/bin/bridge-mcp-ghidra" "$@"

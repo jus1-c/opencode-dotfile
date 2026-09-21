@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+
+TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
+REMOTE = "https://github.com/Leonxlnx/taste-skill.git"
+PROVENANCE = ".component-updater-provenance.json"
+MANAGED_PATHS = ["skills", PROVENANCE]
+
+
+def run(*command, cwd=None):
+    return subprocess.check_output([str(value) for value in command], cwd=cwd, text=True).strip()
+
+
+def head_commit():
+    return run("git", "ls-remote", REMOTE, "HEAD").split()[0]
+
+
+def provenance(root=TARGET):
+    path = root / PROVENANCE
+    return json.loads(path.read_text()) if path.is_file() else None
+
+
+def is_uninstalled_target():
+    return {path.name for path in TARGET.iterdir()} == {Path(__file__).name}
+
+
+def copy_safe_tree(source, destination):
+    info = source.lstat()
+    if stat.S_ISLNK(info.st_mode) or (not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode)):
+        raise SystemExit(f"unsupported source entry: {source}")
+    if stat.S_ISREG(info.st_mode):
+        if info.st_nlink > 1:
+            raise SystemExit(f"hardlinked source entry: {source}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        destination.chmod(stat.S_IMODE(info.st_mode))
+        return
+    destination.mkdir(parents=True, exist_ok=False)
+    destination.chmod(stat.S_IMODE(info.st_mode))
+    for child in sorted(source.iterdir(), key=lambda path: path.name):
+        copy_safe_tree(child, destination / child.name)
+
+
+def check():
+    commit = head_commit()
+    installed = provenance()
+    if installed is None:
+        if not is_uninstalled_target():
+            raise SystemExit("Taste-skill provenance is missing; refusing to replace unmanaged files")
+        current = "0" * 40
+        status = "update-available"
+        summary = "install latest"
+    else:
+        current = installed.get("commit")
+        if not isinstance(current, str) or len(current) != 40:
+            raise SystemExit("Taste-skill provenance has no commit")
+        status = "current" if current == commit else "update-available"
+        summary = current if status == "current" else (f"{current[:12]} -> {commit[:12]}")
+    result = {
+        "schemaVersion": 1,
+        "status": status,
+        "current": current,
+        "latest": commit,
+        "summary": summary,
+        "sourceCommit": commit,
+    }
+    Path(os.environ["OPENCODE_UPDATER_CHECK_RESULT"]).write_text(json.dumps(result) + "\n")
+
+
+def update():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    commit = os.environ["OPENCODE_UPDATER_SOURCE_COMMIT"]
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "source"
+        subprocess.run(["git", "init", "--quiet", source], check=True)
+        subprocess.run(["git", "-C", source, "remote", "add", "origin", REMOTE], check=True)
+        subprocess.run(["git", "-C", source, "fetch", "--quiet", "--depth", "1", "origin", commit], check=True)
+        subprocess.run(["git", "-C", source, "checkout", "--quiet", "--detach", "FETCH_HEAD"], check=True)
+        if run("git", "-C", source, "rev-parse", "HEAD") != commit:
+            raise SystemExit("checked out taste-skill commit does not match update plan")
+        copy_safe_tree(source / "skills", stage / "skills")
+    # OpenCode requires the skill folder name to match the frontmatter name.
+    # Upstream folders sometimes differ, so rename dynamically and verify.
+    for skill_dir in (stage / "skills").iterdir():
+        if not skill_dir.is_dir():
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.is_file():
+            raise SystemExit(f"missing SKILL.md in {skill_dir.name}")
+        fm_name = None
+        with open(skill_md) as f:
+            for line in f:
+                if line.startswith("name:"):
+                    fm_name = line.split(":", 1)[1].strip().strip("'\"")
+                    break
+        if not fm_name:
+            raise SystemExit(f"no frontmatter name in {skill_dir.name}")
+        if fm_name != skill_dir.name:
+            skill_dir.rename(stage / "skills" / fm_name)
+    for skill_dir in (stage / "skills").iterdir():
+        if not skill_dir.is_dir():
+            continue
+        fm_name = None
+        with open(skill_dir / "SKILL.md") as f:
+            for line in f:
+                if line.startswith("name:"):
+                    fm_name = line.split(":", 1)[1].strip().strip("'\"")
+                    break
+        if fm_name != skill_dir.name:
+            raise SystemExit(f"name mismatch in {skill_dir.name}: frontmatter says '{fm_name}'")
+    metadata = {
+        "schemaVersion": 1,
+        "remote": REMOTE,
+        "commit": commit,
+    }
+    (stage / PROVENANCE).write_text(json.dumps(metadata, indent=2) + "\n")
+    manifest = {
+        "schemaVersion": 2,
+        "planSha256": os.environ["OPENCODE_UPDATER_PLAN_SHA256"],
+        "paths": MANAGED_PATHS,
+    }
+    Path(os.environ["OPENCODE_UPDATER_MANIFEST"]).write_text(json.dumps(manifest) + "\n")
+
+
+def healthcheck():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    metadata = provenance(stage)
+    if metadata is None or metadata.get("commit") != os.environ["OPENCODE_UPDATER_SOURCE_COMMIT"]:
+        raise SystemExit("staged taste-skill payload does not match update plan")
+    if not (stage / "skills/design-taste-frontend/SKILL.md").is_file():
+        raise SystemExit("staged taste-skill SKILL.md is missing")
+    package = json.loads((TARGET / "package.json").read_text())
+    if package.get("name") != "taste-skill" or package.get("main") != ".opencode/plugins/taste-skill.js":
+        raise SystemExit("taste-skill package is invalid")
+    subprocess.run(["node", "--check", TARGET / ".opencode/plugins/taste-skill.js"], check=True)
+
+
+def main():
+    actions = {"check": check, "update": update, "healthcheck": healthcheck}
+    if len(sys.argv) != 2 or sys.argv[1] not in actions:
+        raise SystemExit("usage: component-updater check|update|healthcheck")
+    actions[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "models": {
+    "fa/kimi-k3": {
+      "name": "fa/kimi-k3",
+      "reasoning": true,
+      "tool_call": true,
+      "limit": {
+        "context": 1000000,
+        "output": 128000
+      }
+    },
+    "dd/glm-5.2": {
+      "name": "dd/glm-5.2",
+      "reasoning": true,
+      "tool_call": true,
+      "limit": {
+        "context": 1000000,
+        "output": 128000
+      }
+    },
+    "ccf/claude-opus-5": {
+      "name": "ccf/claude-opus-5",
+      "reasoning": true,
+      "tool_call": true,
+      "limit": {
+        "context": 980000,
+        "output": 128000
+      }
+    },
+    "14k/gpt-5.6-sol": {
+      "name": "14k/gpt-5.6-sol",
+      "reasoning": true,
+      "tool_call": true,
+      "limit": {
+        "context": 350000,
+        "output": 128000
+      }
+    },
+    "opt/gpt-5.6-sol": {
+      "name": "opt/gpt-5.6-sol",
+      "reasoning": true,
+      "tool_call": true,
+      "limit": {
+        "context": 350000,
+        "output": 128000
+      }
+    },
+    "clx/claude-opus-5": {
+      "limit": {
+        "context": 450000
+      }
+    },
+    "gate/gpt-5.6-sol": {
+      "limit": {
+        "context": 450000
+      }
+    },
+    "opa/cx/gpt-5.6-sol": {
+      "limit": {
+        "context": 350000
+      }
+    },
+    "sol/gpt-5.6-sol": {
+      "limit": {
+        "context": 350000
+      }
+    },
+    "mn/glm/glm-5.3": {
+      "limit": {
+        "context": 400000
+      }
+    },
+    "cna/kimi-k3": {
+      "limit": {
+        "context": 400000
+      }
+    }
+  }
+}

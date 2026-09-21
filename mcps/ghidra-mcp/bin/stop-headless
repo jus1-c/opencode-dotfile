@@ -1,0 +1,22 @@
+#!/bin/bash
+set -euo pipefail
+
+COMPONENT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PID_FILE="${COMPONENT_DIR}/runtime/state/headless.pid"
+
+[ -f "$PID_FILE" ] || exit 0
+
+pid=$(cat "$PID_FILE" 2>/dev/null) || { rm -f "$PID_FILE"; exit 0; }
+
+if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid"
+    for i in $(seq 1 10); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+fi
+
+rm -f "$PID_FILE"

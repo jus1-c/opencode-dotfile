@@ -1,0 +1,25 @@
+{
+  "name": "opencode-component-updater",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Staged OpenCode MCP and plugin updater.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jus1-c/opencode-component-updater.git"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./tui": "./index.js"
+  },
+  "oc-plugin": [
+    "tui"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check index.js && node --check src/json.js && node --check src/paths.js && node --check src/status.js && node --check src/tui.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

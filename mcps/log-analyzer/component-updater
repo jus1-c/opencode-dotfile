@@ -1,0 +1,148 @@
+#!/usr/sbin/python3.14
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import urllib.request
+
+TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
+PACKAGE = "codesdevs-log-analyzer"
+MODULE = "codesdevs_log_analyzer"
+ENTRY_POINT = ("codesdevs-log-analyzer", "codesdevs_log_analyzer.cli:main")
+PYTHON = "/usr/sbin/python3.14"
+UV = "/home/c/.local/bin/uv"
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+def run(*command, cwd=None):
+    subprocess.run(command, cwd=cwd, check=True)
+
+
+def current_version(root):
+    match = re.search(r"(?mi)^codesdevs-log-analyzer==([^\s]+)$", (root / "requirements.in").read_text())
+    if not match:
+        fail("requirements.in has no exact codesdevs-log-analyzer version")
+    version = match.group(1)
+    script = "import importlib.metadata as m; print(m.version('codesdevs-log-analyzer'))"
+    installed = subprocess.check_output([root / ".venv/bin/python", "-c", script], text=True).strip()
+    if installed != version:
+        fail(f"installed version {installed} does not match requirements.in {version}")
+    return version
+
+
+def check():
+    current = current_version(TARGET)
+    with urllib.request.urlopen(f"https://pypi.org/pypi/{PACKAGE}/json", timeout=60) as response:
+        latest = json.load(response)["info"]["version"]
+    result = {
+        "schemaVersion": 1,
+        "status": "current" if current == latest else "update-available",
+        "current": current,
+        "latest": latest,
+        "summary": current if current == latest else f"{current} -> {latest}",
+    }
+    Path(os.environ["OPENCODE_UPDATER_CHECK_RESULT"]).write_text(json.dumps(result) + "\n")
+
+
+def rewrite_shebangs(venv):
+    old = str(venv)
+    new = str(TARGET / ".venv")
+    for path in (venv / "bin").iterdir():
+        if not path.is_file() or path.is_symlink():
+            continue
+        contents = path.read_bytes()
+        if contents.startswith(b"#!"):
+            path.write_bytes(contents.replace(old.encode(), new.encode(), 1))
+
+
+def reject_links(root):
+    links = [str(path.relative_to(root)) for path in root.rglob("*") if path.is_symlink()]
+    if links:
+        fail("staged venv contains symbolic links: " + ", ".join(links))
+
+
+def update():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    latest = os.environ["OPENCODE_UPDATER_LATEST"]
+    requirements = (TARGET / "requirements.in").read_text()
+    requirements, count = re.subn(
+        r"(?mi)^codesdevs-log-analyzer==[^\s]+$",
+        f"codesdevs-log-analyzer=={latest}",
+        requirements,
+    )
+    if count != 1:
+        fail("expected one codesdevs-log-analyzer requirement")
+    (stage / "requirements.in").write_text(requirements)
+    run(
+        UV,
+        "pip",
+        "compile",
+        "--quiet",
+        "--python",
+        PYTHON,
+        "--generate-hashes",
+        "--output-file",
+        "requirements.lock",
+        "requirements.in",
+        cwd=stage,
+    )
+    run(PYTHON, "-m", "venv", "--copies", stage / ".venv")
+    (stage / ".venv/lib64").unlink(missing_ok=True)
+    run(
+        UV,
+        "pip",
+        "sync",
+        "--quiet",
+        "--require-hashes",
+        "--link-mode",
+        "copy",
+        "--python",
+        stage / ".venv/bin/python",
+        stage / "requirements.lock",
+    )
+    rewrite_shebangs(stage / ".venv")
+    reject_links(stage / ".venv")
+    manifest = {
+        "schemaVersion": 2,
+        "planSha256": os.environ["OPENCODE_UPDATER_PLAN_SHA256"],
+        "paths": ["requirements.in", "requirements.lock", ".venv"],
+    }
+    Path(os.environ["OPENCODE_UPDATER_MANIFEST"]).write_text(json.dumps(manifest) + "\n")
+
+
+def healthcheck():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    python = stage / ".venv/bin/python"
+    run(UV, "pip", "check", "--python", python)
+    expected = os.environ["OPENCODE_UPDATER_LATEST"]
+    script = (
+        "import importlib, importlib.metadata as m; "
+        f"importlib.import_module('{MODULE}'); "
+        f"d=m.distribution('{PACKAGE}'); "
+        f"assert d.version == '{expected}'; "
+        f"assert ('{ENTRY_POINT[0]}','{ENTRY_POINT[1]}') in "
+        "[(e.name,e.value) for e in d.entry_points if e.group=='console_scripts']"
+    )
+    run(python, "-c", script)
+    reject_links(stage / ".venv")
+    for path in (stage / ".venv/bin").iterdir():
+        if path.is_file() and path.read_bytes().startswith(b"#!"):
+            first = path.read_bytes().splitlines()[0]
+            if str(stage).encode() in first:
+                fail(f"staged shebang contains temporary path: {path.name}")
+
+
+def main():
+    actions = {"check": check, "update": update, "healthcheck": healthcheck}
+    if len(sys.argv) != 2 or sys.argv[1] not in actions:
+        fail("usage: component-updater check|update|healthcheck")
+    actions[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()

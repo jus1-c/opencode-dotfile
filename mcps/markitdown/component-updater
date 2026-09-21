@@ -1,0 +1,178 @@
+#!/usr/sbin/python3.14
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import urllib.parse
+
+UV = "/home/c/.local/bin/uv"
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+def run(*command, cwd=None):
+    subprocess.run([str(value) for value in command], cwd=cwd, check=True)
+
+
+def output(*command, cwd=None):
+    return subprocess.check_output([str(value) for value in command], cwd=cwd, text=True).strip()
+
+
+def requirement(root, distribution):
+    pattern = re.compile(
+        rf"(?mi)^({re.escape(distribution)}(?:\[[^]]+\])?\s*@\s*git\+https://[^\s@]+)@([0-9a-f]{{40}})([^\s]*)$"
+    )
+    match = pattern.search((root / "requirements.in").read_text())
+    if not match:
+        fail(f"requirements.in has no exact Git commit for {distribution}")
+    parsed = urllib.parse.urlsplit(match.group(1).split("git+", 1)[1])
+    remote = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    return pattern, match.group(2), remote
+
+
+def installed_commit(root, distribution):
+    script = (
+        "import importlib.metadata as m,json,pathlib; "
+        f"d=m.distribution({distribution!r}); "
+        "p=pathlib.Path(d._path)/'direct_url.json'; "
+        "print(json.loads(p.read_text())['vcs_info']['commit_id'])"
+    )
+    return output(root / ".venv/bin/python", "-c", script)
+
+
+def latest_head(remote):
+    fields = output("git", "ls-remote", remote, "HEAD").split()
+    if not fields or not re.fullmatch(r"[0-9a-f]{40}", fields[0]):
+        fail(f"cannot resolve Git HEAD for {remote}")
+    return fields[0]
+
+
+def check(config, target):
+    _, current, remote = requirement(target, config["distribution"])
+    installed = installed_commit(target, config["distribution"])
+    if installed != current:
+        fail(f"installed commit {installed} does not match requirements.in {current}")
+    latest = latest_head(remote)
+    result = {
+        "schemaVersion": 1,
+        "status": "current" if current == latest else "update-available",
+        "current": current,
+        "latest": latest,
+        "summary": current if current == latest else f"{current} -> HEAD ({latest})",
+    }
+    Path(os.environ["OPENCODE_UPDATER_CHECK_RESULT"]).write_text(json.dumps(result) + "\n")
+
+
+def rewrite_shebangs(venv, target):
+    old = str(venv).encode()
+    new = str(target / ".venv").encode()
+    for path in (venv / "bin").iterdir():
+        if not path.is_file() or path.is_symlink():
+            continue
+        contents = path.read_bytes()
+        if contents.startswith(b"#!"):
+            path.write_bytes(contents.replace(old, new, 1))
+
+
+def reject_links(root):
+    links = [str(path.relative_to(root)) for path in root.rglob("*") if path.is_symlink()]
+    if links:
+        fail("staged tree contains symbolic links: " + ", ".join(links))
+
+
+def update(config, target):
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    pattern, current, _ = requirement(target, config["distribution"])
+    latest = os.environ["OPENCODE_UPDATER_LATEST"]
+    requirements = (target / "requirements.in").read_text()
+    requirements, count = pattern.subn(lambda match: match.group(1) + "@" + latest + match.group(3), requirements)
+    if count != 1:
+        fail("expected one primary Git requirement")
+    (stage / "requirements.in").write_text(requirements)
+    python = config["python"]
+    run(
+        UV,
+        "pip",
+        "compile",
+        "--quiet",
+        "--python",
+        python,
+        "--generate-hashes",
+        "--output-file",
+        "requirements.lock",
+        "requirements.in",
+        cwd=stage,
+    )
+    run(python, "-m", "venv", "--copies", stage / ".venv")
+    (stage / ".venv/lib64").unlink(missing_ok=True)
+    run(
+        UV,
+        "pip",
+        "sync",
+        "--quiet",
+        "--link-mode",
+        "copy",
+        "--python",
+        stage / ".venv/bin/python",
+        stage / "requirements.lock",
+    )
+    if cache := config.get("preserve_tree"):
+        source = target / cache
+        destination = stage / cache
+        if source.exists():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            for item in source.parent.iterdir():
+                run("cp", "-a", item, destination.parent / item.name)
+    rewrite_shebangs(stage / ".venv", target)
+    reject_links(stage / ".venv")
+    manifest = {
+        "schemaVersion": 2,
+        "planSha256": os.environ["OPENCODE_UPDATER_PLAN_SHA256"],
+        "paths": ["requirements.in", "requirements.lock", ".venv"],
+    }
+    Path(os.environ["OPENCODE_UPDATER_MANIFEST"]).write_text(json.dumps(manifest) + "\n")
+
+
+def healthcheck(config, target):
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    python = stage / ".venv/bin/python"
+    run(UV, "pip", "check", "--python", python)
+    expected = os.environ["OPENCODE_UPDATER_LATEST"]
+    if installed_commit(stage, config["distribution"]) != expected:
+        fail("staged primary distribution commit does not match plan")
+    for module in config["modules"]:
+        run(python, "-c", f"import importlib; importlib.import_module({module!r})")
+    if cache := config.get("preserve_tree"):
+        root = stage / cache
+        provider = root.parent / "volatility3-provider.json"
+        if not root.is_dir() or not provider.is_file():
+            fail("preserved provider tree is missing")
+        expected = json.loads(provider.read_text()).get("commit")
+        if not expected or output("git", "rev-parse", "HEAD", cwd=root) != expected:
+            fail("preserved provider tree does not match provider metadata")
+    reject_links(stage / ".venv")
+    for path in (stage / ".venv/bin").iterdir():
+        if path.is_file() and path.read_bytes().startswith(b"#!"):
+            if str(stage).encode() in path.read_bytes().splitlines()[0]:
+                fail(f"staged shebang contains temporary path: {path.name}")
+
+
+CONFIG = {'distribution': 'markitdown-mcp', 'python': '/usr/sbin/python3.10', 'modules': ['markitdown_mcp', 'markitdown']}
+
+
+def main():
+    if len(sys.argv) != 2:
+        fail("usage: component-updater check|update|healthcheck")
+    target = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
+    actions = {"check": check, "update": update, "healthcheck": healthcheck}
+    if sys.argv[1] not in actions:
+        fail("unknown action")
+    actions[sys.argv[1]](CONFIG, target)
+
+
+if __name__ == "__main__":
+    main()

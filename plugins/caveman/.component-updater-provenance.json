@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "remote": "https://github.com/JuliusBrussee/caveman.git",
+  "version": "2.7.0",
+  "commit": "8b0c1d3699b8d83e87fe4605b378da20c41555e0",
+  "links": [
+    "commands/caveman-commit.md",
+    "commands/caveman-compress.md",
+    "commands/caveman-help.md",
+    "commands/caveman-review.md",
+    "commands/caveman-stats.md",
+    "commands/caveman.md",
+    "skills/cavecrew",
+    "skills/caveman",
+    "skills/caveman-commit",
+    "skills/caveman-compress",
+    "skills/caveman-help",
+    "skills/caveman-review",
+    "skills/caveman-stats"
+  ],
+  "excludedInstallerRoots": [
+    "agents"
+  ]
+}

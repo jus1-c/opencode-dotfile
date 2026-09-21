@@ -1,0 +1,7 @@
+frida
+frida-tools
+mcp<2
+pillow
+pywin32
+# frida-game-hacking-mcp: jus1-c fork (Frida 17 compat)
+# git source → pip install -e . from mirror

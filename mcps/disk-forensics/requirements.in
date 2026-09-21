@@ -1,0 +1,8 @@
+# Upstream's `forensics` extra names unavailable py* distributions. These are
+# the real bindings used by its handlers and proven in the legacy runtime.
+pytsk3>=20231007
+mcp==1.27.2
+libewf-python==20240506
+libvhdi-python>=20231123
+libvmdk-python>=20231123
+disk-forensics-mcp-server @ git+https://github.com/jus1-c/disk-forensics-mcp-server.git@bf4cc1264ff78c3620fc823851d3c7cd20918794

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 2,
+  "defaults": {
+    "checkIntervalHours": 24,
+    "checkTimeoutMs": 60000,
+    "updateTimeoutMs": 1800000,
+    "maxOutputBytes": 65536
+  },
+  "components": {}
+}

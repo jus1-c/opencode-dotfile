@@ -1,0 +1,1 @@
+payload/plugin/plugin.js

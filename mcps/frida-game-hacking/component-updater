@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""
+Frida Game Hacking MCP component updater.
+
+Actions:
+  check       resolve current/latest HEAD + mirror parity
+  update      stage exact commit + sync mirror
+  healthcheck validate staged version, sync mirror, verify Windows import
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
+REMOTE = "https://github.com/jus1-c/frida-game-hacking-mcp.git"
+MIRROR = Path("/mnt/c/Users/Administrator/AppData/Local/FridaMCP")
+MIRROR_WIN = r"C:\Users\Administrator\AppData\Local\FridaMCP"
+PYEXE = "/mnt/c/Users/Administrator/scoop/apps/python312/current/python.exe"
+
+
+def output(*command, cwd=None):
+    return subprocess.check_output(
+        [str(x) for x in command], cwd=cwd, text=True, stderr=subprocess.DEVNULL
+    ).strip()
+
+
+def mirror_matches(source):
+    """Check mirror files match source (excluding .git), by relative path."""
+    if not MIRROR.is_dir():
+        return False
+
+    def rel_files(root):
+        SKIP = {"__pycache__", ".git"}
+        def skip(p):
+            return any(part in SKIP or part.endswith(".pyc") or part.endswith(".egg-info") for part in p.parts)
+        return sorted(
+            p.relative_to(root).as_posix()
+            for p in root.rglob("*")
+            if p.is_file() and not skip(p.relative_to(root))
+        )
+
+    src_files = rel_files(source)
+    mir_files = rel_files(MIRROR)
+    if src_files != mir_files:
+        return False
+    return all(
+        (source / rel).read_bytes() == (MIRROR / rel).read_bytes()
+        for rel in src_files
+    )
+
+
+def sync_mirror(source):
+    """Replace mirror contents with source (no .git)."""
+    MIRROR.mkdir(parents=True, exist_ok=True)
+    for path in MIRROR.iterdir():
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    for path in source.rglob("*"):
+        if ".git" in path.parts:
+            continue
+        dest = MIRROR / path.relative_to(source)
+        if path.is_dir():
+            dest.mkdir(parents=True, exist_ok=True)
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, dest)
+    if not mirror_matches(source):
+        raise SystemExit("Windows mirror copy verification failed")
+
+
+def check():
+    """Resolve current vs latest HEAD + mirror parity."""
+    current = output("git", "rev-parse", "HEAD", cwd=TARGET / "source")
+    latest = output("git", "ls-remote", REMOTE, "HEAD").split()[0]
+    mirror_ok = mirror_matches(TARGET / "source")
+    if current == latest and mirror_ok:
+        status = "current"
+    else:
+        status = "update-available"
+    summary = current if status == "current" else f"{current} -> HEAD ({latest})"
+    if not mirror_ok:
+        summary += " [mirror drift]"
+    result = {
+        "schemaVersion": 1,
+        "status": status,
+        "current": current,
+        "latest": latest,
+        "summary": summary,
+    }
+    Path(os.environ["OPENCODE_UPDATER_CHECK_RESULT"]).write_text(
+        json.dumps(result) + "\n"
+    )
+
+
+def update():
+    """Stage the latest commit. Mirror sync happens in healthcheck."""
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    latest = os.environ["OPENCODE_UPDATER_LATEST"]
+    source = stage / "source"
+    subprocess.run(["git", "init", "--quiet", source], check=True)
+    subprocess.run(["git", "-C", source, "remote", "add", "origin", REMOTE], check=True)
+    subprocess.run(
+        ["git", "-C", source, "fetch", "--quiet", "--depth", "1", "origin", latest],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", source, "checkout", "--quiet", "--detach", "FETCH_HEAD"],
+        check=True,
+    )
+    manifest = {
+        "schemaVersion": 2,
+        "planSha256": os.environ["OPENCODE_UPDATER_PLAN_SHA256"],
+        "paths": ["source"],
+    }
+    Path(os.environ["OPENCODE_UPDATER_MANIFEST"]).write_text(
+        json.dumps(manifest) + "\n"
+    )
+
+
+def healthcheck():
+    """Validate staged commit + sync mirror + verify Windows import."""
+    source = Path(os.environ["OPENCODE_UPDATER_STAGE"]) / "source"
+    latest = os.environ["OPENCODE_UPDATER_LATEST"]
+
+    # Verify staged commit
+    staged_head = output("git", "rev-parse", "HEAD", cwd=source)
+    if staged_head != latest:
+        raise SystemExit(
+            f"staged HEAD {staged_head} != planned {latest}"
+        )
+
+    # Verify source is valid Python (system python3, no WSL venv needed)
+    subprocess.run(
+        ["python3", "-m", "py_compile",
+         str(source / "src/frida_game_hacking_mcp/__init__.py")],
+        check=True,
+    )
+
+    # Sync mirror (documented unavoidable external integration)
+    sync_mirror(source)
+
+    # Re-install editable into Windows env (deps may have changed)
+    subprocess.run(
+        [PYEXE, "-m", "pip", "install", "-e", MIRROR_WIN],
+        check=True,
+    )
+
+    # Verify import on Windows
+    subprocess.run(
+        [PYEXE, "-c", "import frida_game_hacking_mcp"],
+        check=True,
+    )
+
+
+def main():
+    actions = {"check": check, "update": update, "healthcheck": healthcheck}
+    if len(sys.argv) != 2 or sys.argv[1] not in actions:
+        raise SystemExit("usage: component-updater check|update|healthcheck")
+    actions[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,198 @@
+#!/usr/sbin/python3.14
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
+REMOTE = "https://github.com/JuliusBrussee/caveman.git"
+RELEASE_API = "https://api.github.com/repos/JuliusBrussee/caveman/releases?per_page=20"
+PLUGIN_FILES = ["plugin.js", "package.json", "caveman-config.cjs", "caveman-parse.cjs"]
+
+
+def output(*command, cwd=None):
+    return subprocess.check_output([str(value) for value in command], cwd=cwd, text=True).strip()
+
+
+def latest_release():
+    request = urllib.request.Request(RELEASE_API, headers={"Accept": "application/vnd.github+json", "User-Agent": "opencode-component-updater"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        releases = json.load(response)
+    release = next(
+        (item for item in releases if not item.get("draft") and not item.get("prerelease") and re.fullmatch(r"v\d+\.\d+\.\d+", item.get("tag_name", ""))),
+        None,
+    )
+    if release is None:
+        raise SystemExit("Caveman plugin release not found")
+    tag = release["tag_name"]
+    commit = output("git", "ls-remote", REMOTE, f"{tag}^{{}}").split()[0]
+    return tag.lstrip("v"), tag, commit
+
+
+def provenance(root=TARGET):
+    path = root / ".component-updater-provenance.json"
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+def links_ok():
+    metadata = provenance()
+    links = metadata.get("links")
+    if not isinstance(links, list) or not links:
+        return False
+    links_match = all(link.is_symlink() and link.resolve() == destination.resolve() for link, destination in expected_links(links).items())
+    config = TARGET.parent.parent
+    linked = set(links)
+    unexpected = []
+    for root in ["commands", "skills"]:
+        directory = config / root
+        if directory.is_dir():
+            unexpected.extend(path for path in directory.iterdir() if path.is_symlink() and path.resolve(strict=False).is_relative_to((TARGET / "payload").resolve()) and f"{root}/{path.name}" not in linked)
+    agents = (TARGET.parent.parent / "AGENTS.md").read_text()
+    block = (TARGET / "payload/AGENTS.md.block").read_text().strip()
+    return links_match and not unexpected and block in agents
+
+
+def expected_links(links):
+    config = TARGET.parent.parent
+    expected = {TARGET / name: TARGET / "payload/plugin" / name for name in PLUGIN_FILES}
+    expected |= {config / relative: TARGET / "payload" / relative for relative in links}
+    return expected
+
+
+def ensure_links(links):
+    config = TARGET.parent.parent
+    linked = set(links)
+    for root in ["commands", "skills"]:
+        directory = config / root
+        if not directory.is_dir():
+            continue
+        for path in directory.iterdir():
+            relative = f"{root}/{path.name}"
+            if path.is_symlink() and path.resolve(strict=False).is_relative_to((TARGET / "payload").resolve()) and relative not in linked:
+                path.unlink()
+    for link, destination in expected_links(links).items():
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink():
+            if link.resolve(strict=False) == destination.resolve(strict=False):
+                continue
+            link.unlink()
+        elif link.exists():
+            raise SystemExit(f"refusing to replace unmanaged Caveman path: {link}")
+        link.symlink_to(destination)
+
+
+def install_agents_block(block):
+    path = TARGET.parent.parent / "AGENTS.md"
+    contents = path.read_text() if path.is_file() else ""
+    pattern = re.compile(r"<!-- caveman-begin -->.*?<!-- caveman-end -->", re.DOTALL)
+    if pattern.search(contents):
+        contents = pattern.sub(block.strip(), contents, count=1)
+    else:
+        contents = contents.rstrip() + ("\n\n" if contents.strip() else "") + block.strip() + "\n"
+    path.write_text(contents)
+
+
+def installer_links(installed):
+    links = []
+    commands = installed / "commands"
+    if commands.is_dir():
+        links.extend(f"commands/{path.name}" for path in commands.iterdir() if path.is_file())
+    skills = installed / "skills"
+    if skills.is_dir():
+        links.extend(f"skills/{path.name}" for path in skills.iterdir() if path.is_dir())
+    return sorted(links)
+
+
+def check():
+    installed = provenance()
+    current = installed.get("version")
+    latest, tag, commit = latest_release()
+    if not current:
+        raise SystemExit("Caveman provenance is missing")
+    status = "current" if current == latest and links_ok() else "update-available"
+    result = {
+        "schemaVersion": 1,
+        "status": status,
+        "current": current,
+        "latest": latest,
+        "summary": current if status == "current" else (f"{current} -> {latest}" if current != latest else "repair managed links"),
+        "sourceCommit": commit,
+    }
+    Path(os.environ["OPENCODE_UPDATER_CHECK_RESULT"]).write_text(json.dumps(result) + "\n")
+
+
+def update():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    latest = os.environ["OPENCODE_UPDATER_LATEST"]
+    commit = os.environ["OPENCODE_UPDATER_SOURCE_COMMIT"]
+    source = stage / "source"
+    subprocess.run(["git", "init", "--quiet", source], check=True)
+    subprocess.run(["git", "-C", source, "remote", "add", "origin", REMOTE], check=True)
+    subprocess.run(["git", "-C", source, "fetch", "--quiet", "--depth", "1", "origin", commit], check=True)
+    subprocess.run(["git", "-C", source, "checkout", "--quiet", "--detach", "FETCH_HEAD"], check=True)
+    with tempfile.TemporaryDirectory() as home:
+        env = os.environ | {"HOME": home, "XDG_CONFIG_HOME": str(Path(home) / ".config")}
+        install_script = source / "bin/install.js" if (source / "bin/install.js").exists() else source / "cli/install.js"
+        subprocess.run(["node", install_script, "--only", "opencode", "--non-interactive", "--force", "--no-mcp-shrink"], env=env, check=True)
+        installed = Path(home) / ".config/opencode"
+        payload = stage / "payload"
+        shutil.move(installed / "plugins/caveman", payload / "plugin")
+        links = installer_links(installed)
+        if not links:
+            raise SystemExit("Caveman installer produced no commands or skills")
+        for relative in links:
+            destination = payload / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(installed / relative, destination)
+        rules = (installed / "AGENTS.md").read_text()
+        match = re.search(r"<!-- caveman-begin -->.*?<!-- caveman-end -->", rules, re.DOTALL)
+        if not match:
+            raise SystemExit("Caveman installer produced no fenced AGENTS.md block")
+        (payload / "AGENTS.md.block").write_text(match.group(0) + "\n")
+    shutil.rmtree(source)
+    metadata = {
+        "schemaVersion": 1,
+        "remote": REMOTE,
+        "version": latest,
+        "commit": commit,
+        "links": links,
+        "excludedInstallerRoots": ["agents"],
+    }
+    (stage / ".component-updater-provenance.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    manifest = {"schemaVersion": 2, "planSha256": os.environ["OPENCODE_UPDATER_PLAN_SHA256"], "paths": ["payload", ".component-updater-provenance.json"]}
+    Path(os.environ["OPENCODE_UPDATER_MANIFEST"]).write_text(json.dumps(manifest) + "\n")
+
+
+def healthcheck():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    metadata = provenance(stage)
+    if metadata.get("version") != os.environ["OPENCODE_UPDATER_LATEST"] or metadata.get("commit") != os.environ["OPENCODE_UPDATER_SOURCE_COMMIT"]:
+        raise SystemExit("staged Caveman payload does not match plan")
+    links = metadata.get("links")
+    if not isinstance(links, list) or links != sorted(set(links)) or not links:
+        raise SystemExit("staged Caveman link manifest is invalid")
+    if any(not relative.startswith(("commands/", "skills/")) for relative in links):
+        raise SystemExit("staged Caveman link escapes managed roots")
+    for relative in [*(f"plugin/{name}" for name in PLUGIN_FILES), "AGENTS.md.block", *links]:
+        if not (stage / "payload" / relative).exists():
+            raise SystemExit(f"staged Caveman payload is missing {relative}")
+    subprocess.run(["node", "--check", stage / "payload/plugin/plugin.js"], check=True)
+    ensure_links(links)
+    # Installer-owned fenced block is the sole non-transactional file update.
+    install_agents_block((stage / "payload/AGENTS.md.block").read_text())
+
+
+def main():
+    actions = {"check": check, "update": update, "healthcheck": healthcheck}
+    if len(sys.argv) != 2 or sys.argv[1] not in actions:
+        raise SystemExit("usage: component-updater check|update|healthcheck")
+    actions[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()

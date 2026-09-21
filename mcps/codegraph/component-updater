@@ -1,0 +1,61 @@
+#!/usr/sbin/python3.14
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
+
+
+def version():
+    return subprocess.check_output(["codegraph", "--version"], text=True).strip().lstrip("v")
+
+
+def installed_version():
+    package = Path.home() / ".codegraph/current/lib/package.json"
+    return json.loads(package.read_text())["version"]
+
+
+def check():
+    current = version()
+    if installed_version() != current:
+        raise SystemExit("CodeGraph launcher and current installation disagree")
+    text = subprocess.check_output(["codegraph", "upgrade", "--check"], text=True, stderr=subprocess.STDOUT)
+    versions = re.findall(r"v?(\d+\.\d+\.\d+)", text)
+    latest = versions[-1] if versions else current
+    result = {"schemaVersion": 1, "status": "current" if current == latest else "update-available", "current": current, "latest": latest, "summary": current if current == latest else f"{current} -> {latest}"}
+    Path(os.environ["OPENCODE_UPDATER_CHECK_RESULT"]).write_text(json.dumps(result) + "\n")
+
+
+def update():
+    latest = os.environ["OPENCODE_UPDATER_LATEST"]
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    (stage / "installed-version").write_text(latest + "\n")
+    manifest = {"schemaVersion": 2, "planSha256": os.environ["OPENCODE_UPDATER_PLAN_SHA256"], "paths": ["installed-version"]}
+    Path(os.environ["OPENCODE_UPDATER_MANIFEST"]).write_text(json.dumps(manifest) + "\n")
+
+
+def healthcheck():
+    expected = os.environ["OPENCODE_UPDATER_LATEST"]
+    marker = (Path(os.environ["OPENCODE_UPDATER_STAGE"]) / "installed-version").read_text().strip()
+    if marker != expected:
+        raise SystemExit("CodeGraph staged marker does not match planned version")
+    current = version()
+    if current != installed_version() or current == expected:
+        return
+    subprocess.run(["codegraph", "upgrade", expected], check=True)
+    if version() != expected or installed_version() != expected:
+        raise SystemExit("CodeGraph native upgrade did not reach planned version")
+
+
+def main():
+    actions = {"check": check, "update": update, "healthcheck": healthcheck}
+    if len(sys.argv) != 2 or sys.argv[1] not in actions:
+        raise SystemExit("usage: component-updater check|update|healthcheck")
+    actions[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+
+TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
+REMOTE = "https://github.com/obra/superpowers.git"
+RELEASE_API = "https://api.github.com/repos/obra/superpowers/releases/latest"
+PLUGIN = Path(".opencode/plugins/superpowers.js")
+PROVENANCE = ".component-updater-provenance.json"
+MANAGED_PATHS = ["package.json", "skills", ".opencode", PROVENANCE]
+
+
+def run(*command, cwd=None):
+    return subprocess.check_output([str(value) for value in command], cwd=cwd, text=True).strip()
+
+
+def release():
+    request = urllib.request.Request(
+        RELEASE_API,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "opencode-component-updater"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        data = json.load(response)
+    tag = data.get("tag_name", "")
+    if data.get("draft") or data.get("prerelease") or not tag.startswith("v"):
+        raise SystemExit("Superpowers latest release is not a stable version tag")
+    version = tag[1:]
+    if not version or version.count(".") != 2:
+        raise SystemExit("Superpowers release tag is not semantic versioning")
+    commit = run("git", "ls-remote", REMOTE, f"{tag}^{{}}").split()[0]
+    if len(commit) != 40:
+        raise SystemExit("Superpowers release tag does not resolve to a commit")
+    return version, tag, commit
+
+
+def provenance(root=TARGET):
+    path = root / PROVENANCE
+    return json.loads(path.read_text()) if path.is_file() else None
+
+
+def plugin_path(root=TARGET):
+    return root / PLUGIN
+
+
+def is_uninstalled_target():
+    return {path.name for path in TARGET.iterdir()} == {Path(__file__).name}
+
+
+def copy_safe_tree(source, destination):
+    info = source.lstat()
+    if stat.S_ISLNK(info.st_mode) or (not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode)):
+        raise SystemExit(f"unsupported source entry: {source}")
+    if stat.S_ISREG(info.st_mode):
+        if info.st_nlink > 1:
+            raise SystemExit(f"hardlinked source entry: {source}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        destination.chmod(stat.S_IMODE(info.st_mode))
+        return
+    destination.mkdir(parents=True, exist_ok=False)
+    destination.chmod(stat.S_IMODE(info.st_mode))
+    for child in sorted(source.iterdir(), key=lambda path: path.name):
+        copy_safe_tree(child, destination / child.name)
+
+
+def check():
+    latest, tag, commit = release()
+    installed = provenance()
+    if installed is None:
+        if not is_uninstalled_target():
+            raise SystemExit("Superpowers provenance is missing; refusing to replace unmanaged files")
+        current = "0.0.0"
+        status = "update-available"
+        summary = f"install {latest}"
+    else:
+        current = installed.get("version")
+        if not isinstance(current, str) or not current:
+            raise SystemExit("Superpowers provenance has no version")
+        status = "current" if current == latest and installed.get("commit") == commit and plugin_path().is_file() else "update-available"
+        summary = current if status == "current" else (f"{current} -> {latest}" if current != latest else "repair managed plugin payload")
+    result = {
+        "schemaVersion": 1,
+        "status": status,
+        "current": current,
+        "latest": latest,
+        "summary": summary,
+        "sourceCommit": commit,
+    }
+    Path(os.environ["OPENCODE_UPDATER_CHECK_RESULT"]).write_text(json.dumps(result) + "\n")
+
+
+def update():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    latest = os.environ["OPENCODE_UPDATER_LATEST"]
+    commit = os.environ["OPENCODE_UPDATER_SOURCE_COMMIT"]
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "source"
+        subprocess.run(["git", "init", "--quiet", source], check=True)
+        subprocess.run(["git", "-C", source, "remote", "add", "origin", REMOTE], check=True)
+        subprocess.run(["git", "-C", source, "fetch", "--quiet", "--depth", "1", "origin", commit], check=True)
+        subprocess.run(["git", "-C", source, "checkout", "--quiet", "--detach", "FETCH_HEAD"], check=True)
+        if run("git", "-C", source, "rev-parse", "HEAD") != commit:
+            raise SystemExit("checked out Superpowers commit does not match update plan")
+        package = json.loads((source / "package.json").read_text())
+        if package.get("name") != "superpowers" or package.get("version") != latest or package.get("type") != "module" or package.get("main") != str(PLUGIN):
+            raise SystemExit("Superpowers release has an incompatible OpenCode package layout")
+        for relative in [Path("package.json"), Path("skills"), PLUGIN]:
+            copy_safe_tree(source / relative, stage / relative)
+    metadata = {
+        "schemaVersion": 1,
+        "remote": REMOTE,
+        "version": latest,
+        "commit": commit,
+        "plugin": str(PLUGIN),
+    }
+    (stage / PROVENANCE).write_text(json.dumps(metadata, indent=2) + "\n")
+    manifest = {
+        "schemaVersion": 2,
+        "planSha256": os.environ["OPENCODE_UPDATER_PLAN_SHA256"],
+        "paths": MANAGED_PATHS,
+    }
+    Path(os.environ["OPENCODE_UPDATER_MANIFEST"]).write_text(json.dumps(manifest) + "\n")
+
+
+def healthcheck():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    metadata = provenance(stage)
+    if metadata is None or metadata.get("version") != os.environ["OPENCODE_UPDATER_LATEST"] or metadata.get("commit") != os.environ["OPENCODE_UPDATER_SOURCE_COMMIT"]:
+        raise SystemExit("staged Superpowers payload does not match update plan")
+    package = json.loads((stage / "package.json").read_text())
+    if package.get("name") != "superpowers" or package.get("version") != metadata["version"] or package.get("main") != str(PLUGIN):
+        raise SystemExit("staged Superpowers package is invalid")
+    if not (stage / PLUGIN).is_file() or not (stage / "skills/using-superpowers/SKILL.md").is_file():
+        raise SystemExit("staged Superpowers plugin or bootstrap skill is missing")
+    subprocess.run(["node", "--check", stage / PLUGIN], check=True)
+
+
+def main():
+    actions = {"check": check, "update": update, "healthcheck": healthcheck}
+    if len(sys.argv) != 2 or sys.argv[1] not in actions:
+        raise SystemExit("usage: component-updater check|update|healthcheck")
+    actions[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()

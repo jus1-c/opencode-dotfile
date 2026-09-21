@@ -1,0 +1,101 @@
+#!/usr/sbin/python3.14
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
+REGISTRY = "https://registry.npmjs.org/opencode-pty"
+
+
+def metadata():
+    request = urllib.request.Request(
+        REGISTRY,
+        headers={"Accept": "application/json", "User-Agent": "opencode-component-updater"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
+def check():
+    current = json.loads((TARGET / "package.json").read_text())["version"]
+    data = metadata()
+    latest = data["dist-tags"]["latest"]
+    release = data["versions"][latest]
+    result = {
+        "schemaVersion": 1,
+        "status": "current" if current == latest else "update-available",
+        "current": current,
+        "latest": latest,
+        "summary": current if current == latest else f"{current} -> {latest}",
+        "artifact": {
+            "url": release["dist"]["tarball"],
+            "integrity": release["dist"]["integrity"],
+        },
+    }
+    Path(os.environ["OPENCODE_UPDATER_CHECK_RESULT"]).write_text(json.dumps(result) + "\n")
+
+
+def verify_archive(path, integrity):
+    algorithm, expected = integrity.split("-", 1)
+    if algorithm not in {"sha256", "sha384", "sha512"}:
+        raise SystemExit(f"unsupported npm integrity algorithm: {algorithm}")
+    actual = base64.b64encode(hashlib.new(algorithm, path.read_bytes()).digest()).decode()
+    if actual != expected:
+        raise SystemExit("opencode-pty artifact integrity mismatch")
+
+
+def update():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    latest = os.environ["OPENCODE_UPDATER_LATEST"]
+    with tempfile.TemporaryDirectory() as directory:
+        archive = Path(directory) / "opencode-pty.tgz"
+        request = urllib.request.Request(
+            os.environ["OPENCODE_UPDATER_ARTIFACT_URL"],
+            headers={"User-Agent": "opencode-component-updater"},
+        )
+        with urllib.request.urlopen(request, timeout=60) as response, archive.open("wb") as output:
+            shutil.copyfileobj(response, output)
+        verify_archive(archive, os.environ["OPENCODE_UPDATER_ARTIFACT_INTEGRITY"])
+
+    (stage / "package.json").write_text(json.dumps({
+        "name": "opencode-pty",
+        "version": latest,
+        "dependencies": {"opencode-pty": latest},
+    }, indent=2) + "\n")
+    subprocess.run([
+        "npm", "install", "--ignore-scripts", "--no-bin-links", "--no-audit", "--no-fund",
+    ], cwd=stage, check=True)
+    manifest = {
+        "schemaVersion": 2,
+        "planSha256": os.environ["OPENCODE_UPDATER_PLAN_SHA256"],
+        "paths": ["package.json", "package-lock.json", "node_modules"],
+    }
+    Path(os.environ["OPENCODE_UPDATER_MANIFEST"]).write_text(json.dumps(manifest) + "\n")
+
+
+def healthcheck():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    package = json.loads((stage / "node_modules/opencode-pty/package.json").read_text())
+    if package["version"] != os.environ["OPENCODE_UPDATER_LATEST"]:
+        raise SystemExit("staged opencode-pty version does not match update plan")
+    entry = (stage / "node_modules/opencode-pty/dist/index.js").as_uri()
+    script = f"import({json.dumps(entry)}).then(m => {{ if (typeof m.server !== 'function') process.exit(1) }})"
+    subprocess.run(["bun", "-e", script], check=True)
+
+
+def main():
+    actions = {"check": check, "update": update, "healthcheck": healthcheck}
+    if len(sys.argv) != 2 or sys.argv[1] not in actions:
+        raise SystemExit("usage: component-updater check|update|healthcheck")
+    actions[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,413 @@
+#!/usr/sbin/python3.14
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
+SOURCE_DIR = TARGET / "source"
+RUNTIME_DIR = TARGET / "runtime"
+GHIDRA_RELEASES_DIR = TARGET / "ghidra-releases"
+JAVA_HOME = RUNTIME_DIR / "jdk"
+MAVEN_HOME = RUNTIME_DIR / "maven"
+REPO_URL = "https://github.com/bethington/ghidra-mcp"
+ADOPTIUM_API = "https://api.adoptium.net/v3/binary/latest"
+MVN_ARCHIVE = "https://archive.apache.org/dist/maven/maven-3"
+
+JDK_COMPAT = {
+    "12.0": 21, "12.0.4": 21,
+    "12.1": 21, "12.1.2": 21, "12.1.3": 21,
+}
+
+
+def fail(msg):
+    raise SystemExit(msg)
+
+
+def run(cmd, java_home=None, maven_home=None, **kw):
+    env = dict(os.environ)
+    jh = java_home or JAVA_HOME
+    mh = maven_home or MAVEN_HOME
+    env["JAVA_HOME"] = str(jh)
+    env["PATH"] = f"{jh}/bin:{mh}/bin:{env.get('PATH', '')}"
+    return subprocess.run(cmd, capture_output=True, text=True, env=env, **kw)
+
+
+def gh_api(endpoint):
+    r = subprocess.run(["gh", "api", endpoint], capture_output=True, text=True)
+    if r.returncode != 0:
+        fail(f"gh api {endpoint} failed: {r.stderr}")
+    return json.loads(r.stdout)
+
+
+def current_provenance():
+    prov_file = TARGET / ".component-updater-provenance.json"
+    if prov_file.exists():
+        return json.loads(prov_file.read_text())
+    return {}
+
+
+def latest_ghidra_mcp_tag():
+    data = gh_api("repos/bethington/ghidra-mcp/releases/latest")
+    return data["tag_name"], data["target_commitish"]
+
+
+def parse_ghidra_version_from_source(source_dir):
+    pom = source_dir / "pom.xml"
+    if not pom.exists():
+        fail("pom.xml not found in source")
+    m = re.search(r"<ghidra\.version>([^<]+)</ghidra\.version>", pom.read_text())
+    if not m:
+        fail("ghidra.version not found in pom.xml")
+    return m.group(1)
+
+
+def required_jdk_major(ghidra_version):
+    if ghidra_version in JDK_COMPAT:
+        return JDK_COMPAT[ghidra_version]
+    for prefix, major in sorted(JDK_COMPAT.items(), key=lambda x: -len(x[0])):
+        if ghidra_version.startswith(prefix):
+            return major
+    return None
+
+
+def current_jdk_major(java_home):
+    java_bin = java_home / "bin" / "java"
+    if not java_bin.exists():
+        return None
+    r = subprocess.run([str(java_bin), "-version"], capture_output=True, text=True)
+    m = re.search(r'version "(\d+)', r.stderr or r.stdout)
+    return int(m.group(1)) if m else None
+
+
+def ghidra_download_url(version):
+    releases = gh_api("repos/NationalSecurityAgency/ghidra/releases?per_page=20")
+    version_pattern = version.replace(".", r"\.")
+    tag_re = re.compile(rf"Ghidra_{version_pattern}_build")
+    asset_re = re.compile(rf"ghidra_{version_pattern}_PUBLIC_\d+\.zip$")
+    for rel in releases:
+        if tag_re.match(rel.get("tag_name", "")):
+            for asset in rel.get("assets", []):
+                name = asset.get("name", "")
+                if asset_re.match(name):
+                    return asset["browser_download_url"]
+    fail(f"No Ghidra {version} download URL found via GitHub API; check release assets manually")
+
+
+def latest_maven_version():
+    try:
+        data = gh_api("repos/apache/maven/releases/latest")
+        tag = data.get("tag_name", "")
+        m = re.match(r"maven-(\d+\.\d+\.\d+)", tag)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def download_file(url, dest, timeout=300):
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        dest.write_bytes(resp.read())
+
+
+def download_jdk(major, dest):
+    url = f"{ADOPTIUM_API}/{major}/ga/linux/x64/jdk/hotspot/normal/eclipse?project=jdk"
+    tar_path = dest.parent / f"jdk{major}.tar.gz"
+    download_file(url, tar_path, timeout=300)
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    subprocess.run(["tar", "xzf", str(tar_path), "-C", str(dest), "--strip-components=1"], check=True)
+    tar_path.unlink()
+
+
+def download_maven(version, dest):
+    url = f"{MVN_ARCHIVE}/{version}/binaries/apache-maven-{version}-bin.tar.gz"
+    tar_path = dest.parent / f"maven-{version}.tar.gz"
+    try:
+        download_file(url, tar_path, timeout=120)
+    except Exception:
+        url = f"https://dlcdn.apache.org/maven/maven-3/{version}/binaries/apache-maven-{version}-bin.tar.gz"
+        download_file(url, tar_path, timeout=120)
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    subprocess.run(["tar", "xzf", str(tar_path), "-C", str(dest), "--strip-components=1"], check=True)
+    tar_path.unlink()
+
+
+def check():
+    prov = current_provenance()
+    current_tag = prov.get("ghidra_mcp_tag", "unknown")
+
+    latest_tag, _ = latest_ghidra_mcp_tag()
+
+    if current_tag == latest_tag:
+        result = {
+            "schemaVersion": 1,
+            "status": "current",
+            "current": current_tag,
+            "latest": latest_tag,
+            "summary": f"ghidra-mcp {current_tag}",
+        }
+        Path(os.environ["OPENCODE_UPDATER_CHECK_RESULT"]).write_text(json.dumps(result) + "\n")
+        return
+
+    changes = [f"ghidra-mcp {current_tag} -> {latest_tag}"]
+
+    tmp_dir = TARGET / ".tmp-check-source"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    r = subprocess.run(
+        ["git", "clone", "--depth", "1", "--branch", latest_tag, REPO_URL, str(tmp_dir)],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        fail(f"git clone for check failed: {r.stderr}")
+
+    new_ghidra_ver = parse_ghidra_version_from_source(tmp_dir)
+    old_ghidra_ver = prov.get("ghidra_version", "unknown")
+    if new_ghidra_ver != old_ghidra_ver:
+        changes.append(f"Ghidra {old_ghidra_ver} -> {new_ghidra_ver}")
+
+    new_jdk = required_jdk_major(new_ghidra_ver)
+    old_jdk = current_jdk_major(JAVA_HOME)
+    if new_jdk and old_jdk and new_jdk != old_jdk:
+        changes.append(f"JDK {old_jdk} -> {new_jdk}")
+
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    result = {
+        "schemaVersion": 1,
+        "status": "update-available",
+        "current": current_tag,
+        "latest": latest_tag,
+        "summary": "; ".join(changes),
+    }
+    Path(os.environ["OPENCODE_UPDATER_CHECK_RESULT"]).write_text(json.dumps(result) + "\n")
+
+
+def update():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    plan_sha = os.environ.get("OPENCODE_UPDATER_PLAN_SHA256", "")
+
+    latest_tag, commit = latest_ghidra_mcp_tag()
+
+    staged_source = stage / "source"
+    if staged_source.exists():
+        shutil.rmtree(staged_source)
+    r = run(["git", "clone", "--depth", "1", "--branch", latest_tag, REPO_URL, str(staged_source)])
+    if r.returncode != 0:
+        fail(f"git clone failed: {r.stderr}")
+
+    ghidra_version = parse_ghidra_version_from_source(staged_source)
+    ghidra_url = ghidra_download_url(ghidra_version)
+
+    staged_ghidra_dir = stage / "ghidra-releases" / f"ghidra_{ghidra_version}_PUBLIC"
+    if not staged_ghidra_dir.exists():
+        zip_path = stage / "ghidra.zip"
+        download_file(ghidra_url, zip_path, timeout=600)
+        ghidra_sha = sha256_file(zip_path)
+        subprocess.run(["unzip", "-q", str(zip_path), "-d", str(stage / "ghidra-releases")], check=True)
+        zip_path.unlink()
+    else:
+        ghidra_sha = current_provenance().get("ghidra_sha256", "")
+
+    staged_runtime = stage / "runtime"
+    staged_runtime.mkdir(parents=True, exist_ok=True)
+
+    needed_jdk = required_jdk_major(ghidra_version)
+    current_jdk = current_jdk_major(JAVA_HOME)
+    staged_jdk = staged_runtime / "jdk"
+    if needed_jdk and current_jdk and needed_jdk != current_jdk:
+        download_jdk(needed_jdk, staged_jdk)
+    elif JAVA_HOME.exists():
+        if not staged_jdk.exists():
+            shutil.copytree(JAVA_HOME, staged_jdk, symlinks=True)
+    else:
+        fail("No existing JDK and cannot determine required version")
+
+    staged_maven = staged_runtime / "maven"
+    if MAVEN_HOME.exists() and not staged_maven.exists():
+        shutil.copytree(MAVEN_HOME, staged_maven, symlinks=True)
+
+    staged_venv = staged_runtime / ".venv"
+    if not staged_venv.exists():
+        uv = shutil.which("uv") or "/home/c/.local/bin/uv"
+        r = run([uv, "venv", str(staged_venv)], java_home=staged_jdk, maven_home=staged_maven)
+        if r.returncode != 0:
+            fail(f"uv venv failed: {r.stderr}")
+        r = run([uv, "pip", "install", "-e", ".", "--python", str(staged_venv / "bin/python")],
+                java_home=staged_jdk, maven_home=staged_maven, cwd=str(staged_source))
+        if r.returncode != 0:
+            fail(f"uv pip install failed: {r.stderr}")
+
+    env = dict(os.environ)
+    env["JAVA_HOME"] = str(staged_jdk)
+    env["PATH"] = f"{staged_jdk}/bin:{staged_maven}/bin:{env.get('PATH', '')}"
+    env["GHIDRA_INSTALL_DIR"] = str(staged_ghidra_dir)
+
+    r = subprocess.run(
+        [str(staged_maven / "bin/mvn"), "clean", "package", "assembly:single", "-DskipTests", "-Pheadless"],
+        capture_output=True, text=True, cwd=str(staged_source), env=env,
+    )
+    if r.returncode != 0:
+        mvn_ver = latest_maven_version()
+        current_mv = None
+        mvn_bin = staged_maven / "bin/mvn"
+        if mvn_bin.exists():
+            cr = subprocess.run([str(mvn_bin), "--version"], capture_output=True, text=True, env=env)
+            mm = re.search(r"Apache Maven (\d+\.\d+\.\d+)", cr.stdout)
+            current_mv = mm.group(1) if mm else None
+        if mvn_ver and current_mv and mvn_ver != current_mv:
+            download_maven(mvn_ver, staged_maven)
+            r = subprocess.run(
+                [str(staged_maven / "bin/mvn"), "clean", "package", "assembly:single", "-DskipTests", "-Pheadless"],
+                capture_output=True, text=True, cwd=str(staged_source), env=env,
+            )
+            if r.returncode != 0:
+                fail(f"mvn build failed (after Maven update to {mvn_ver}): {r.stderr[-500:]}")
+        else:
+            fail(f"mvn build failed: {r.stderr[-500:]}")
+
+    jar_src = staged_source / "target" / f"GhidraMCP-{latest_tag.lstrip('v')}.jar"
+    if not jar_src.exists():
+        jars = list((staged_source / "target").glob("GhidraMCP-*.jar"))
+        if not jars:
+            fail("No GhidraMCP JAR found after build")
+        jar_src = jars[0]
+    shutil.copy2(jar_src, staged_runtime / "GhidraMCP.jar")
+
+    for script in ["ghidra-mcp-launcher", "start-headless", "stop-headless"]:
+        src = TARGET / "bin" / script
+        dst = stage / "bin" / script
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.exists():
+            shutil.copy2(src, dst)
+            dst.chmod(0o755)
+
+    updater_src = Path(__file__)
+    shutil.copy2(updater_src, stage / "component-updater")
+    (stage / "component-updater").chmod(0o755)
+
+    new_jdk_ver = None
+    java_bin = staged_jdk / "bin/java"
+    if java_bin.exists():
+        vr = subprocess.run([str(java_bin), "-version"], capture_output=True, text=True)
+        jm = re.search(r'version "([^"]+)"', vr.stderr or vr.stdout)
+        new_jdk_ver = jm.group(1) if jm else None
+
+    new_mvn_ver = None
+    mvn_bin = staged_maven / "bin/mvn"
+    if mvn_bin.exists():
+        mr = subprocess.run([str(mvn_bin), "--version"], capture_output=True, text=True, env=env)
+        mm = re.search(r"Apache Maven (\d+\.\d+\.\d+)", mr.stdout)
+        new_mvn_ver = mm.group(1) if mm else None
+
+    provenance = {
+        "ghidra_mcp_tag": latest_tag,
+        "ghidra_mcp_commit": commit,
+        "ghidra_version": ghidra_version,
+        "ghidra_sha256": ghidra_sha,
+        "jdk_major": needed_jdk or current_jdk,
+        "jdk_version": new_jdk_ver,
+        "maven_version": new_mvn_ver,
+        "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    (stage / ".component-updater-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+
+    manifest = {
+        "schemaVersion": 2,
+        "planSha256": plan_sha,
+        "paths": [
+            "source",
+            "runtime",
+            "ghidra-releases",
+            "bin",
+            "component-updater",
+            ".component-updater-provenance.json",
+        ],
+    }
+    Path(os.environ["OPENCODE_UPDATER_MANIFEST"]).write_text(json.dumps(manifest) + "\n")
+
+
+def healthcheck():
+    test_port = 8090
+    base = Path(os.environ.get("OPENCODE_UPDATER_STAGE", str(TARGET)))
+    runtime = base / "runtime"
+    ghidra_home = None
+    ghidra_releases = base / "ghidra-releases"
+    if ghidra_releases.exists():
+        for d in sorted(ghidra_releases.iterdir(), reverse=True):
+            if d.is_dir() and d.name.startswith("ghidra_"):
+                ghidra_home = d
+                break
+    if not ghidra_home:
+        ghidra_link = TARGET / "ghidra"
+        if ghidra_link.is_symlink():
+            ghidra_home = ghidra_link.resolve()
+    if not ghidra_home or not ghidra_home.exists():
+        fail("healthcheck: no Ghidra installation found")
+
+    java = runtime / "jdk" / "bin" / "java"
+    jar = runtime / "GhidraMCP.jar"
+    if not java.exists() or not jar.exists():
+        fail("healthcheck: missing java or GhidraMCP.jar")
+
+    classpath = str(jar)
+    for pattern in ["Framework/*/lib/*.jar", "Features/*/lib/*.jar", "Processors/*/lib/*.jar"]:
+        for p in ghidra_home.glob(f"Ghidra/{pattern}"):
+            classpath += f":{p}"
+
+    proc = subprocess.Popen(
+        [str(java), "-Xmx2g", f"-Dghidra.home={ghidra_home}", "-Dapplication.name=GhidraMCP",
+         "-classpath", classpath, "com.xebyte.headless.GhidraMCPHeadlessServer",
+         "--port", str(test_port), "--bind", "127.0.0.1"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+    healthy = False
+    for _ in range(60):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{test_port}/check_connection", timeout=2) as r:
+                if r.status == 200:
+                    healthy = True
+                    break
+        except Exception:
+            pass
+        time.sleep(1)
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+    if not healthy:
+        fail("healthcheck: headless server did not respond on test port")
+
+    bridge = runtime / ".venv" / "bin" / "bridge-mcp-ghidra"
+    if not bridge.exists():
+        fail("healthcheck: bridge-mcp-ghidra not found")
+    r = subprocess.run([str(bridge), "--help"], capture_output=True, text=True)
+    if r.returncode != 0:
+        fail(f"healthcheck: bridge --help failed: {r.stderr}")
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "check"
+    {"check": check, "update": update, "healthcheck": healthcheck}[cmd]()

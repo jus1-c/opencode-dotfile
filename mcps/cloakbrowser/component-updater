@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+
+
+PACKAGE = "cloakbrowser-mcp"
+REGISTRY = "https://registry.npmjs.org/"
+TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+def package_metadata(version):
+    encoded = urllib.parse.quote(PACKAGE, safe="")
+    with urllib.request.urlopen(f"{REGISTRY}{encoded}/{version}", timeout=60) as response:
+        value = json.load(response)
+    dist = value.get("dist", {})
+    artifact = {"url": dist.get("tarball"), "integrity": dist.get("integrity")}
+    if value.get("version") != version or not artifact["url"] or not artifact["integrity"].startswith("sha512-"):
+        fail(f"npm metadata for {PACKAGE}@{version} has no valid immutable artifact")
+    return artifact
+
+
+def runtime_entry(root):
+    try:
+        lock = json.loads((root / "runtime/package-lock.json").read_text())
+        return lock["packages"][f"node_modules/{PACKAGE}"]
+    except (FileNotFoundError, KeyError, json.JSONDecodeError) as error:
+        fail(f"invalid {PACKAGE} package lock: {error}")
+
+
+def installed_version(root):
+    version = runtime_entry(root).get("version")
+    if not isinstance(version, str) or not version:
+        fail(f"{PACKAGE} version is missing from package lock")
+    return version
+
+
+def verify_runtime(root, version, artifact):
+    manifest = json.loads((root / "runtime/package.json").read_text())
+    if manifest.get("dependencies", {}).get(PACKAGE) != version:
+        fail(f"runtime manifest does not pin {PACKAGE}@{version}")
+    entry = runtime_entry(root)
+    if entry.get("version") != version or entry.get("resolved") != artifact["url"] or entry.get("integrity") != artifact["integrity"]:
+        fail(f"runtime lock provenance does not match {PACKAGE}@{version}")
+    links = [str(path.relative_to(root)) for path in (root / "runtime/node_modules").rglob("*") if path.is_symlink()]
+    if links:
+        fail("runtime contains symbolic links: " + ", ".join(links))
+
+
+def check():
+    current = installed_version(TARGET)
+    verify_runtime(TARGET, current, package_metadata(current))
+    encoded = urllib.parse.quote(PACKAGE, safe="")
+    with urllib.request.urlopen(f"{REGISTRY}{encoded}/latest", timeout=60) as response:
+        latest = json.load(response)["version"]
+    artifact = package_metadata(latest)
+    result = {
+        "schemaVersion": 1,
+        "status": "current" if current == latest else "update-available",
+        "current": current,
+        "latest": latest,
+        "summary": current if current == latest else f"{current} -> {latest}",
+        "artifact": artifact,
+    }
+    Path(os.environ["OPENCODE_UPDATER_CHECK_RESULT"]).write_text(json.dumps(result) + "\n")
+
+
+def update():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    runtime = stage / "runtime"
+    runtime.mkdir()
+    version = os.environ["OPENCODE_UPDATER_LATEST"]
+    artifact = {
+        "url": os.environ["OPENCODE_UPDATER_ARTIFACT_URL"],
+        "integrity": os.environ["OPENCODE_UPDATER_ARTIFACT_INTEGRITY"],
+    }
+    (runtime / "package.json").write_text(json.dumps({"name": "opencode-cloakbrowser-mcp-runtime", "private": True, "dependencies": {PACKAGE: version}}, indent=2) + "\n")
+    subprocess.run([
+        "npm", "install", "--ignore-scripts", "--no-bin-links", "--no-audit", "--no-fund", "--save-exact", f"{PACKAGE}@{version}"
+    ], cwd=runtime, check=True)
+    verify_runtime(stage, version, artifact)
+    manifest = {
+        "schemaVersion": 2,
+        "planSha256": os.environ["OPENCODE_UPDATER_PLAN_SHA256"],
+        "paths": ["runtime/package.json", "runtime/package-lock.json", "runtime/node_modules"],
+    }
+    Path(os.environ["OPENCODE_UPDATER_MANIFEST"]).write_text(json.dumps(manifest) + "\n")
+
+
+def healthcheck():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    version = os.environ["OPENCODE_UPDATER_LATEST"]
+    verify_runtime(stage, version, {
+        "url": os.environ["OPENCODE_UPDATER_ARTIFACT_URL"],
+        "integrity": os.environ["OPENCODE_UPDATER_ARTIFACT_INTEGRITY"],
+    })
+    entry = stage / "runtime/node_modules/cloakbrowser-mcp/dist/cli.js"
+    subprocess.run(["node", str(entry), "--help"], check=True, timeout=60)
+
+
+def main():
+    actions = {"check": check, "update": update, "healthcheck": healthcheck}
+    if len(sys.argv) != 2 or sys.argv[1] not in actions:
+        fail("usage: component-updater check|update|healthcheck")
+    actions[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()

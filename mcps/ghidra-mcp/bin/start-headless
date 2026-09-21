@@ -1,0 +1,32 @@
+#!/bin/bash
+set -euo pipefail
+
+COMPONENT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PID_FILE="${COMPONENT_DIR}/runtime/state/headless.pid"
+LOG_FILE="${COMPONENT_DIR}/runtime/logs/headless.log"
+JAVA_HOME="${COMPONENT_DIR}/runtime/jdk"
+GHIDRA_HOME="${COMPONENT_DIR}/ghidra"
+PORT=8089
+BIND="127.0.0.1"
+
+if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+    exit 0
+fi
+
+CLASSPATH="${COMPONENT_DIR}/runtime/GhidraMCP.jar"
+for jar in "${GHIDRA_HOME}"/Ghidra/Framework/*/lib/*.jar; do CLASSPATH="${CLASSPATH}:${jar}"; done
+for jar in "${GHIDRA_HOME}"/Ghidra/Features/*/lib/*.jar; do CLASSPATH="${CLASSPATH}:${jar}"; done
+for jar in "${GHIDRA_HOME}"/Ghidra/Processors/*/lib/*.jar; do CLASSPATH="${CLASSPATH}:${jar}"; done
+
+mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$PID_FILE")"
+
+nohup "${JAVA_HOME}/bin/java" \
+    -Xmx4g -XX:+UseG1GC \
+    -Dghidra.home="${GHIDRA_HOME}" \
+    -Dapplication.name=GhidraMCP \
+    -classpath "${CLASSPATH}" \
+    com.xebyte.headless.GhidraMCPHeadlessServer \
+    --port "${PORT}" --bind "${BIND}" \
+    >> "$LOG_FILE" 2>&1 &
+
+echo $! > "$PID_FILE"

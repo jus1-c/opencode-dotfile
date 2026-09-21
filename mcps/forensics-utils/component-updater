@@ -1,4 +1,4 @@
-#!/usr/sbin/python3.14
+#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
@@ -161,7 +161,7 @@ def healthcheck(config, target):
                 fail(f"staged shebang contains temporary path: {path.name}")
 
 
-CONFIG = {'distribution': 'forensics-utils-mcp-server', 'python': '/usr/sbin/python3.14', 'modules': ['forensics_utils_mcp_server']}
+CONFIG = {'distribution': 'forensics-utils-mcp-server', 'python': 'python3.14', 'modules': ['forensics_utils_mcp_server']}
 
 
 def main():

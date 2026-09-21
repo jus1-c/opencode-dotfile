@@ -1,4 +1,4 @@
-#!/usr/sbin/python3.14
+#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
@@ -11,7 +11,7 @@ TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
 PACKAGE = "codesdevs-log-analyzer"
 MODULE = "codesdevs_log_analyzer"
 ENTRY_POINT = ("codesdevs-log-analyzer", "codesdevs_log_analyzer.cli:main")
-PYTHON = "/usr/sbin/python3.14"
+PYTHON = "python3.14"
 UV = os.path.expanduser("~/.local/bin/uv")
 
 

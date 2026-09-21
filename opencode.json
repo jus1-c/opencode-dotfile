@@ -141,7 +141,7 @@
     "cloakbrowser": {
       "type": "local",
       "command": [
-        "/usr/sbin/node",
+        "node",
         "{env:HOME}/.config/opencode/mcps/cloakbrowser/bin/launcher.js"
       ],
       "enabled": true,
@@ -155,7 +155,7 @@
     "headroom-ctl": {
       "type": "local",
       "command": [
-        "/usr/sbin/node",
+        "node",
         "{env:HOME}/.config/opencode/mcps/headroom-ctl/bin/headroom-ctl.js"
       ],
       "enabled": true

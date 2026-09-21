@@ -1,4 +1,4 @@
-#!/usr/sbin/python3.14
+#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
@@ -161,7 +161,7 @@ def healthcheck(config, target):
                 fail(f"staged shebang contains temporary path: {path.name}")
 
 
-CONFIG = {'distribution': 'windows-forensics-mcp', 'python': '/usr/sbin/python3.14', 'modules': ['windows_forensics_mcp', 'pyesedb', 'pyevtx', 'pyfsntfs', 'pyfwsi', 'pylnk', 'pyolecf', 'pyregf', 'pyscca']}
+CONFIG = {'distribution': 'windows-forensics-mcp', 'python': 'python3.14', 'modules': ['windows_forensics_mcp', 'pyesedb', 'pyevtx', 'pyfsntfs', 'pyfwsi', 'pylnk', 'pyolecf', 'pyregf', 'pyscca']}
 
 
 def main():

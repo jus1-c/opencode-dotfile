@@ -23,6 +23,7 @@ if [[ -e "$DEST" && ! -L "$DEST" ]]; then
 fi
 
 if [[ ! -e "$DEST" ]]; then
+  mkdir -p "$(dirname "$DEST")"
   ln -s "$REPO" "$DEST"
   echo "symlinked $DEST -> $REPO"
 elif [[ "$(readlink -f "$DEST")" == "$(readlink -f "$REPO")" ]]; then
@@ -54,11 +55,26 @@ echo "python MCP venvs ..."
 for d in "$REPO"/mcps/*/; do
   name="$(basename "$d")"
   if [[ ",$SKIP," == *",$name,"* ]]; then echo "skip $name"; continue; fi
+  if [[ "$name" == "frida-game-hacking" ]]; then
+    echo "skip frida-game-hacking (WSL/Windows-only deps; set FRIDA_PYTHON in secrets.env and run its component-updater on WSL)"
+    continue
+  fi
   [[ -f "$d/requirements.lock" ]] || continue
-  if [[ -e "$d/.venv/bin/python" ]]; then echo "ok $name (venv exists)"; continue; fi
-  echo "  venv $name ..."
-  python3 -m venv --copies "$d/.venv"
+  mods="$(rg -o "'modules': \[([^]]+)\]" -r '$1' "$d/component-updater" 2>/dev/null | head -1 || true)"
+  mods="${mods//\'}"; mods="${mods//[/}"; mods="${mods//]/}"; mods="${mods%%,*}"; mods="${mods// /}"
+  if [[ -e "$d/.venv/bin/python" ]]; then
+    if [[ -n "$mods" ]] && "$d/.venv/bin/python" -c "import $mods" >/dev/null 2>&1; then
+      echo "ok $name (venv exists)"
+      continue
+    fi
+    echo "  incomplete venv $name; rebuilding ..."
+    rm -rf "$d/.venv"
+  fi
+  py="$(rg -o "'python': '([^']+)'" -r '$1' "$d/component-updater" 2>/dev/null || true)"
+  echo "  venv $name (${py:-python3}) ..."
+  uv venv --python "${py:-python3}" "$d/.venv"
   uv pip sync --quiet --link-mode copy --python "$d/.venv/bin/python" "$d/requirements.lock"
+  [[ -n "$mods" ]] && "$d/.venv/bin/python" -c "import $mods"
 done
 
 if [[ ",$SKIP," != *",ghidra-mcp,"* && ! -e "$REPO/mcps/ghidra-mcp/ghidra-releases" ]]; then

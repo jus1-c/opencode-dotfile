@@ -41,7 +41,7 @@ FRIDA_ON="$FRIDA_ON" python3 - "$DEST/opencode.json" <<'PYEOF'
 import json, os, sys
 p = sys.argv[1]
 cfg = json.load(open(p))
-cfg["mcp"]["frida-game-hacking"]["enabled"] = os.environ["FRIDA_ON"] == "true"
+cfg["mcp"]["servers"]["frida-game-hacking"]["disabled"] = os.environ["FRIDA_ON"] != "true"
 json.dump(cfg, open(p, "w"), indent=2)
 PYEOF
 echo "frida-game-hacking enabled=$FRIDA_ON (FRIDA_PYTHON ${FRIDA_PYTHON:+set})"

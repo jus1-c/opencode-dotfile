@@ -12,12 +12,16 @@ import (
 )
 
 type openCodeConfig struct {
-	MCP    map[string]mcpEntry `json:"mcp"`
-	Plugin []any               `json:"plugin"`
+	MCP      mcpConfig `json:"mcp"`
+	Plugins  []any     `json:"plugins"`
 }
 
-type tuiConfig struct {
-	Plugin []any `json:"plugin"`
+type mcpConfig struct {
+	Servers map[string]mcpEntry `json:"servers"`
+}
+
+type cliConfig struct {
+	Plugins []any `json:"plugins"`
 }
 
 type mcpEntry struct {
@@ -30,22 +34,22 @@ func discoverComponents(configRoot string) (map[string]component, error) {
 	if err := readOptionalJSON(filepath.Join(configRoot, "opencode.json"), &openConfig); err != nil {
 		return nil, err
 	}
-	var tui tuiConfig
-	if err := readOptionalJSON(filepath.Join(configRoot, "tui.json"), &tui); err != nil {
+	var cli cliConfig
+	if err := readOptionalJSON(filepath.Join(configRoot, "cli.json"), &cli); err != nil {
 		return nil, err
 	}
 
 	mcpRoot := filepath.Join(configRoot, "mcps")
 	pluginRoot := filepath.Join(configRoot, "plugins")
 	components := map[string]component{}
-	for name, entry := range openConfig.MCP {
+	for name, entry := range openConfig.MCP.Servers {
 		var target *string
 		if entry.Type == "local" {
 			target = commandOwner(entry.Command, mcpRoot)
 		}
 		components["mcp."+name] = discoveredComponent("mcp", name, target)
 	}
-	for _, raw := range append(openConfig.Plugin, tui.Plugin...) {
+	for _, raw := range append(openConfig.Plugins, cli.Plugins...) {
 		spec := pluginSpec(raw)
 		target := ownerTarget(localPath(spec, configRoot), pluginRoot)
 		name := pluginName(spec, target)

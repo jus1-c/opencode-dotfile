@@ -26,14 +26,14 @@ Never create or restore shared runtime directories at `CONFIG_DIR` root. In part
 
 ## Before Changing Anything
 
-1. Read `CONFIG_DIR/opencode.json`, `CONFIG_DIR/tui.json`, and the target component directory if it exists.
+1. Read `CONFIG_DIR/opencode.json`, `CONFIG_DIR/cli.json`, and the target component directory if it exists.
 2. Search `mcps/` and `plugins/` for the package/server name before adding another copy.
 3. Read the deployed updater contract and inventory before planning:
    - `CONFIG_DIR/plugins/opencode-component-updater/README.md`
    - `CONFIG_DIR/plugins/opencode-component-updater/config/components.example.json`
    - `CONFIG_DIR/component-updater/components.json`
 4. Confirm component kind and ownership. Prefer local ownership through `opencode-component-updater` whenever its release/install model can manage the component safely:
-   - Remote MCP or system-managed executable: config only. Do not create an empty local runtime.
+    - Remote MCP or system-managed executable: config only. Do not create an empty local runtime.
    - Local Python MCP: isolated component directory and `.venv`.
    - Local Node MCP: dependencies under that MCP's `runtime/`.
    - Local plugin: dependencies and build output under that plugin's directory.
@@ -88,7 +88,7 @@ Keep direct requirements in `requirements.in` and reproducible resolved requirem
   "command": [
     "~/.config/opencode/mcps/example/.venv/bin/example-mcp"
   ],
-  "enabled": true
+  "disabled": false
 }
 ```
 
@@ -108,15 +108,16 @@ For a remote endpoint, use `type: "remote"`, its URL, and `{env:VAR}` for any ne
 
 1. Put local source, `package.json`, lockfile, `node_modules/`, config, and build output under `plugins/<name>/`.
 2. Add local plugins to `opencode.json` with an absolute `file://~/.config/opencode/plugins/...` target. Use a directory target when it has `package.json`; use its explicit entry file otherwise.
-3. Add a plugin to `tui.json` only when it exports a TUI plugin and needs TUI loading. Keep its server entry in `opencode.json` when it also has server hooks.
+3. Add a plugin to `cli.json` only when it exports a CLI/TUI plugin and needs terminal-client loading. Keep its server entry in `opencode.json` when it also has server hooks.
 4. For a published npm plugin, prefer an isolated `plugins/<name>/` owner containing `package.json`, lockfile, and `node_modules`, load its package through an absolute `file://` target, and register its npm source with `opencode-component-updater`.
 5. Use an exact npm spec such as `@scope/package@x.y.z` only when local updater ownership is not supported or the user explicitly chooses OpenCode cache ownership. Never use a bare package or `@latest` by default.
 6. Do not move an existing local plugin to an npm spec, or vice versa, unless the user asks.
 
 ## Config and Secrets
 
-- Preserve `$schema`, existing entries, ordering, and unrelated fields in `opencode.json` and `tui.json`.
-- `mcp.<name>.command` must be an array of strings; local and remote MCP entries require the correct `type`.
+- Preserve `$schema`, existing entries, ordering, and unrelated fields in `opencode.json` and `cli.json`.
+- `mcp.servers.<name>.command` must be an array of strings; local and remote MCP entries require the correct `type`.
+- Use `disabled`, not `enabled`, for V2 MCP entries.
 - Set a timeout only when normal operations justify it; do not copy another MCP's timeout blindly.
 - Use `{env:NAME}` for new credentials in headers. Use `environment` for local MCP environment variables. Never write a new API key, token, password, or private key into config, logs, or a skill.
 - Do not add a root package manifest merely to install one plugin or MCP.
@@ -133,7 +134,7 @@ For a remote endpoint, use `type: "remote"`, its URL, and `{env:VAR}` for any ne
 
 1. Confirm every active local config path exists and belongs to the named component.
 2. Run the component's smallest harmless check: import/version/help/tool discovery, as applicable.
-3. Run `opencode debug info` and `opencode mcp list` after MCP or plugin config changes.
+3. Run `opencode debug config` and `opencode mcp list` after MCP or plugin config changes.
 4. For an MCP, make one read-only or discovery smoke call when practical.
 5. Validate updater config and confirm `opencode-component-updater status` recognizes the component. Do not run an update unless requested.
 6. Report owner directory, config entries, updater registration, version/lock source, and any external service still required.

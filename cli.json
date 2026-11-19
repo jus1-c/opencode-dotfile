@@ -1,6 +1,6 @@
 {
-  "$schema": "https://opencode.ai/tui.json",
-  "plugin": [
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "plugins": [
     "file://{env:HOME}/.config/opencode/plugins/quota",
     "file://{env:HOME}/.config/opencode/plugins/goal/node_modules/@prevalentware/opencode-goal-plugin",
     "file://{env:HOME}/.config/opencode/plugins/opencode-component-updater",

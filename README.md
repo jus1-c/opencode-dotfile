@@ -6,8 +6,8 @@ Personal [OpenCode](https://opencode.ai) harness, packaged to reinstall on any m
 
 | Path | Content |
 |------|---------|
-| `opencode.json` | Global config: MCP servers, providers, plugins. Secrets referenced via `{env:VAR}` |
-| `tui.json` | TUI plugin list |
+| `opencode.json` | V2 global config: MCP servers, providers, plugins. Secrets referenced via `{env:VAR}` |
+| `cli.json` | V2 global CLI/TUI settings and plugins |
 | `AGENTS.md` | Global agent rules (Context7 workflow, coding guidelines, math output) |
 | `skills/` | Local skills: karpathy-guidelines, context7-library-check, opencode-component-install, windows-disk-forensics |
 | `plugins/` | Local plugins: caveman, quota, rtk, headroom, headroom-ctl, llmgate-provider, vilao-provider, taste-skill, superpowers, opencode-component-updater |
@@ -34,6 +34,7 @@ SKIP=ghidra-mcp ./install.sh # skip the ~2GB Ghidra toolchain
 5. Installs npm deps (root + npm-sourced plugins)
 6. Builds each MCP venv with uv (per-MCP Python version from its `component-updater` CONFIG; uv downloads the interpreter if missing)
 7. Ghidra MCP: runs its self-updater (downloads JDK/Maven/Ghidra; needs `gh` CLI)
+8. Enables `frida-game-hacking` only when `FRIDA_PYTHON` is set
 
 ## Secrets
 
@@ -62,6 +63,11 @@ Auth and session state live outside the config dir and must be recreated per mac
 - `codegraph` binary (codegraph MCP)
 - `headroom` binary + `uv tool install headroom-ai` (headroom plugins/MCP)
 - `tshark`/`capinfos` (network-forensics MCP; absolute paths in `opencode.json` — adjust if yours live in `/usr/bin`)
+
+## OpenCode V2
+
+The repository uses native V2 configuration. OpenCode V2 keeps server settings in `opencode.json` and terminal settings
+in global `cli.json`; V1 `tui.json` is not used.
 
 ## Updating components
 

@@ -1,167 +1,209 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "snapshot": false,
+  "snapshots": false,
   "mcp": {
-    "log-analyzer": {
-      "type": "local",
-      "command": [
-        "{env:HOME}/.config/opencode/mcps/log-analyzer/.venv/bin/codesdevs-log-analyzer"
-      ],
-      "enabled": true
-    },
-    "ghidra-mcp": {
-      "type": "local",
-      "command": [
-        "{env:HOME}/.config/opencode/mcps/ghidra-mcp/bin/ghidra-mcp-launcher"
-      ],
-      "enabled": true,
-      "timeout": 600000
-    },
-    "disk-forensics": {
-      "type": "local",
-      "command": [
-        "{env:HOME}/.config/opencode/mcps/disk-forensics/.venv/bin/disk-forensics-mcp-server"
-      ],
-      "enabled": true,
-      "timeout": 900000
-    },
-    "mem-forensics": {
-      "type": "local",
-      "command": [
-        "{env:HOME}/.config/opencode/mcps/mem-forensics/.venv/bin/python",
-        "-m",
-        "mem_forensics_mcp_server"
-      ],
-      "enabled": true,
-      "timeout": 600000
-    },
-    "forensics-utils": {
-      "type": "local",
-      "command": [
-        "{env:HOME}/.config/opencode/mcps/forensics-utils/.venv/bin/python",
-        "-m",
-        "forensics_utils_mcp_server"
-      ],
-      "enabled": true,
-      "timeout": 300000,
-      "environment": {
-        "VIRUSTOTAL_API_KEY": "{env:VIRUSTOTAL_API_KEY}"
-      }
-    },
-    "windows-forensics": {
-      "type": "local",
-      "command": [
-        "{env:HOME}/.config/opencode/mcps/windows-forensics/.venv/bin/windows-forensics-mcp"
-      ],
-      "enabled": true,
-      "timeout": 300000
-    },
-    "network-forensics": {
-      "type": "local",
-      "command": [
-        "{env:HOME}/.config/opencode/mcps/network-forensics/.venv/bin/mcp-network-forensics"
-      ],
-      "enabled": true,
-      "timeout": 1800000,
-      "environment": {
-        "MCP_CASE_ROOT": "/tmp/mcp-network-forensics",
-        "TSHARK_PATH": "/usr/sbin/tshark",
-        "CAPINFOS_PATH": "/usr/sbin/capinfos",
-        "MCP_MAX_FILE_SIZE": "10737418240",
-        "MCP_MAX_PACKETS": "10000",
-        "MCP_TIMEOUT": "1800",
-        "MCP_EXTRACTION_BYTES": "21474836480",
-        "MCP_ARTIFACT_BYTES": "52428800",
-        "MCP_MAX_CONCURRENT_JOBS": "2",
-        "MCP_PLUGIN_MEMORY_BYTES": "2147483648",
-        "MCP_NAME_RESOLUTION": "false"
-      }
-    },
-    "context7": {
-      "type": "local",
-      "command": [
-        "npx",
-        "-y",
-        "@upstash/context7-mcp",
-        "--api-key",
-        "{env:CONTEXT7_API_KEY}"
-      ],
-      "enabled": true
-    },
-    "codegraph": {
-      "type": "local",
-      "command": [
-        "codegraph",
-        "serve",
-        "--mcp"
-      ],
-      "enabled": true
-    },
-    "markitdown": {
-      "type": "local",
-      "command": [
-        "{env:HOME}/.config/opencode/mcps/markitdown/.venv/bin/markitdown-mcp"
-      ],
-      "enabled": true,
-      "timeout": 300000
-    },
-    "frida-game-hacking": {
-      "type": "local",
-      "command": [
-        "{env:FRIDA_PYTHON}",
-        "-m",
-        "frida_game_hacking_mcp"
-      ],
-      "enabled": false,
-      "timeout": 300000
-    },
-    "headroom-memory": {
-      "type": "local",
-      "command": [
-        "{env:HOME}/.local/share/uv/tools/headroom-ai/bin/python",
-        "-m",
-        "headroom.memory.mcp_server",
-        "--db",
-        "{env:HOME}/.headroom/memory.db",
-        "--user",
-        "{env:USER}"
-      ],
-      "enabled": true
-    },
-    "anysearch": {
-      "type": "remote",
-      "url": "https://api.anysearch.com/mcp",
-      "enabled": true,
-      "headers": {
-        "Authorization": "Bearer {env:ANYSEARCH_BEARER}",
-        "X-Anysearch-Client": "mcp/1.0.0"
+    "servers": {
+      "log-analyzer": {
+        "type": "local",
+        "command": [
+          "{env:HOME}/.config/opencode/mcps/log-analyzer/.venv/bin/codesdevs-log-analyzer"
+        ],
+        "disabled": false
       },
-      "timeout": 300000
-    },
-    "cloakbrowser": {
-      "type": "local",
-      "command": [
-        "node",
-        "{env:HOME}/.config/opencode/mcps/cloakbrowser/bin/launcher.js"
-      ],
-      "enabled": true,
-      "timeout": 300000,
-      "environment": {
-        "PLAYWRIGHT_MCP_HEADLESS": "false",
-        "PLAYWRIGHT_MCP_OUTPUT_DIR": "/tmp/opencode/cloakbrowser-artifacts",
-        "PLAYWRIGHT_MCP_USER_DATA_DIR": "{env:HOME}/.local/state/opencode/cloakbrowser-profile"
+      "ghidra-mcp": {
+        "type": "local",
+        "command": [
+          "{env:HOME}/.config/opencode/mcps/ghidra-mcp/bin/ghidra-mcp-launcher"
+        ],
+        "timeout": {
+          "startup": 600000,
+          "catalog": 600000,
+          "execution": 600000
+        },
+        "disabled": false
+      },
+      "disk-forensics": {
+        "type": "local",
+        "command": [
+          "{env:HOME}/.config/opencode/mcps/disk-forensics/.venv/bin/disk-forensics-mcp-server"
+        ],
+        "timeout": {
+          "startup": 900000,
+          "catalog": 900000,
+          "execution": 900000
+        },
+        "disabled": false
+      },
+      "mem-forensics": {
+        "type": "local",
+        "command": [
+          "{env:HOME}/.config/opencode/mcps/mem-forensics/.venv/bin/python",
+          "-m",
+          "mem_forensics_mcp_server"
+        ],
+        "timeout": {
+          "startup": 600000,
+          "catalog": 600000,
+          "execution": 600000
+        },
+        "disabled": false
+      },
+      "forensics-utils": {
+        "type": "local",
+        "command": [
+          "{env:HOME}/.config/opencode/mcps/forensics-utils/.venv/bin/python",
+          "-m",
+          "forensics_utils_mcp_server"
+        ],
+        "timeout": {
+          "startup": 300000,
+          "catalog": 300000,
+          "execution": 300000
+        },
+        "environment": {
+          "VIRUSTOTAL_API_KEY": "{env:VIRUSTOTAL_API_KEY}"
+        },
+        "disabled": false
+      },
+      "windows-forensics": {
+        "type": "local",
+        "command": [
+          "{env:HOME}/.config/opencode/mcps/windows-forensics/.venv/bin/windows-forensics-mcp"
+        ],
+        "timeout": {
+          "startup": 300000,
+          "catalog": 300000,
+          "execution": 300000
+        },
+        "disabled": false
+      },
+      "network-forensics": {
+        "type": "local",
+        "command": [
+          "{env:HOME}/.config/opencode/mcps/network-forensics/.venv/bin/mcp-network-forensics"
+        ],
+        "timeout": {
+          "startup": 1800000,
+          "catalog": 1800000,
+          "execution": 1800000
+        },
+        "environment": {
+          "MCP_CASE_ROOT": "/tmp/mcp-network-forensics",
+          "TSHARK_PATH": "/usr/sbin/tshark",
+          "CAPINFOS_PATH": "/usr/sbin/capinfos",
+          "MCP_MAX_FILE_SIZE": "10737418240",
+          "MCP_MAX_PACKETS": "10000",
+          "MCP_TIMEOUT": "1800",
+          "MCP_EXTRACTION_BYTES": "21474836480",
+          "MCP_ARTIFACT_BYTES": "52428800",
+          "MCP_MAX_CONCURRENT_JOBS": "2",
+          "MCP_PLUGIN_MEMORY_BYTES": "2147483648",
+          "MCP_NAME_RESOLUTION": "false"
+        },
+        "disabled": false
+      },
+      "context7": {
+        "type": "local",
+        "command": [
+          "npx",
+          "-y",
+          "@upstash/context7-mcp",
+          "--api-key",
+          "{env:CONTEXT7_API_KEY}"
+        ],
+        "disabled": false
+      },
+      "codegraph": {
+        "type": "local",
+        "command": [
+          "codegraph",
+          "serve",
+          "--mcp"
+        ],
+        "disabled": false
+      },
+      "markitdown": {
+        "type": "local",
+        "command": [
+          "{env:HOME}/.config/opencode/mcps/markitdown/.venv/bin/markitdown-mcp"
+        ],
+        "timeout": {
+          "startup": 300000,
+          "catalog": 300000,
+          "execution": 300000
+        },
+        "disabled": false
+      },
+      "frida-game-hacking": {
+        "type": "local",
+        "command": [
+          "{env:FRIDA_PYTHON}",
+          "-m",
+          "frida_game_hacking_mcp"
+        ],
+        "timeout": {
+          "startup": 300000,
+          "catalog": 300000,
+          "execution": 300000
+        },
+        "disabled": true
+      },
+      "headroom-memory": {
+        "type": "local",
+        "command": [
+          "{env:HOME}/.local/share/uv/tools/headroom-ai/bin/python",
+          "-m",
+          "headroom.memory.mcp_server",
+          "--db",
+          "{env:HOME}/.headroom/memory.db",
+          "--user",
+          "{env:USER}"
+        ],
+        "disabled": false
+      },
+      "anysearch": {
+        "type": "remote",
+        "url": "https://api.anysearch.com/mcp",
+        "headers": {
+          "Authorization": "Bearer {env:ANYSEARCH_BEARER}",
+          "X-Anysearch-Client": "mcp/1.0.0"
+        },
+        "timeout": {
+          "startup": 300000,
+          "catalog": 300000,
+          "execution": 300000
+        },
+        "disabled": false
+      },
+      "cloakbrowser": {
+        "type": "local",
+        "command": [
+          "node",
+          "{env:HOME}/.config/opencode/mcps/cloakbrowser/bin/launcher.js"
+        ],
+        "timeout": {
+          "startup": 300000,
+          "catalog": 300000,
+          "execution": 300000
+        },
+        "environment": {
+          "PLAYWRIGHT_MCP_HEADLESS": "false",
+          "PLAYWRIGHT_MCP_OUTPUT_DIR": "/tmp/opencode/cloakbrowser-artifacts",
+          "PLAYWRIGHT_MCP_USER_DATA_DIR": "{env:HOME}/.local/state/opencode/cloakbrowser-profile"
+        },
+        "disabled": false
+      },
+      "headroom-ctl": {
+        "type": "local",
+        "command": [
+          "node",
+          "{env:HOME}/.config/opencode/mcps/headroom-ctl/bin/headroom-ctl.js"
+        ],
+        "disabled": false
       }
-    },
-    "headroom-ctl": {
-      "type": "local",
-      "command": [
-        "node",
-        "{env:HOME}/.config/opencode/mcps/headroom-ctl/bin/headroom-ctl.js"
-      ],
-      "enabled": true
     }
   },
-  "plugin": [
+  "plugins": [
     "file://{env:HOME}/.config/opencode/plugins/quota",
     "file://{env:HOME}/.config/opencode/plugins/caveman/plugin.js",
     "file://{env:HOME}/.config/opencode/plugins/headroom/dist/entry.opencode.js",
@@ -177,338 +219,550 @@
     "file://{env:HOME}/.config/opencode/plugins/superpowers/.opencode/plugins/superpowers.js",
     "file://{env:HOME}/.config/opencode/plugins/taste-skill"
   ],
-  "permission": {
-    "bash": "allow",
-    "external_directory": "allow"
-  },
+  "permissions": [
+    {
+      "action": "shell",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "external_directory",
+      "resource": "*",
+      "effect": "allow"
+    }
+  ],
   "shell": "/bin/zsh",
-  "provider": {
+  "providers": {
     "openai": {},
     "vilao": {},
     "kirobot_claude": {
-      "npm": "@ai-sdk/openai-compatible",
       "name": "KiroBot (Claude)",
-      "options": {
-        "apiKey": "{env:KIROBOT_CLAUDE_API_KEY}",
-        "baseURL": "https://api.xpiki.com/v1"
-      },
       "models": {
         "claude-opus-5": {
           "name": "Claude Opus 5",
           "family": "claude-opus",
-          "reasoning": true,
-          "tool_call": true,
-          "structured_output": true,
-          "temperature": false,
-          "attachment": true,
           "limit": {
             "context": 1000000,
             "output": 128000
           },
-          "variants": {
-            "low": {
-              "reasoningEffort": "low"
-            },
-            "medium": {
-              "reasoningEffort": "medium"
-            },
-            "high": {
-              "reasoningEffort": "high"
-            },
-            "xhigh": {
-              "reasoningEffort": "xhigh"
-            },
-            "max": {
-              "reasoningEffort": "max"
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "reasoning": {
+              "supported": true
             }
-          }
+          },
+          "variants": [
+            {
+              "id": "low",
+              "settings": {
+                "reasoningEffort": "low"
+              }
+            },
+            {
+              "id": "medium",
+              "settings": {
+                "reasoningEffort": "medium"
+              }
+            },
+            {
+              "id": "high",
+              "settings": {
+                "reasoningEffort": "high"
+              }
+            },
+            {
+              "id": "xhigh",
+              "settings": {
+                "reasoningEffort": "xhigh"
+              }
+            },
+            {
+              "id": "max",
+              "settings": {
+                "reasoningEffort": "max"
+              }
+            }
+          ]
         },
         "claude-opus-4-8": {
           "name": "Claude Opus 4.8",
           "family": "claude-opus",
-          "reasoning": true,
-          "tool_call": true,
-          "structured_output": true,
-          "temperature": false,
-          "attachment": true,
           "limit": {
             "context": 1000000,
             "output": 128000
           },
-          "variants": {
-            "low": {
-              "reasoningEffort": "low"
-            },
-            "medium": {
-              "reasoningEffort": "medium"
-            },
-            "high": {
-              "reasoningEffort": "high"
-            },
-            "xhigh": {
-              "reasoningEffort": "xhigh"
-            },
-            "max": {
-              "reasoningEffort": "max"
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "reasoning": {
+              "supported": true
             }
-          }
+          },
+          "variants": [
+            {
+              "id": "low",
+              "settings": {
+                "reasoningEffort": "low"
+              }
+            },
+            {
+              "id": "medium",
+              "settings": {
+                "reasoningEffort": "medium"
+              }
+            },
+            {
+              "id": "high",
+              "settings": {
+                "reasoningEffort": "high"
+              }
+            },
+            {
+              "id": "xhigh",
+              "settings": {
+                "reasoningEffort": "xhigh"
+              }
+            },
+            {
+              "id": "max",
+              "settings": {
+                "reasoningEffort": "max"
+              }
+            }
+          ]
         },
         "claude-opus-4-7": {
           "name": "Claude Opus 4.7",
           "family": "claude-opus",
-          "reasoning": true,
-          "tool_call": true,
-          "structured_output": true,
-          "temperature": false,
-          "attachment": true,
           "limit": {
             "context": 1000000,
             "output": 128000
           },
-          "variants": {
-            "low": {
-              "reasoningEffort": "low"
-            },
-            "medium": {
-              "reasoningEffort": "medium"
-            },
-            "high": {
-              "reasoningEffort": "high"
-            },
-            "xhigh": {
-              "reasoningEffort": "xhigh"
-            },
-            "max": {
-              "reasoningEffort": "max"
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "reasoning": {
+              "supported": true
             }
-          }
+          },
+          "variants": [
+            {
+              "id": "low",
+              "settings": {
+                "reasoningEffort": "low"
+              }
+            },
+            {
+              "id": "medium",
+              "settings": {
+                "reasoningEffort": "medium"
+              }
+            },
+            {
+              "id": "high",
+              "settings": {
+                "reasoningEffort": "high"
+              }
+            },
+            {
+              "id": "xhigh",
+              "settings": {
+                "reasoningEffort": "xhigh"
+              }
+            },
+            {
+              "id": "max",
+              "settings": {
+                "reasoningEffort": "max"
+              }
+            }
+          ]
         },
         "claude-sonnet-5": {
           "name": "Claude Sonnet 5",
           "family": "claude-sonnet",
-          "reasoning": true,
-          "tool_call": true,
-          "structured_output": true,
-          "temperature": false,
-          "attachment": true,
           "limit": {
             "context": 1000000,
             "output": 128000
           },
-          "variants": {
-            "low": {
-              "reasoningEffort": "low"
-            },
-            "medium": {
-              "reasoningEffort": "medium"
-            },
-            "high": {
-              "reasoningEffort": "high"
-            },
-            "xhigh": {
-              "reasoningEffort": "xhigh"
-            },
-            "max": {
-              "reasoningEffort": "max"
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "reasoning": {
+              "supported": true
             }
-          }
+          },
+          "variants": [
+            {
+              "id": "low",
+              "settings": {
+                "reasoningEffort": "low"
+              }
+            },
+            {
+              "id": "medium",
+              "settings": {
+                "reasoningEffort": "medium"
+              }
+            },
+            {
+              "id": "high",
+              "settings": {
+                "reasoningEffort": "high"
+              }
+            },
+            {
+              "id": "xhigh",
+              "settings": {
+                "reasoningEffort": "xhigh"
+              }
+            },
+            {
+              "id": "max",
+              "settings": {
+                "reasoningEffort": "max"
+              }
+            }
+          ]
         },
         "claude-sonnet-4-6": {
           "name": "Claude Sonnet 4.6",
           "family": "claude-sonnet",
-          "reasoning": true,
-          "tool_call": true,
-          "structured_output": true,
-          "temperature": true,
-          "attachment": true,
           "limit": {
             "context": 1000000,
             "output": 128000
           },
-          "variants": {
-            "low": {
-              "reasoningEffort": "low"
-            },
-            "medium": {
-              "reasoningEffort": "medium"
-            },
-            "high": {
-              "reasoningEffort": "high"
-            },
-            "max": {
-              "reasoningEffort": "max"
+          "capabilities": {
+            "tools": true,
+            "temperature": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "reasoning": {
+              "supported": true
             }
-          }
+          },
+          "variants": [
+            {
+              "id": "low",
+              "settings": {
+                "reasoningEffort": "low"
+              }
+            },
+            {
+              "id": "medium",
+              "settings": {
+                "reasoningEffort": "medium"
+              }
+            },
+            {
+              "id": "high",
+              "settings": {
+                "reasoningEffort": "high"
+              }
+            },
+            {
+              "id": "max",
+              "settings": {
+                "reasoningEffort": "max"
+              }
+            }
+          ]
         },
         "claude-haiku-4-5": {
           "name": "Claude Haiku 4.5",
           "family": "claude-haiku",
-          "reasoning": true,
-          "tool_call": true,
-          "structured_output": true,
-          "temperature": true,
-          "attachment": true,
           "limit": {
             "context": 200000,
             "output": 64000
+          },
+          "capabilities": {
+            "tools": true,
+            "temperature": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "reasoning": {
+              "supported": true
+            }
           }
         },
         "claude-fable-5": {
           "name": "Claude Fable 5",
           "family": "claude-fable",
-          "reasoning": true,
-          "tool_call": true,
-          "structured_output": true,
-          "temperature": false,
-          "attachment": true,
           "limit": {
             "context": 1000000,
             "output": 128000
           },
-          "variants": {
-            "low": {
-              "reasoningEffort": "low"
-            },
-            "medium": {
-              "reasoningEffort": "medium"
-            },
-            "high": {
-              "reasoningEffort": "high"
-            },
-            "xhigh": {
-              "reasoningEffort": "xhigh"
-            },
-            "max": {
-              "reasoningEffort": "max"
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "reasoning": {
+              "supported": true
             }
-          }
+          },
+          "variants": [
+            {
+              "id": "low",
+              "settings": {
+                "reasoningEffort": "low"
+              }
+            },
+            {
+              "id": "medium",
+              "settings": {
+                "reasoningEffort": "medium"
+              }
+            },
+            {
+              "id": "high",
+              "settings": {
+                "reasoningEffort": "high"
+              }
+            },
+            {
+              "id": "xhigh",
+              "settings": {
+                "reasoningEffort": "xhigh"
+              }
+            },
+            {
+              "id": "max",
+              "settings": {
+                "reasoningEffort": "max"
+              }
+            }
+          ]
         }
+      },
+      "package": "aisdk:@ai-sdk/openai-compatible",
+      "settings": {
+        "apiKey": "{env:KIROBOT_CLAUDE_API_KEY}",
+        "baseURL": "https://api.xpiki.com/v1"
       }
     },
     "kirobot_gpt": {
-      "npm": "@ai-sdk/openai-compatible",
       "name": "KiroBot (GPT)",
-      "options": {
-        "apiKey": "{env:KIROBOT_GPT_API_KEY}",
-        "baseURL": "https://api.xpiki.com/v1"
-      },
       "models": {
         "gpt-6-astra": {
           "name": "GPT 6 Astra",
-          "reasoning": true,
-          "tool_call": true,
-          "structured_output": true,
-          "temperature": false,
-          "attachment": true,
           "limit": {
             "context": 1000000,
             "output": 128000
           },
-          "variants": {
-            "low": {
-              "reasoningEffort": "low"
-            },
-            "medium": {
-              "reasoningEffort": "medium"
-            },
-            "high": {
-              "reasoningEffort": "high"
-            },
-            "xhigh": {
-              "reasoningEffort": "xhigh"
-            },
-            "max": {
-              "reasoningEffort": "max"
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "reasoning": {
+              "supported": true
             }
-          }
+          },
+          "variants": [
+            {
+              "id": "low",
+              "settings": {
+                "reasoningEffort": "low"
+              }
+            },
+            {
+              "id": "medium",
+              "settings": {
+                "reasoningEffort": "medium"
+              }
+            },
+            {
+              "id": "high",
+              "settings": {
+                "reasoningEffort": "high"
+              }
+            },
+            {
+              "id": "xhigh",
+              "settings": {
+                "reasoningEffort": "xhigh"
+              }
+            },
+            {
+              "id": "max",
+              "settings": {
+                "reasoningEffort": "max"
+              }
+            }
+          ]
         },
         "gpt-5.6-sol": {
           "name": "GPT 5.6 Sol",
-          "reasoning": true,
-          "tool_call": true,
-          "structured_output": true,
-          "temperature": false,
-          "attachment": true,
           "limit": {
             "context": 1000000,
             "output": 128000
           },
-          "variants": {
-            "low": {
-              "reasoningEffort": "low"
-            },
-            "medium": {
-              "reasoningEffort": "medium"
-            },
-            "high": {
-              "reasoningEffort": "high"
-            },
-            "xhigh": {
-              "reasoningEffort": "xhigh"
-            },
-            "max": {
-              "reasoningEffort": "max"
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "reasoning": {
+              "supported": true
             }
-          }
+          },
+          "variants": [
+            {
+              "id": "low",
+              "settings": {
+                "reasoningEffort": "low"
+              }
+            },
+            {
+              "id": "medium",
+              "settings": {
+                "reasoningEffort": "medium"
+              }
+            },
+            {
+              "id": "high",
+              "settings": {
+                "reasoningEffort": "high"
+              }
+            },
+            {
+              "id": "xhigh",
+              "settings": {
+                "reasoningEffort": "xhigh"
+              }
+            },
+            {
+              "id": "max",
+              "settings": {
+                "reasoningEffort": "max"
+              }
+            }
+          ]
         },
         "gpt-5.6-terra": {
           "name": "GPT 5.6 Terra",
-          "reasoning": true,
-          "tool_call": true,
-          "structured_output": true,
-          "temperature": false,
-          "attachment": true,
           "limit": {
             "context": 1000000,
             "output": 128000
           },
-          "variants": {
-            "low": {
-              "reasoningEffort": "low"
-            },
-            "medium": {
-              "reasoningEffort": "medium"
-            },
-            "high": {
-              "reasoningEffort": "high"
-            },
-            "xhigh": {
-              "reasoningEffort": "xhigh"
-            },
-            "max": {
-              "reasoningEffort": "max"
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "reasoning": {
+              "supported": true
             }
-          }
+          },
+          "variants": [
+            {
+              "id": "low",
+              "settings": {
+                "reasoningEffort": "low"
+              }
+            },
+            {
+              "id": "medium",
+              "settings": {
+                "reasoningEffort": "medium"
+              }
+            },
+            {
+              "id": "high",
+              "settings": {
+                "reasoningEffort": "high"
+              }
+            },
+            {
+              "id": "xhigh",
+              "settings": {
+                "reasoningEffort": "xhigh"
+              }
+            },
+            {
+              "id": "max",
+              "settings": {
+                "reasoningEffort": "max"
+              }
+            }
+          ]
         },
         "gpt-5.6-luna": {
           "name": "GPT 5.6 Luna",
-          "reasoning": true,
-          "tool_call": true,
-          "structured_output": true,
-          "temperature": false,
-          "attachment": true,
           "limit": {
             "context": 1000000,
             "output": 128000
           },
-          "variants": {
-            "low": {
-              "reasoningEffort": "low"
-            },
-            "medium": {
-              "reasoningEffort": "medium"
-            },
-            "high": {
-              "reasoningEffort": "high"
-            },
-            "xhigh": {
-              "reasoningEffort": "xhigh"
-            },
-            "max": {
-              "reasoningEffort": "max"
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "reasoning": {
+              "supported": true
             }
-          }
+          },
+          "variants": [
+            {
+              "id": "low",
+              "settings": {
+                "reasoningEffort": "low"
+              }
+            },
+            {
+              "id": "medium",
+              "settings": {
+                "reasoningEffort": "medium"
+              }
+            },
+            {
+              "id": "high",
+              "settings": {
+                "reasoningEffort": "high"
+              }
+            },
+            {
+              "id": "xhigh",
+              "settings": {
+                "reasoningEffort": "xhigh"
+              }
+            },
+            {
+              "id": "max",
+              "settings": {
+                "reasoningEffort": "max"
+              }
+            }
+          ]
         }
+      },
+      "package": "aisdk:@ai-sdk/openai-compatible",
+      "settings": {
+        "apiKey": "{env:KIROBOT_GPT_API_KEY}",
+        "baseURL": "https://api.xpiki.com/v1"
       }
     }
   }

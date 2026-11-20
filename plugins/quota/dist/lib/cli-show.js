@@ -1,28 +1,53 @@
-import { resolve } from "path";
+/**
+ * `opencode-quota show` and `status`, and the frame every terminal report runs in: the settings (prices
+ * included), the logins from OpenCode's database, and the providers OpenCode knows.
+ */
+import { resolve } from "node:path";
+import { loadSettings } from "../settings/index.js";
+import { offProviderId, PROVIDER_IDS } from "../settings/schema.js";
 import { hasAnthropicCredentialsConfigured } from "./anthropic.js";
-import { findGitWorktreeRoot, getEffectiveConfigRoot } from "./config-file-utils.js";
-import { sanitizeQuotaRenderData } from "./display-sanitize.js";
-import { formatQuotaRows } from "./format.js";
-import { DEFAULT_KIMI_AUTH_CACHE_MAX_AGE_MS, resolveKimiAuthCached } from "./kimi-auth.js";
-import { loadConfiguredOpenCodeConfig, loadConfiguredProviderIds, } from "./opencode-config-providers.js";
-import { getQuotaProviderShape } from "./provider-metadata.js";
-import { buildQuotaExport, createExportProviderContext } from "./quota-export.js";
-import { resolveQuotaFormatStyle } from "./quota-format-style.js";
-import { collectQuotaRenderData } from "./quota-render-data.js";
-import { createQuotaRuntimeRequestContext, resolveQuotaRuntimeContext, } from "./quota-runtime-context.js";
-import { getPackageVersion } from "./version.js";
-const SHOW_USAGE = [
-    "Usage:",
-    "  npx @slkiser/opencode-quota show [--provider <provider-id>] [--json] [--threshold <pct>]",
-    "",
-    "Options:",
-    "  --provider <provider-id>  Show quota for one provider",
-    "  --json                    Machine-readable JSON output (reads from cache)",
-    "  --threshold <pct>         With --json, exit 1 if any complete cached percentage is below",
-    "                            <pct>% remaining (exit 2 if data is incomplete or not comparable)",
-    "  --help, -h                Show help",
-].join("\n");
-function parseShowArgs(argv) {
+import { API_KEY_VENDORS, resolveApiKeyLogin } from "./api-key-resolver.js";
+import { buildCliShowJson, buildCliShowText, buildCliStatus, } from "./cli-reports.js";
+import { findGitWorktreeRoot } from "./config-file-utils.js";
+import { usePricingSettings } from "./modelsdev-pricing.js";
+import { createSqliteCredentialSource } from "./opencode-auth-sqlite.js";
+import { bindCredentialSource } from "./opencode-auth.js";
+import { loadConfiguredProviderIds } from "./opencode-config-providers.js";
+import { resolveOpenCodeConsoleAuth } from "./opencode-console-auth.js";
+import { getCanonicalQuotaProviderId } from "./provider-metadata.js";
+const USAGE = {
+    show: [
+        "Usage:",
+        "  npx @slkiser/opencode-quota show [--provider <provider-id>] [--json] [--threshold <pct>]",
+        "",
+        "Options:",
+        "  --provider <provider-id>  Show quota for one provider",
+        "  --json                    Machine-readable JSON output (the last known quota)",
+        "  --threshold <pct>         With --json, exit 1 if any complete saved percentage is below",
+        "                            <pct>% remaining (exit 2 if data is incomplete or not comparable)",
+        "  --help, -h                Show help",
+    ].join("\n"),
+    status: [
+        "Usage:",
+        "  npx @slkiser/opencode-quota status [--provider <provider-id>] [--json]",
+        "",
+        "Print the same Quota Status diagnostics as the /quota_status slash command,",
+        "without launching OpenCode.",
+        "",
+        "Options:",
+        "  --provider <provider-id>  Restrict provider availability and live probes to one provider",
+        "  --json                    Machine-readable JSON output:",
+        "                            { version, generatedAt, config, providers, pricing, liveProbes }",
+        "  --help, -h                Show help",
+        "",
+        "Exit codes:",
+        "  0  success",
+        "  1  error",
+        "  2  no comparable provider data (with --json only)",
+    ].join("\n"),
+};
+const THRESHOLD_REDIRECT = "--threshold is not supported by status. For threshold exit codes, use: opencode-quota show --json --threshold <pct>";
+function parseArgs(command, argv) {
     let providerId;
     let json = false;
     let threshold;
@@ -36,6 +61,8 @@ function parseShowArgs(argv) {
             continue;
         }
         if (arg === "--threshold" || arg.startsWith("--threshold=")) {
+            if (command === "status")
+                return { ok: false, error: THRESHOLD_REDIRECT };
             let value;
             if (arg === "--threshold") {
                 value = argv[index + 1];
@@ -57,27 +84,17 @@ function parseShowArgs(argv) {
             threshold = num;
             continue;
         }
-        if (arg === "--provider") {
-            const value = argv[index + 1];
-            if (!value || value.startsWith("-")) {
+        if (arg === "--provider" || arg.startsWith("--provider=")) {
+            const value = arg === "--provider" ? argv[index + 1] : arg.slice("--provider=".length).trim();
+            if (!value || (arg === "--provider" && value.startsWith("-"))) {
                 return { ok: false, error: "Missing value for --provider." };
             }
             if (providerId) {
                 return { ok: false, error: "Specify --provider only once." };
             }
             providerId = value;
-            index += 1;
-            continue;
-        }
-        if (arg.startsWith("--provider=")) {
-            const value = arg.slice("--provider=".length).trim();
-            if (!value) {
-                return { ok: false, error: "Missing value for --provider." };
-            }
-            if (providerId) {
-                return { ok: false, error: "Specify --provider only once." };
-            }
-            providerId = value;
+            if (arg === "--provider")
+                index += 1;
             continue;
         }
         if (arg.startsWith("-")) {
@@ -90,68 +107,37 @@ function parseShowArgs(argv) {
     }
     return { ok: true, providerId, help: false, json, threshold };
 }
-function cloneCliConfig(config) {
-    return {
-        ...config,
-        enabledProviders: Array.isArray(config.enabledProviders)
-            ? [...config.enabledProviders]
-            : config.enabledProviders,
-        googleModels: [...config.googleModels],
-        opencodeGoWindows: [...config.opencodeGoWindows],
-        pricingSnapshot: { ...config.pricingSnapshot },
-        layout: { ...config.layout },
-        showSessionTokens: false,
-    };
-}
-export function resolveCliRoots(cwd) {
-    const fallbackDirectory = resolve(cwd);
-    const worktreeRoot = findGitWorktreeRoot(fallbackDirectory) ?? fallbackDirectory;
-    const configRoot = getEffectiveConfigRoot(worktreeRoot);
-    return {
-        workspaceRoot: worktreeRoot,
-        configRoot,
-        fallbackDirectory,
-    };
-}
-function isRecord(value) {
-    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-async function loadCliAuthenticatedProviderIds(config) {
-    const experimental = isRecord(config.experimental) ? config.experimental : undefined;
-    const quotaToast = isRecord(experimental?.quotaToast) ? experimental.quotaToast : undefined;
-    const anthropicBinaryPath = typeof quotaToast?.anthropicBinaryPath === "string"
-        ? quotaToast.anthropicBinaryPath
-        : undefined;
-    const [anthropicConfigured, kimiAuth] = await Promise.all([
+/**
+ * Logins OpenCode may not list as providers: the Claude CLI, the Kimi CLI and the Console
+ * sign-in. OpenCode lists Go from the Console's own answer; here Go's Console check decides.
+ */
+async function loadCliAuthenticatedProviderIds(anthropicBinaryPath, directory) {
+    const [anthropicConfigured, kimiGlobalAuth, kimiCnAuth, consoleAuth] = await Promise.all([
         hasAnthropicCredentialsConfigured({ binaryPath: anthropicBinaryPath }),
-        resolveKimiAuthCached({ maxAgeMs: DEFAULT_KIMI_AUTH_CACHE_MAX_AGE_MS }),
+        resolveApiKeyLogin(API_KEY_VENDORS["kimi-code-plan-global"], directory),
+        resolveApiKeyLogin(API_KEY_VENDORS["kimi-code-plan-cn"], directory),
+        resolveOpenCodeConsoleAuth(),
     ]);
     return [
         ...(anthropicConfigured ? ["anthropic"] : []),
-        ...(kimiAuth.state === "configured" ? ["kimi-for-coding"] : []),
+        ...(kimiGlobalAuth.state === "configured" ? ["kimi-code-plan-global"] : []),
+        ...(kimiCnAuth.state === "configured" ? ["kimi-code-plan-cn"] : []),
+        ...(consoleAuth.state === "none" ? [] : ["opencode-go"]),
     ];
 }
+/**
+ * OpenCode's provider list without OpenCode: its config files that count for `directory`, plus
+ * the CLI logins.
+ */
 export function createCliQuotaClient(params) {
-    let configPromise;
     let providerIdsPromise;
     return {
         config: {
-            get: async () => {
-                configPromise ??= loadConfiguredOpenCodeConfig({
-                    configRootDir: params.configRootDir,
-                });
-                return {
-                    data: (await configPromise),
-                };
-            },
             providers: async () => {
                 providerIdsPromise ??= (async () => {
-                    configPromise ??= loadConfiguredOpenCodeConfig({
-                        configRootDir: params.configRootDir,
-                    });
                     const [configuredIds, authenticatedIds] = await Promise.all([
-                        loadConfiguredProviderIds({ configRootDir: params.configRootDir }),
-                        configPromise.then(loadCliAuthenticatedProviderIds),
+                        loadConfiguredProviderIds(params.directory),
+                        loadCliAuthenticatedProviderIds(params.anthropicBinaryPath, params.directory),
                     ]);
                     return [...new Set([...configuredIds, ...authenticatedIds])];
                 })();
@@ -165,140 +151,99 @@ export function createCliQuotaClient(params) {
         },
     };
 }
+/** `--provider`: that provider only, as if the settings enabled only it. */
+function withOnlyProvider(host, providerId) {
+    if (!providerId)
+        return host;
+    const loaded = host.settings();
+    const providers = {
+        ...loaded.settings.providers,
+        off: PROVIDER_IDS.filter((id) => id !== offProviderId(providerId)),
+    };
+    const only = { ...loaded, settings: { ...loaded.settings, providers } };
+    return { ...host, settings: () => only };
+}
 function writeLine(stream, message) {
     stream.write(message.endsWith("\n") ? message : `${message}\n`);
 }
-async function runCliShowJsonOutput(params) {
-    const { runtime, providerId, threshold, stdout } = params;
-    const config = cloneCliConfig(runtime.config);
-    if (providerId) {
-        config.enabledProviders = [providerId];
+/**
+ * Builds one `show` or `status` report in this process, for the folder the command runs in,
+ * and prints it. It works with OpenCode closed: logins are read read-only from OpenCode's
+ * database, and only while the report runs.
+ */
+async function runCliReport(params) {
+    const unbind = bindCredentialSource(createSqliteCredentialSource());
+    let unbindPricingSettings = () => { };
+    try {
+        // The folder the command runs in stands for OpenCode's session folder.
+        const locationDirectory = resolve(params.cwd);
+        const workspaceRoot = findGitWorktreeRoot(locationDirectory) ?? locationDirectory;
+        // The terminal reads the settings as they are; only OpenCode writes the v5 conversion.
+        const loaded = await loadSettings({ projectDir: workspaceRoot });
+        unbindPricingSettings = usePricingSettings(() => loaded.settings.providers.pricing);
+        const host = {
+            client: createCliQuotaClient({
+                directory: locationDirectory,
+                anthropicBinaryPath: loaded.settings.providers.anthropic.binaryPath,
+            }),
+            workspaceRoot,
+            locationDirectory,
+            settings: () => loaded,
+            providers: params.providers,
+        };
+        const report = await params.build(host);
+        params.stdout.write(report.stdout);
+        params.stderr.write(report.stderr);
+        return report.exitCode;
     }
-    const allProviders = runtime.providers.filter((p) => {
-        if (config.enabledProviders === "auto")
-            return true;
-        return config.enabledProviders.includes(p.id);
-    });
-    // Read cached quota through the shared export context so the cache key
-    // matches the one the TUI background writer used. Without this, a user with
-    // onlyCurrentModel:true would compute a different key and every provider
-    // would read back as "unavailable".
-    const ctx = createExportProviderContext(runtime);
-    const exportData = await buildQuotaExport({
-        providers: allProviders,
-        ctx,
-        ttlMs: config.minIntervalMs,
-        fromCache: true,
-    });
-    writeLine(stdout, JSON.stringify(exportData, null, 2));
-    if (threshold !== undefined) {
-        const providerResults = Object.values(exportData.providers);
-        if (providerResults.some((provider) => provider.status !== "ok")) {
-            return 2;
-        }
-        const okProviders = providerResults.filter((p) => p.status === "ok");
-        if (okProviders.length === 0) {
-            // No cached quota to compare against: distinct from "below threshold" (1).
-            return 2;
-        }
-        let hasComparablePercent = false;
-        for (const provider of okProviders) {
-            const percents = provider.entries
-                .filter((entry) => entry.renderType === "percent")
-                .map((entry) => entry.percentRemaining);
-            if (percents.length === 0)
-                continue;
-            hasComparablePercent = true;
-            const minPercent = Math.min(...percents);
-            if (minPercent < threshold) {
-                return 1;
-            }
-        }
-        if (!hasComparablePercent) {
-            return 2;
-        }
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        writeLine(params.stderr, `${params.failurePrefix}: ${message}`);
+        return 1;
     }
-    return 0;
+    finally {
+        unbind();
+        unbindPricingSettings();
+    }
 }
-export async function runCliShowCommand(options = {}) {
-    const argv = options.argv ?? process.argv.slice(3);
+/** Parses the arguments, prints the usage or an argument error, else runs the report. */
+async function runCliCommand(command, options, build) {
     const stdout = options.stdout ?? process.stdout;
     const stderr = options.stderr ?? process.stderr;
-    const parsed = parseShowArgs(argv);
+    const parsed = parseArgs(command, options.argv ?? process.argv.slice(3));
     if (!parsed.ok) {
         writeLine(stderr, parsed.error);
-        writeLine(stderr, SHOW_USAGE);
+        writeLine(stderr, USAGE[command]);
         return 1;
     }
     if (parsed.help) {
-        writeLine(stdout, SHOW_USAGE);
+        writeLine(stdout, USAGE[command]);
         return 0;
     }
-    const providerId = parsed.providerId ? getQuotaProviderShape(parsed.providerId)?.id : undefined;
+    const providerId = parsed.providerId ? getCanonicalQuotaProviderId(parsed.providerId) : undefined;
     if (parsed.providerId && !providerId) {
         writeLine(stderr, `Unknown provider: ${parsed.providerId}`);
         return 1;
     }
-    try {
-        const roots = resolveCliRoots(options.cwd ?? process.cwd());
-        const client = createCliQuotaClient({ configRootDir: roots.configRoot });
-        const runtime = await resolveQuotaRuntimeContext({
-            client,
-            roots,
-            includeSessionMeta: false,
-        });
-        if (!runtime.config.enabled) {
-            writeLine(stderr, "Quota disabled in config (enabled: false).");
-            return 1;
-        }
-        if (parsed.json) {
-            return runCliShowJsonOutput({
-                runtime,
-                providerId,
-                threshold: parsed.threshold,
-                stdout,
-            });
-        }
-        const config = cloneCliConfig(runtime.config);
-        if (providerId) {
-            config.enabledProviders = [providerId];
-        }
-        const result = await collectQuotaRenderData({
-            client: runtime.client,
-            resolveRuntimeProviderIds: runtime.resolveRuntimeProviderIds,
-            config,
-            configMeta: runtime.configMeta,
-            request: createQuotaRuntimeRequestContext(runtime),
-            surfaceExplicitProviderIssues: true,
-            formatStyle: resolveQuotaFormatStyle(config.formatStyle),
-            providers: runtime.providers,
-        });
-        if (!result.data) {
-            writeLine(stderr, "No provider data available.");
-            return 1;
-        }
-        const data = sanitizeQuotaRenderData(result.data);
-        const version = (await getPackageVersion()) ?? "";
-        const output = formatQuotaRows({
-            version,
-            layout: config.layout,
-            entries: data.entries,
-            errors: data.errors,
-            style: resolveQuotaFormatStyle(config.formatStyle),
-            percentDisplayMode: config.percentDisplayMode,
-            resetTimeDecimals: config.resetTimeDecimals,
-        });
-        if (!output.trim()) {
-            writeLine(stderr, "No provider data available.");
-            return 1;
-        }
-        writeLine(stdout, output);
-        return data.entries.length > 0 ? 0 : 1;
-    }
-    catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        writeLine(stderr, `Failed to show quota: ${message}`);
-        return 1;
-    }
+    return runCliReport({
+        cwd: options.cwd ?? process.cwd(),
+        failurePrefix: command === "show" ? "Failed to show quota" : "Failed to generate quota status",
+        build: (host) => build(host, { ...parsed, providerId }),
+        stdout,
+        stderr,
+        providers: options.providers,
+    });
+}
+export function runCliShowCommand(options = {}) {
+    return runCliCommand("show", options, (host, args) => {
+        const only = withOnlyProvider(host, args.providerId);
+        return args.json
+            ? buildCliShowJson({ host: only, threshold: args.threshold })
+            : buildCliShowText(only);
+    });
+}
+/** `status`: the same Quota Status diagnostics as /quota_status, without OpenCode. */
+export function runCliStatusCommand(options = {}) {
+    return runCliCommand("status", options, (host, args) => buildCliStatus({ host, providerId: args.providerId, json: args.json }));
 }
 //# sourceMappingURL=cli-show.js.map

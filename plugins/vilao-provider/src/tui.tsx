@@ -137,7 +137,6 @@ const plugin: TuiPluginModule & { id: string } = {
     };
 
     api.keymap.registerLayer({
-      mode: "base",
       commands: [{
         name: "vilao.model.settings",
         title: "Vilao model settings",

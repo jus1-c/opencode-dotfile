@@ -1,43 +1,39 @@
-import { homedir } from "os";
-import { join } from "path";
+/**
+ * The export file (version 3) for scripts and status bars, and `opencode-quota show --json`,
+ * written from quota rows. Each check gives its provider's part of the file
+ * (`exportProviderFromCheck`, from the check's rows as the snapshot shows them): the server
+ * keeps that part, in memory only, next to the provider's snapshot, so the file shows the last
+ * check, a failed one too. A provider without one (in the terminal command, or before its first
+ * check since the server started) is written from its snapshot.
+ */
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { describeError } from "../core/errors.js";
+import { rowValueText } from "../view/format.js";
 import { writeJsonAtomic } from "./atomic-json.js";
 import { sanitizeSingleLineDisplaySnippet } from "./display-sanitize.js";
-import { isValueEntry } from "./entries.js";
 import { getOpencodeRuntimeDirs } from "./opencode-runtime-paths.js";
-import { MAINTAINED_LOCAL_ESTIMATE_IDS } from "./quota-providers.js";
-import { normalizeSingleWindowWindowLabel } from "./quota-render-data.js";
-import { createQuotaProviderRuntimeContext } from "./quota-runtime-context.js";
-import { readCachedProviderResult } from "./quota-state.js";
+import { isRetiredEstimateTuning, QUOTA_PROVIDERS_AGGREGATE_ID, } from "./quota-providers.js";
 /** Max length for an exported provider error message after sanitization. */
 const EXPORT_ERROR_MAX_LENGTH = 240;
-/**
- * Builds the provider context used to read cached quota for export.
- *
- * The cache key is derived from these fields, so it MUST match the one the TUI
- * background writer used (`onlyCurrentModel: false`, no session). Otherwise a
- * user with `onlyCurrentModel: true` would compute a different key than the one
- * the cache was written under, turning every provider into "unavailable".
- *
- * Both export surfaces (CLI `show --json` and the TUI periodic writer) must go
- * through this helper so the cache-key contract lives in one place.
- */
-export function createExportProviderContext(runtime) {
-    return createQuotaProviderRuntimeContext({
-        ...runtime,
-        config: {
-            ...runtime.config,
-            onlyCurrentModel: false,
-            showSessionTokens: false,
-        },
-        session: {},
-        configureTelemetry: false,
-    });
-}
+const EXPORT_WINDOW_LABELS = {
+    rpm: "RPM",
+    hour: "Hourly",
+    five_hour: "5h",
+    session: "Session",
+    day: "Daily",
+    week: "Weekly",
+    month: "Monthly",
+    year: "Yearly",
+    mcp: "MCP",
+    code_review: "Code Review",
+};
 /**
  * Resolves the export file path from a configured value.
  *
  * - Empty string → XDG cache default: `$XDG_CACHE_HOME/opencode/quota-export.json`
  * - Starts with `~/` → expands `~` to `homedir()`
+ * - Starts with `~\` → expands `~` and treats backslashes as path separators
  * - Otherwise → returns as-is (caller is responsible for absolute paths)
  */
 export function resolveExportPath(configured) {
@@ -47,11 +43,11 @@ export function resolveExportPath(configured) {
     if (configured.startsWith("~/")) {
         return join(homedir(), configured.slice(2));
     }
+    if (configured.startsWith("~\\")) {
+        return join(homedir(), ...configured.slice(2).split(/\\+/u));
+    }
     return configured;
 }
-/**
- * Maps a `QuotaToastEntry` to a `QuotaExportEntry`.
- */
 function unixSecondsFromIso(value) {
     if (!value)
         return undefined;
@@ -64,118 +60,112 @@ function toExportError(error) {
         message: sanitizeSingleLineDisplaySnippet(error.message, EXPORT_ERROR_MAX_LENGTH),
     };
 }
-function toExportRawDetail(detail) {
-    return {
-        key: sanitizeSingleLineDisplaySnippet(detail.key, EXPORT_ERROR_MAX_LENGTH),
-        value: sanitizeSingleLineDisplaySnippet(detail.value, EXPORT_ERROR_MAX_LENGTH),
-    };
-}
-function toExportEntry(entry) {
-    // Derive the window only from the explicit row label. The entry name is a
-    // human-readable display string (e.g. "Monthly Premium Requests") and must
-    // not be parsed as a machine-readable window.
-    const window = normalizeSingleWindowWindowLabel(entry.label) ?? undefined;
-    const resetAt = unixSecondsFromIso(entry.resetTimeIso);
-    const observedAt = unixSecondsFromIso(entry.accounting.observedAtIso);
-    const base = {
-        name: entry.name,
-        resultType: entry.accounting.resultType,
-        acquisitionMethod: entry.accounting.acquisitionMethod,
-        ownership: entry.accounting.ownership,
-        authority: entry.accounting.authority,
-        ...(entry.accounting.sourceId ? { sourceId: entry.accounting.sourceId } : {}),
-        ...(observedAt !== undefined ? { observedAt } : {}),
-        ...(window ? { window } : {}),
-        ...(resetAt !== undefined ? { resetAt } : {}),
-    };
-    return isValueEntry(entry)
-        ? { ...base, renderType: "value", value: entry.value }
-        : { ...base, renderType: "percent", percentRemaining: entry.percentRemaining };
-}
-function buildQuotaProviderStatuses(params) {
-    const diagnosticsBySource = new Map((params.diagnostics ?? []).map((diagnostic) => [diagnostic.sourceId, diagnostic]));
-    return (params.ctx.config.quotaProviders ?? [])
-        .filter((source) => !MAINTAINED_LOCAL_ESTIMATE_IDS.includes(source.id))
+/**
+ * Each custom definition in its configured order, never its URL, key or format. Its account in
+ * this check (the definition id is the account's login) gives its status: "error" when it gave
+ * only errors, "ok" otherwise, and "unavailable" when it was not checked. A switched-off
+ * definition is never checked: it says `enabled: false` instead. A retired tuning is never run,
+ * so it is left out entirely rather than exported as an unavailable source.
+ */
+function customSourceStatuses(definitions, accounts) {
+    return definitions
+        .filter((definition) => !isRetiredEstimateTuning(definition))
         .map((source) => {
-        const diagnostic = diagnosticsBySource.get(source.id);
-        return {
-            id: source.id,
-            providerId: source.providerId,
-            status: !diagnostic ? "unavailable" : diagnostic.outcome === "success" ? "ok" : "error",
-            entryCount: diagnostic?.entryCount ?? 0,
-        };
+        const identity = { id: source.id, providerId: source.providerId };
+        if (source.enabled === false)
+            return { ...identity, entryCount: 0, enabled: false };
+        const account = accounts.find((candidate) => candidate.login === source.id);
+        if (!account)
+            return { ...identity, status: "unavailable", entryCount: 0 };
+        const failed = account.rows.length === 0 && account.errors.length > 0;
+        return { ...identity, status: failed ? "error" : "ok", entryCount: account.rows.length };
     });
 }
+/** One row as an export entry; provider text loses terminal escapes and control characters. */
+function rowEntry(providerId, providerLabel, row) {
+    const account = row.account ? ` (${row.account})` : "";
+    const resetAt = unixSecondsFromIso(row.resetsAt);
+    const base = {
+        id: row.id,
+        name: sanitizeSingleLineDisplaySnippet(`${providerLabel}${account} ${row.label}`, EXPORT_ERROR_MAX_LENGTH),
+        ...(row.account
+            ? { account: sanitizeSingleLineDisplaySnippet(row.account, EXPORT_ERROR_MAX_LENGTH) }
+            : {}),
+        resultType: row.type,
+        acquisitionMethod: row.method,
+        ownership: providerId === QUOTA_PROVIDERS_AGGREGATE_ID
+            ? "user_configured"
+            : "maintained",
+        authority: row.authority,
+        ...(row.window ? { window: EXPORT_WINDOW_LABELS[row.window] } : {}),
+        ...(resetAt !== undefined ? { resetAt } : {}),
+    };
+    if (row.percentRemaining !== undefined) {
+        return { ...base, renderType: "percent", percentRemaining: row.percentRemaining };
+    }
+    return {
+        ...base,
+        renderType: "value",
+        value: sanitizeSingleLineDisplaySnippet(rowValueText(row), EXPORT_ERROR_MAX_LENGTH),
+    };
+}
 /**
- * Builds a `QuotaExport` document by reading cached provider results.
- *
- * All providers are read in parallel from the per-provider disk cache.
- * No live network fetches are performed.
+ * A provider's part: "ok" or "partial" with its rows, "error" when it has no rows, and
+ * "unavailable" when it is not set up. `answeredAtMs` is when the rows or the error came.
  */
-export async function buildQuotaExport(params) {
-    const reads = await Promise.all(params.providers.map((provider) => readCachedProviderResult({
-        provider,
-        ctx: params.ctx,
-        ttlMs: params.ttlMs,
-    }).then((read) => ({ provider, read }))));
+function exportProvider(provider, answeredAtMs, nowMs) {
+    if (provider.error?.code === "not_configured" && provider.rows.length === 0) {
+        return { status: "unavailable" };
+    }
+    const fetchedAt = Math.floor(answeredAtMs / 1000);
+    const entries = provider.rows.map((row) => rowEntry(provider.providerId, provider.label, row));
+    if (!provider.error)
+        return { status: "ok", fetchedAt, entries };
+    const error = sanitizeSingleLineDisplaySnippet(describeError(provider.error, provider.label, nowMs), EXPORT_ERROR_MAX_LENGTH);
+    if (entries.length === 0)
+        return { status: "error", fetchedAt, error };
+    return {
+        status: "partial",
+        fetchedAt,
+        entries,
+        errors: [toExportError({ label: provider.label, message: error })],
+    };
+}
+/**
+ * A provider's part of the export file from one check: this check's rows as the snapshot
+ * shows them, or its error. The custom providers also list each definition, from this check's
+ * `accounts`.
+ */
+export function exportProviderFromCheck(params) {
+    const { providerId, label, rows, error, checkedAtMs } = params;
+    const part = exportProvider({ providerId, label, rows, error }, checkedAtMs, checkedAtMs);
+    if (providerId !== QUOTA_PROVIDERS_AGGREGATE_ID)
+        return part;
+    return { ...part, sources: customSourceStatuses(params.customDefinitions, params.accounts) };
+}
+/** A provider's part written from its snapshot; "unavailable" until it first answered. */
+function exportProviderFromSnapshot(provider, nowMs) {
+    const answeredAtMs = provider.okAtMs ?? provider.checkedAtMs;
+    if (answeredAtMs === undefined)
+        return { status: "unavailable" };
+    return exportProvider(provider, answeredAtMs, nowMs);
+}
+/** Builds the export document from the quota snapshot; no provider is asked again. */
+export function buildQuotaExportFromSnapshot(snapshot, nowMs = Date.now()) {
     const providers = {};
     const fetchedAtValues = [];
-    for (const { provider, read } of reads) {
-        const sources = provider.id === "quota-providers"
-            ? buildQuotaProviderStatuses({
-                ctx: params.ctx,
-                ...(read.hit ? { diagnostics: read.result.diagnostics } : {}),
-            })
-            : undefined;
-        const withSources = sources ? { sources } : {};
-        if (!read.hit) {
-            providers[provider.id] = { status: "unavailable", ...withSources };
-            continue;
-        }
-        const withRawDetails = read.result.rawDetails?.length
-            ? { rawDetails: read.result.rawDetails.map(toExportRawDetail) }
-            : {};
-        const fetchedAt = Math.floor(read.timestamp / 1000);
-        if (read.result.entries.length > 0 && read.result.errors.length > 0) {
-            providers[provider.id] = {
-                status: "partial",
-                fetchedAt,
-                entries: read.result.entries.map(toExportEntry),
-                errors: read.result.errors.map(toExportError),
-                ...withSources,
-                ...withRawDetails,
-            };
-            fetchedAtValues.push(fetchedAt);
-            continue;
-        }
-        if (read.result.errors.length > 0 && read.result.entries.length === 0) {
-            providers[provider.id] = {
-                status: "error",
-                fetchedAt,
-                error: sanitizeSingleLineDisplaySnippet(read.result.errors[0].message, EXPORT_ERROR_MAX_LENGTH),
-                ...withSources,
-                ...withRawDetails,
-            };
-            fetchedAtValues.push(fetchedAt);
-            continue;
-        }
-        const entries = read.result.entries.map(toExportEntry);
-        providers[provider.id] = {
-            status: "ok",
-            fetchedAt,
-            entries,
-            ...withSources,
-            ...withRawDetails,
-        };
-        fetchedAtValues.push(fetchedAt);
+    for (const provider of snapshot.providers) {
+        const part = provider.exportPart ?? exportProviderFromSnapshot(provider, nowMs);
+        providers[provider.providerId] = part;
+        if (part.status !== "unavailable")
+            fetchedAtValues.push(part.fetchedAt);
     }
-    const cacheAgeSeconds = fetchedAtValues.length > 0 ? Math.floor(Date.now() / 1000) - Math.min(...fetchedAtValues) : 0;
-    const exportedAt = Math.floor(Date.now() / 1000);
+    const exportedAt = Math.floor(nowMs / 1000);
     return {
-        version: 2,
+        version: 3,
         exportedAt,
-        fromCache: params.fromCache,
-        cacheAgeSeconds,
+        fromCache: true,
+        cacheAgeSeconds: fetchedAtValues.length > 0 ? exportedAt - Math.min(...fetchedAtValues) : 0,
         providers,
     };
 }

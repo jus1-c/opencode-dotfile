@@ -1,42 +1,33 @@
-import type { QuotaProvider, QuotaProviderContext } from "./entries.js";
-import type { QuotaExport } from "./quota-export-types.js";
-import type { QuotaRuntimeContext } from "./quota-runtime-context.js";
-/**
- * Builds the provider context used to read cached quota for export.
- *
- * The cache key is derived from these fields, so it MUST match the one the TUI
- * background writer used (`onlyCurrentModel: false`, no session). Otherwise a
- * user with `onlyCurrentModel: true` would compute a different key than the one
- * the cache was written under, turning every provider into "unavailable".
- *
- * Both export surfaces (CLI `show --json` and the TUI periodic writer) must go
- * through this helper so the cache-key contract lives in one place.
- */
-export declare function createExportProviderContext(runtime: QuotaRuntimeContext): QuotaProviderContext;
+import type { CheckForExport } from "../core/store.js";
+import type { QuotaSnapshot } from "../core/types.js";
+import type { AccountResult } from "../providers/contract.js";
+import type { QuotaExport, QuotaExportProvider } from "./quota-export-types.js";
+import { type QuotaProviderDefinition } from "./quota-providers.js";
 /**
  * Resolves the export file path from a configured value.
  *
  * - Empty string → XDG cache default: `$XDG_CACHE_HOME/opencode/quota-export.json`
  * - Starts with `~/` → expands `~` to `homedir()`
+ * - Starts with `~\` → expands `~` and treats backslashes as path separators
  * - Otherwise → returns as-is (caller is responsible for absolute paths)
  */
 export declare function resolveExportPath(configured: string): string;
 /**
- * Builds a `QuotaExport` document by reading cached provider results.
- *
- * All providers are read in parallel from the per-provider disk cache.
- * No live network fetches are performed.
+ * A provider's part of the export file from one check: this check's rows as the snapshot
+ * shows them, or its error. The custom providers also list each definition, from this check's
+ * `accounts`.
  */
-export declare function buildQuotaExport(params: {
-    providers: QuotaProvider[];
-    ctx: QuotaProviderContext;
-    ttlMs: number;
-    fromCache: boolean;
-}): Promise<QuotaExport>;
+export declare function exportProviderFromCheck(params: CheckForExport & {
+    providerId: string;
+    label: string;
+    customDefinitions: readonly QuotaProviderDefinition[];
+    accounts: readonly AccountResult[];
+}): QuotaExportProvider;
+/** Builds the export document from the quota snapshot; no provider is asked again. */
+export declare function buildQuotaExportFromSnapshot(snapshot: QuotaSnapshot, nowMs?: number): QuotaExport;
 /**
  * Writes a `QuotaExport` document atomically to disk.
  *
  * Errors are re-thrown — callers are responsible for catching and logging them.
  */
 export declare function writeQuotaExport(exportData: QuotaExport, resolvedPath: string): Promise<void>;
-//# sourceMappingURL=quota-export.d.ts.map

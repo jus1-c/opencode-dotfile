@@ -1,36 +1,32 @@
-/**
- * MiniMax Coding Plan provider wrapper.
- *
- * Fetches quota data from MiniMax API for coding plan users.
- */
+/** MiniMax Token Plan quota (international and China endpoints), one canonical model per account. */
+import { API_KEY_VENDORS, readVendorKeys } from "../lib/api-key-resolver.js";
 import { sanitizeDisplayText } from "../lib/display-sanitize.js";
-import { fetchWithTimeout } from "../lib/http.js";
-import { DEFAULT_MINIMAX_AUTH_CACHE_MAX_AGE_MS, getMiniMaxAuthDiagnostics, getMiniMaxChinaAuthDiagnostics, resolveMiniMaxAuthCached, resolveMiniMaxChinaAuthCached, } from "../lib/minimax-auth.js";
-import { getMiniMaxQuotaEndpoint } from "../lib/minimax-endpoints.js";
+import { failureFacts, requestJson } from "../lib/http.js";
+import { asRecord } from "../lib/json-guards.js";
 import { isAnyProviderIdAvailable, isCanonicalProviderAvailable, } from "../lib/provider-availability.js";
 import { normalizeQuotaProviderId } from "../lib/provider-metadata.js";
-import { apiKeyStatusDetails, attemptedErrorResult, attemptedResult, notAttemptedResult, statusDetailsFromRecord, withStatusDetails, } from "./result-helpers.js";
-const MINIMAX_PROVIDER_LABEL = "MiniMax Coding Plan";
-const MINIMAX_CHINA_PROVIDER_LABEL = "MiniMax Coding Plan (CN)";
+import { accountingDecimalFromNumber } from "./accounting-decimal.js";
+import { vendorKeysPolicy } from "./cache-policies.js";
+import { FIVE_HOUR, failedAccount, fetchError, quotaRow, WEEKLY, } from "./contract.js";
+import { fetchStoredKeys, isKeyVendorAvailable } from "./key-vendor.js";
+import { statusDetailsFromRecord, vendorKeyDetails, vendorKeyState } from "./result-helpers.js";
 const USER_AGENT = "OpenCode-Quota-Toast/1.0";
-const MINIMAX_COUNT_SEMANTICS_BY_ENDPOINT = {
-    international: "remaining",
-    china: "used",
+const REQUEST_UNIT = { kind: "count", unit: "request" };
+const MINIMAX_QUOTA_URLS = {
+    international: "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
+    // CN Token Plan docs use this path on minimaxi.com; api.minimaxi.com returns MiniMax base_resp auth errors for it.
+    china: "https://api.minimaxi.com/v1/token_plan/remains",
 };
 const MINIMAX_WINDOW_SPECS = [
     {
-        window: "five_hour",
-        name: "MiniMax Coding Plan 5h",
-        label: "5h:",
+        slot: FIVE_HOUR,
         getTotal: (model) => model.current_interval_total_count,
         getCount: (model) => model.current_interval_usage_count,
         getResetOffsetMs: (model) => model.remains_time,
         getPercentRemaining: (model) => model.current_interval_remaining_percent,
     },
     {
-        window: "weekly",
-        name: "MiniMax Coding Plan Weekly",
-        label: "Weekly:",
+        slot: WEEKLY,
         getTotal: (model) => model.current_weekly_total_count,
         getCount: (model) => model.current_weekly_usage_count,
         getResetOffsetMs: (model) => model.weekly_remains_time,
@@ -40,281 +36,216 @@ const MINIMAX_WINDOW_SPECS = [
 function isFiniteNumber(value) {
     return typeof value === "number" && Number.isFinite(value);
 }
-/**
- * Type guard that validates a value is a well-formed MiniMax model record.
- *
- * Accepts the existing count shape or the international endpoint's percentage
- * fallback shape. A finite 5-hour reset offset remains required.
- */
+/** Accepts the count shape or the percentage-only shape; a finite 5-hour reset offset is required. */
 function isMiniMaxModelRecord(value) {
-    if (value === null || typeof value !== "object" || !("model_name" in value))
-        return false;
-    const v = value;
-    if (typeof v.model_name !== "string" || !isFiniteNumber(v.remains_time))
+    const v = asRecord(value);
+    if (!v || typeof v.model_name !== "string" || !isFiniteNumber(v.remains_time))
         return false;
     const hasCounts = isFiniteNumber(v.current_interval_total_count) &&
         isFiniteNumber(v.current_interval_usage_count);
-    const hasPercent = isFiniteNumber(v.current_interval_remaining_percent);
-    return hasCounts || hasPercent;
+    return hasCounts || isFiniteNumber(v.current_interval_remaining_percent);
+}
+function isMiniMaxCodingModelName(modelName) {
+    const normalized = modelName.trim().toLowerCase();
+    return normalized.startsWith("minimax-m") || normalized === "general";
 }
 function roundPercent(value) {
     return Math.min(100, Math.round(value));
 }
-function sanitizeMiniMaxMessage(text, maxLength = 120) {
+function requests(value) {
+    return { decimal: accountingDecimalFromNumber(value), unit: REQUEST_UNIT };
+}
+function sanitizeMiniMaxMessage(text) {
     const sanitized = sanitizeDisplayText(text).replace(/\s+/g, " ").trim();
-    return (sanitized || "unknown").slice(0, maxLength);
+    return (sanitized || "unknown").slice(0, 120);
 }
-function clampRemaining(total, remaining) {
-    return Math.min(total, remaining);
+/**
+ * Used, limit and remaining for a row with a positive total. The raw count is
+ * endpoint-specific: China reports the used count, international the remaining count.
+ */
+function countAmounts(total, rawCount, endpointId) {
+    const reportsUsed = endpointId === "china";
+    const used = reportsUsed ? Math.max(0, rawCount) : total - Math.min(total, rawCount);
+    const remaining = reportsUsed ? total - used : Math.min(total, rawCount);
+    return { used, remaining };
 }
-function normalizeMiniMaxCounts(total, rawCount, countSemantics) {
-    if (countSemantics === "used") {
-        const used = Math.max(0, rawCount);
-        return { used, remaining: total - used };
-    }
-    const remaining = clampRemaining(total, rawCount);
-    return { used: total - remaining, remaining };
-}
-function isMiniMaxCodingModelName(modelName, endpointId = "international") {
-    const normalized = modelName.trim().toLowerCase();
-    if (normalized === "minimax-m*" || normalized.startsWith("minimax-m")) {
-        return true;
-    }
-    return endpointId === "international" && (normalized === "general" || normalized === "video");
-}
-function buildMiniMaxEntry(model, spec, providerLabel, countSemantics) {
-    const total = spec.getTotal(model);
-    const rawCount = spec.getCount(model);
+function minimaxRow(model, spec, endpointId) {
     const resetOffsetMs = spec.getResetOffsetMs(model);
     if (!isFiniteNumber(resetOffsetMs))
         return null;
-    if (isFiniteNumber(total) && isFiniteNumber(rawCount) && total > 0) {
-        const { used, remaining } = normalizeMiniMaxCounts(total, rawCount, countSemantics);
-        const percentRemaining = roundPercent((remaining / total) * 100);
+    const resetsAt = new Date(Date.now() + Math.max(0, resetOffsetMs)).toISOString();
+    const total = spec.getTotal(model);
+    const rawCount = spec.getCount(model);
+    if (isFiniteNumber(total) && total > 0 && isFiniteNumber(rawCount)) {
+        const { used, remaining } = countAmounts(total, rawCount, endpointId);
         return {
-            window: spec.window,
-            name: spec.name.replace(MINIMAX_PROVIDER_LABEL, providerLabel),
-            group: providerLabel,
-            label: spec.label,
-            right: `${used}/${total}`,
-            percentRemaining,
-            resetTimeIso: new Date(Date.now() + Math.max(0, resetOffsetMs)).toISOString(),
+            ...quotaRow({
+                ...spec.slot,
+                percentRemaining: roundPercent((remaining / total) * 100),
+                resetsAt,
+            }),
+            used: requests(used),
+            limit: requests(total),
+            remaining: requests(remaining),
         };
     }
-    if (countSemantics !== "remaining")
+    // New plan rows (general bucket, total=0) only report a percent. China counts never fall
+    // back to it except on general rows.
+    const percent = endpointId === "international" || model.model_name.trim().toLowerCase() === "general"
+        ? spec.getPercentRemaining(model)
+        : undefined;
+    if (!isFiniteNumber(percent))
         return null;
-    const percentRaw = spec.getPercentRemaining(model);
-    if (!isFiniteNumber(percentRaw))
-        return null;
-    const percentRemaining = roundPercent(percentRaw);
-    return {
-        window: spec.window,
-        name: spec.name.replace(MINIMAX_PROVIDER_LABEL, providerLabel),
-        group: providerLabel,
-        label: spec.label,
-        right: `${100 - percentRemaining}%`,
-        percentRemaining,
-        resetTimeIso: new Date(Date.now() + Math.max(0, resetOffsetMs)).toISOString(),
-    };
+    return quotaRow({ ...spec.slot, percentRemaining: roundPercent(percent), resetsAt });
 }
-function buildMiniMaxEntries(model, providerLabel, countSemantics) {
+function minimaxRows(model, endpointId) {
     return MINIMAX_WINDOW_SPECS.flatMap((spec) => {
-        const entry = buildMiniMaxEntry(model, spec, providerLabel, countSemantics);
-        return entry ? [entry] : [];
+        const row = minimaxRow(model, spec, endpointId);
+        return row ? [row] : [];
     });
 }
-function getWorstPercent(model, countSemantics) {
-    const percents = buildMiniMaxEntries(model, MINIMAX_PROVIDER_LABEL, countSemantics).map((entry) => entry.percentRemaining);
+function getWorstPercent(model, endpointId) {
+    const percents = minimaxRows(model, endpointId).flatMap((row) => row.percentRemaining === undefined ? [] : [row.percentRemaining]);
     return percents.length > 0 ? Math.min(...percents) : Number.POSITIVE_INFINITY;
 }
-function selectCanonicalMiniMaxModel(models, countSemantics) {
-    if (models.length === 0)
-        return null;
-    const wildcardModel = models.find((model) => model.model_name.trim().toLowerCase() === "minimax-m*") ?? null;
-    if (wildcardModel && Number.isFinite(getWorstPercent(wildcardModel, countSemantics))) {
+/** The `MiniMax-M*` wildcard row when it reports quota, else the model with the least left. */
+function selectCanonicalMiniMaxModel(models, endpointId) {
+    const wildcardModel = models.find((model) => model.model_name.trim().toLowerCase() === "minimax-m*");
+    if (wildcardModel && Number.isFinite(getWorstPercent(wildcardModel, endpointId))) {
         return wildcardModel;
     }
     return ([...models].sort((left, right) => {
-        const percentDiff = getWorstPercent(left, countSemantics) - getWorstPercent(right, countSemantics);
+        const percentDiff = getWorstPercent(left, endpointId) - getWorstPercent(right, endpointId);
         if (percentDiff !== 0)
             return percentDiff;
         return left.model_name.localeCompare(right.model_name);
     })[0] ?? null);
 }
-/**
- * Fetch MiniMax coding plan quota from the API.
- *
- * Parses usage for MiniMax coding-plan models returned by the selected endpoint.
- *
- * @param apiKey - MiniMax API key
- * @returns Quota entries on success, error on failure, or empty entries when
- *          the API returns successfully but no models have reportable quota.
- */
-export async function queryMiniMaxQuota(apiKey, options = {}) {
-    const endpointId = options.endpoint ?? "international";
-    const endpoint = getMiniMaxQuotaEndpoint(endpointId);
-    const countSemantics = MINIMAX_COUNT_SEMANTICS_BY_ENDPOINT[endpointId];
-    try {
-        return await fetchWithTimeout(endpoint.quotaUrl, {
-            request: {
-                method: "GET",
-                headers: {
-                    Authorization: `Bearer ${apiKey}`,
-                    "User-Agent": USER_AGENT,
-                },
-            },
-            timeoutMs: options.requestTimeoutMs,
-            consume: async (response) => {
-                if (!response.ok) {
-                    const text = await response.text();
-                    return {
-                        success: false,
-                        error: `MiniMax API error ${response.status}: ${sanitizeMiniMaxMessage(text, 120)}`,
-                    };
-                }
-                const payload = (await response.json());
-                if (payload.base_resp?.status_code !== 0) {
-                    return {
-                        success: false,
-                        error: `MiniMax API error: ${sanitizeMiniMaxMessage(payload.base_resp?.status_msg ?? "unknown")}`,
-                    };
-                }
-                const matchingModels = (payload.model_remains ?? []).filter((model) => isMiniMaxModelRecord(model) && isMiniMaxCodingModelName(model.model_name, endpointId));
-                const canonicalModel = selectCanonicalMiniMaxModel(matchingModels, countSemantics);
-                const entries = canonicalModel
-                    ? buildMiniMaxEntries(canonicalModel, options.label ?? MINIMAX_PROVIDER_LABEL, countSemantics)
-                    : [];
-                return { success: true, entries };
-            },
-        });
-    }
-    catch (err) {
+/** The rows of one key (none when no coding model reports quota), or the error. */
+async function queryMiniMaxQuota(apiKey, endpointId, requestTimeoutMs) {
+    const reply = await requestJson(MINIMAX_QUOTA_URLS[endpointId], {
+        method: "GET",
+        headers: { Authorization: `Bearer ${apiKey}`, "User-Agent": USER_AGENT },
+        secrets: [apiKey],
+        timeoutMs: requestTimeoutMs,
+    });
+    if (!reply.ok) {
+        const { failure } = reply;
         return {
-            success: false,
-            error: sanitizeMiniMaxMessage(err instanceof Error ? err.message : String(err)),
+            error: failure.kind === "http"
+                ? `MiniMax API error ${failure.status}: ${sanitizeMiniMaxMessage(failure.detail)}`
+                : sanitizeMiniMaxMessage(failure.detail),
+            facts: failureFacts(failure),
         };
     }
+    try {
+        const payload = reply.json;
+        if (payload.base_resp?.status_code !== 0) {
+            return {
+                error: `MiniMax API error: ${sanitizeMiniMaxMessage(payload.base_resp?.status_msg ?? "unknown")}`,
+            };
+        }
+        const matchingModels = (payload.model_remains ?? []).filter((model) => isMiniMaxModelRecord(model) && isMiniMaxCodingModelName(model.model_name));
+        const canonicalModel = selectCanonicalMiniMaxModel(matchingModels, endpointId);
+        return { rows: canonicalModel ? minimaxRows(canonicalModel, endpointId) : [] };
+    }
+    catch (err) {
+        return { error: sanitizeMiniMaxMessage(err instanceof Error ? err.message : String(err)) };
+    }
 }
+/** The ambiguous `minimax` runtime id counts for China only when China is explicitly enabled. */
 function isMiniMaxChinaExplicitlyEnabled(context) {
-    if (!context || context.enabledProviders === "auto")
+    if (!context || context.automaticDiscovery || context.enabledProviders === "auto")
         return false;
     return context.enabledProviders.some((providerId) => normalizeQuotaProviderId(providerId) === "minimax-china-coding-plan");
 }
-function matchesMiniMaxCurrentModel(model, spec, context) {
-    const [provider = "", modelId] = model.toLowerCase().split("/", 2);
-    if (!modelId || !isMiniMaxCodingModelName(modelId))
-        return false;
-    const normalizedProvider = normalizeQuotaProviderId(provider);
-    if (spec.id === "minimax-coding-plan") {
-        return normalizedProvider === "minimax-coding-plan";
+async function fetchMiniMaxQuota(spec, ctx) {
+    const keys = await readVendorKeys(spec.auth, ctx.locationDirectory);
+    const configured = vendorKeyState(keys).state === "configured";
+    const debug = [
+        ...vendorKeyDetails(spec.auth, keys, ctx.locationDirectory),
+        ...statusDetailsFromRecord({ api_endpoint: configured ? spec.endpoint : undefined }),
+    ];
+    const query = (apiKey) => queryMiniMaxQuota(apiKey, spec.endpoint, ctx.config?.requestTimeoutMs);
+    if (!keys.envOrConfig) {
+        const stored = await fetchStoredKeys({
+            providerName: spec.label,
+            keys,
+            brokenFirst: true,
+            async fetchKey(apiKey) {
+                const result = await query(apiKey);
+                return "error" in result
+                    ? { rows: [], errors: [fetchError(result.error, result.facts)] }
+                    : { rows: result.rows, errors: [] };
+            },
+        });
+        return { ...stored, debug };
     }
-    return (normalizedProvider === "minimax-china-coding-plan" ||
-        (provider === "minimax" && isMiniMaxChinaExplicitlyEnabled(context)));
-}
-async function isMiniMaxProviderRuntimeAvailable(ctx, spec) {
-    const providerAvailable = await isCanonicalProviderAvailable({
-        ctx,
-        providerId: spec.id,
-        fallbackOnError: false,
-    });
-    if (providerAvailable)
-        return true;
-    if (spec.id !== "minimax-china-coding-plan" || !isMiniMaxChinaExplicitlyEnabled(ctx.config)) {
-        return false;
+    const result = await query(keys.envOrConfig.key);
+    if ("error" in result) {
+        return {
+            attempted: true,
+            accounts: [failedAccount(spec.label, result.error, result.facts)],
+            debug: [...debug, { key: "live_fetch_error", value: result.error }],
+        };
     }
-    return isAnyProviderIdAvailable({
-        ctx,
-        candidateIds: ["minimax"],
-        fallbackOnError: false,
-    });
-}
-function createMiniMaxProvider(spec) {
     return {
-        id: spec.id,
-        async isAvailable(ctx) {
-            const providerAvailable = await isMiniMaxProviderRuntimeAvailable(ctx, spec);
-            if (!providerAvailable) {
-                return false;
-            }
-            const auth = await spec.resolveAuthCached({
-                maxAgeMs: DEFAULT_MINIMAX_AUTH_CACHE_MAX_AGE_MS,
-            });
-            return auth.state === "configured" || auth.state === "invalid";
-        },
-        matchesCurrentModel(model, context) {
-            return matchesMiniMaxCurrentModel(model, spec, context);
-        },
-        async fetch(ctx) {
-            const diagnostics = await spec.getAuthDiagnostics({
-                maxAgeMs: DEFAULT_MINIMAX_AUTH_CACHE_MAX_AGE_MS,
-            });
-            const endpoint = diagnostics.state === "configured"
-                ? getMiniMaxQuotaEndpoint(diagnostics.endpoint)
-                : undefined;
-            const statusDetails = [
-                ...apiKeyStatusDetails(diagnostics),
-                ...statusDetailsFromRecord({
-                    api_endpoint: endpoint?.id,
-                    api_base_url: endpoint?.apiBaseUrl,
-                }),
-            ];
-            const auth = await spec.resolveAuthCached({
-                maxAgeMs: DEFAULT_MINIMAX_AUTH_CACHE_MAX_AGE_MS,
-            });
-            if (auth.state === "none") {
-                return withStatusDetails(notAttemptedResult(), statusDetails);
-            }
-            if (auth.state === "invalid") {
-                return withStatusDetails(attemptedErrorResult(spec.label, auth.error), statusDetails);
-            }
-            const result = await queryMiniMaxQuota(auth.apiKey, {
-                endpoint: spec.endpoint,
-                label: spec.label,
-                requestTimeoutMs: ctx.config?.requestTimeoutMs,
-            });
-            if (!result.success) {
-                return withStatusDetails(attemptedErrorResult(spec.label, result.error), [
-                    ...statusDetails,
-                    { key: "live_fetch_error", value: result.error },
-                ]);
-            }
-            const providerResult = attemptedResult(result.entries.map(({ window: _window, ...entry }) => ({
-                ...entry,
-                accounting: {
-                    resultType: "quota",
-                    acquisitionMethod: "remote_api",
-                    ownership: "maintained",
-                    authority: "provider_reported",
-                },
-            })));
-            const fiveHourEntry = result.entries.find((entry) => entry.window === "five_hour");
-            const weeklyEntry = result.entries.find((entry) => entry.window === "weekly");
-            const formatUsage = (entry) => entry
-                ? `${entry.right ?? "(none)"} percent_remaining=${entry.percentRemaining} reset_at=${entry.resetTimeIso ?? "(none)"}`
-                : undefined;
-            return withStatusDetails(providerResult, [
-                ...statusDetails,
-                ...statusDetailsFromRecord({
-                    five_hour_usage: formatUsage(fiveHourEntry),
-                    weekly_usage: formatUsage(weeklyEntry),
-                    live_state: !fiveHourEntry && !weeklyEntry ? `no reportable ${spec.label} quota` : undefined,
-                }),
-            ]);
-        },
+        attempted: true,
+        accounts: [{ name: spec.label, rows: result.rows, errors: [] }],
+        debug,
     };
 }
-export const minimaxCodingPlanProvider = createMiniMaxProvider({
+function minimaxProvider(spec) {
+    return {
+        id: spec.id,
+        cachePolicy: vendorKeysPolicy(spec.id, spec.endpoint),
+        async isAvailable(ctx) {
+            return await isKeyVendorAvailable({
+                ctx,
+                providerId: spec.id,
+                availability: "listed-and-key",
+                readKeys: () => readVendorKeys(spec.auth, ctx.locationDirectory),
+                // The China plan also counts OpenCode's `minimax` when the user enabled the China plan.
+                isListed: async () => (await isCanonicalProviderAvailable({
+                    ctx,
+                    providerId: spec.id,
+                    fallbackOnError: false,
+                })) ||
+                    (spec.id === "minimax-china-coding-plan" &&
+                        isMiniMaxChinaExplicitlyEnabled(ctx.config) &&
+                        (await isAnyProviderIdAvailable({
+                            ctx,
+                            candidateIds: ["minimax"],
+                            fallbackOnError: false,
+                        }))),
+            });
+        },
+        matchesCurrentModel(model, context) {
+            const [provider = "", modelId] = model.toLowerCase().split("/", 2);
+            if (!modelId || !isMiniMaxCodingModelName(modelId))
+                return false;
+            const normalizedProvider = normalizeQuotaProviderId(provider);
+            if (spec.id === "minimax-coding-plan") {
+                return normalizedProvider === "minimax-coding-plan";
+            }
+            return (normalizedProvider === "minimax-china-coding-plan" ||
+                (provider === "minimax" && isMiniMaxChinaExplicitlyEnabled(context)));
+        },
+        fetch: (ctx) => fetchMiniMaxQuota(spec, ctx),
+    };
+}
+// The international and China plans have separate keys; the China env key never
+// configures the international provider.
+export const minimaxCodingPlanProvider = minimaxProvider({
     id: "minimax-coding-plan",
-    label: MINIMAX_PROVIDER_LABEL,
+    label: "MiniMax Token Plan",
     endpoint: "international",
-    resolveAuthCached: resolveMiniMaxAuthCached,
-    getAuthDiagnostics: getMiniMaxAuthDiagnostics,
+    auth: API_KEY_VENDORS["minimax-coding-plan"],
 });
-export const minimaxChinaCodingPlanProvider = createMiniMaxProvider({
+export const minimaxChinaCodingPlanProvider = minimaxProvider({
     id: "minimax-china-coding-plan",
-    label: MINIMAX_CHINA_PROVIDER_LABEL,
+    label: "MiniMax Token Plan (CN)",
     endpoint: "china",
-    resolveAuthCached: resolveMiniMaxChinaAuthCached,
-    getAuthDiagnostics: getMiniMaxChinaAuthDiagnostics,
+    auth: API_KEY_VENDORS["minimax-china-coding-plan"],
 });
 //# sourceMappingURL=minimax-coding-plan.js.map

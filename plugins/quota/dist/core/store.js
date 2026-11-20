@@ -1,0 +1,825 @@
+/**
+ * The server's quota store. It keeps the last known rows of every provider (in memory and in
+ * one snapshot file), refreshes them in the background, and tells subscribers when they change.
+ *
+ * - `snapshot()` answers at once from what is known; when a provider is due it starts a
+ *   background refresh.
+ * - Refreshes are single-flight per cache identity and keep a minimum interval (by default 30 s after a turn,
+ *   none for a manual or retry refresh); failures back off from 1 to 15 minutes, or until the
+ *   provider's own retry time.
+ * - Every snapshot, refresh, login-change and settings-change pass is one operation: it reads
+ *   the providers and who each one is signed in as once, and keeps both to its end. A login,
+ *   settings or session model change starts a new generation: an older operation stores nothing and
+ *   tells subscribers nothing, and a snapshot or refresh it was answering answers with the
+ *   providers and rows of the new one.
+ * - Rows and reset notices belong to an identity (account plus provider settings). Those of
+ *   another identity are never shown; those whose identity can't be saved stay in memory and
+ *   go on a login change. For those the file keeps only when their provider was last checked
+ *   (with its failures and retry time). Without rows after a restart, the store may check again
+ *   30 s (or the configured interval if shorter) after a successful last check; a failed one
+ *   keeps the full interval, its backoff and retry time. A login change or settings recheck ends that wait, also one before the file is read.
+ * - Rows also carry their login. A failed refresh keeps the last good rows and records the
+ *   error; when one of several logins fails, that login keeps its last rows. Logins that share
+ *   an account name are numbered here ("Pro", "Pro 2"), by login, so the numbers stay put;
+ *   numbers skip names other rows already have.
+ * - When a quota window resets between two checks, a reset notice is recorded once.
+ * - A fetch may bring how to write its provider's part of the export file. The store writes it
+ *   from the check's rows as shown (numbered like the snapshot) and the error it records, and
+ *   keeps the last check's part in memory only, never in the file, like its debug details.
+ * - Subscribers hear of every change: a fetch, the rows read from the file at the start, and a
+ *   change in which providers are on.
+ * - Each snapshot write saves all the store keeps. A write that saved nothing (another process
+ *   kept the file's lock) is made up by the next one, and `dispose` tries once more.
+ * - Reads from OpenCode and provider fetches have time limits, so `dispose` always ends.
+ */
+import { createHash, randomUUID } from "node:crypto";
+import { sanitizeSingleLineDisplaySnippet } from "../lib/display-sanitize.js";
+import { withOpenCodeConfigReadScope } from "../lib/opencode-config-files.js";
+import { classifyError, RETRY_WAIT_MAX_MS } from "./errors.js";
+import { joinNotices, readSavedState, rowSlot, writeSavedState, } from "./persist.js";
+import { WINDOWS } from "./windows.js";
+const TURN_MIN_INTERVAL_MS = 30_000;
+const BACKOFF_FIRST_MS = 60_000;
+const BACKOFF_MAX_MS = 15 * 60_000;
+/** A reset notice stays in snapshots this long; each TUI shows it once. */
+const RESET_NOTICE_KEEP_MS = 60 * 60_000;
+/** A window that reset longer ago than this when we noticed gets no notice. */
+const RESET_NOTICE_MAX_LATENESS_MS = 24 * 60 * 60_000;
+/** Reading the providers or a login from OpenCode. */
+const READ_TIMEOUT_MS = 15_000;
+/** One provider fetch; the TUI waits up to 60 s for an RPC answer. */
+const FETCH_TIMEOUT_MS = 60_000;
+/** Visible clients read every minute; background work does not keep a session view alive. */
+const SESSION_VIEW_KEEP_MS = 5 * 60_000;
+function hashText(text, length) {
+    return createHash("sha256").update(text).digest("hex").slice(0, length);
+}
+function resolvedKey(providerId, identity) {
+    const hash = hashText(identity.key, 32);
+    return {
+        key: `${providerId}|${identity.persist ? hash : `memory-${hash}`}`,
+        persist: identity.persist,
+    };
+}
+/** `promise`, or a rejection with `message` once `ms` have passed. */
+export function withTimeout(promise, ms, message) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+function backoffMs(failures) {
+    return Math.min(BACKOFF_MAX_MS, BACKOFF_FIRST_MS * 2 ** (failures - 1));
+}
+function lastCheckOf(entry) {
+    if (entry?.checkedAtMs === undefined)
+        return undefined;
+    const retryAtMs = entry.error?.retryAtMs;
+    return {
+        checkedAtMs: entry.checkedAtMs,
+        failures: entry.failures,
+        ...(retryAtMs === undefined ? {} : { retryAtMs }),
+    };
+}
+function isDue(last, reason, minIntervalMs, nowMs, providerMinIntervalMs) {
+    if (reason === "manual")
+        return true;
+    // The retry after a model's limit error checks at once, except past a provider's own floor.
+    const hasOwnFloor = providerMinIntervalMs !== undefined && providerMinIntervalMs > 0;
+    if (reason === "retry" && !hasOwnFloor)
+        return true;
+    if (last === undefined || last.checkedAtMs > nowMs)
+        return true;
+    // A model turn just used quota, so it may refresh 30 s after the last check even when
+    // `minIntervalMs` is longer; a provider's own `minIntervalMs` is a hard floor.
+    let waitMs = reason === "turn" && providerMinIntervalMs === undefined
+        ? Math.min(minIntervalMs, TURN_MIN_INTERVAL_MS)
+        : minIntervalMs;
+    if (last.failures > 0)
+        waitMs = Math.max(waitMs, backoffMs(last.failures));
+    if (nowMs - last.checkedAtMs < waitMs)
+        return false;
+    // A retry time waits at most a day (the most a reply can ask), so a far one never stalls checks.
+    const { retryAtMs } = last;
+    return (retryAtMs === undefined || nowMs >= Math.min(retryAtMs, last.checkedAtMs + RETRY_WAIT_MAX_MS));
+}
+/** Independently checked entries share one display/export group, in configured order. */
+function groupedExport(parts, provider) {
+    if (parts.length === 1)
+        return parts[0];
+    const entries = [];
+    const errors = [];
+    const sources = new Map();
+    let fetchedAt;
+    for (const part of parts) {
+        if ("fetchedAt" in part)
+            fetchedAt = Math.max(fetchedAt ?? 0, part.fetchedAt);
+        if ("entries" in part)
+            entries.push(...part.entries);
+        if (part.status === "partial")
+            errors.push(...part.errors);
+        if (part.status === "error")
+            errors.push({ label: provider.label, message: part.error });
+        for (const source of part.sources ?? []) {
+            if (!sources.has(source.id) || !("status" in source) || source.status !== "unavailable") {
+                sources.set(source.id, source);
+            }
+        }
+    }
+    // Rows with identical labels are numbered together, including in the export.
+    const numbered = entries.map((entry) => {
+        const row = provider.rows.find((row) => row.id === entry.id);
+        if (!row || row.account === entry.account)
+            return entry;
+        const { account: _account, ...fields } = entry;
+        const account = row.account ? ` (${row.account})` : "";
+        return {
+            ...fields,
+            name: sanitizeSingleLineDisplaySnippet(`${provider.label}${account} ${row.label}`, 300),
+            ...(row.account ? { account: row.account } : {}),
+        };
+    });
+    const sourceList = sources.size ? { sources: [...sources.values()] } : {};
+    if (fetchedAt === undefined)
+        return { status: "unavailable", ...sourceList };
+    if (errors.length === 0)
+        return { status: "ok", fetchedAt, entries: numbered, ...sourceList };
+    return numbered.length
+        ? { status: "partial", fetchedAt, entries: numbered, errors, ...sourceList }
+        : { status: "error", fetchedAt, error: errors[0].message, ...sourceList };
+}
+/** Each fetched row with its login, shortened to a hash of the keyed id it arrives as. */
+function loginRows(result) {
+    return result.rows.map((row, index) => {
+        const login = result.rowLogins?.[index] ?? "";
+        return { login: login ? hashText(login, 16) : "", row };
+    });
+}
+/**
+ * The rows as shown. Logins that share an account name (or have none) are told apart: each
+ * login after the first (by login key) gets " 2", " 3"... on all its rows ("Account 2" without
+ * a name), skipping names that rows already have or got. Numbering by login keeps a login's
+ * number while another login fails.
+ */
+function shownRows(rows) {
+    const loginsByAccount = new Map();
+    for (const { login, row } of rows) {
+        const logins = loginsByAccount.get(row.account ?? "") ?? [];
+        if (!logins.includes(login))
+            logins.push(login);
+        loginsByAccount.set(row.account ?? "", logins);
+    }
+    const taken = new Set(loginsByAccount.keys());
+    /** The shown account per `${account}\u001f${login}`. */
+    const shown = new Map();
+    for (const [account, logins] of [...loginsByAccount].sort(([a], [b]) => (a < b ? -1 : 1))) {
+        let number = 1;
+        for (const login of logins.sort().slice(1)) {
+            let name;
+            do {
+                number += 1;
+                name = account ? `${account} ${number}` : `Account ${number}`;
+            } while (taken.has(name));
+            taken.add(name);
+            shown.set(`${account}\u001f${login}`, name);
+        }
+    }
+    return rows.map(({ login, row }) => {
+        const account = shown.get(`${row.account ?? ""}\u001f${login}`);
+        return account === undefined ? row : { ...row, account };
+    });
+}
+/** Rows by slot (id, account, login); a slot that appears twice can't be matched. */
+function rowsBySlot(rows) {
+    const bySlot = new Map();
+    for (const row of rows) {
+        const slot = rowSlot(row);
+        bySlot.set(slot, bySlot.has(slot) ? null : row);
+    }
+    return bySlot;
+}
+/**
+ * True when `before` (its reset time first seen at `observedAtMs`, before that time) has reset
+ * by now: the reset time passed less than a day ago and the new row has a later reset and more
+ * left.
+ */
+function didReset(before, after, observedAtMs, nowMs) {
+    const resetMs = Date.parse(before.resetsAt ?? "");
+    const nextResetMs = Date.parse(after.resetsAt ?? "");
+    if (!Number.isFinite(resetMs) || !Number.isFinite(nextResetMs))
+        return false;
+    if (before.percentRemaining === undefined || after.percentRemaining === undefined)
+        return false;
+    const lateMs = nowMs - resetMs;
+    return (observedAtMs <= resetMs &&
+        lateMs >= 0 &&
+        lateMs <= RESET_NOTICE_MAX_LATENESS_MS &&
+        nextResetMs > resetMs &&
+        nextResetMs > nowMs &&
+        after.percentRemaining > before.percentRemaining &&
+        before.percentRemaining < 100);
+}
+/**
+ * Reset notices for `rows` (the new rows of `previous`'s entry), with their shown accounts.
+ * A notice's id names its row's slot (id, account, login), so each login's reset is one notice.
+ */
+function findResets(previous, rows, nowMs) {
+    const before = rowsBySlot(previous.rows);
+    const after = rowsBySlot(rows);
+    const shown = shownRows(rows);
+    const notices = [];
+    rows.forEach((current, index) => {
+        const slot = rowSlot(current);
+        const old = before.get(slot)?.row;
+        const { row } = current;
+        if (!old || after.get(slot) === null)
+            return;
+        if (row.type !== "quota" || !row.window || !WINDOWS[row.window].resets)
+            return;
+        const observedAtMs = previous.resetSeenAtMs[slot] ?? previous.okAtMs;
+        if (observedAtMs === undefined || !didReset(old, row, observedAtMs, nowMs))
+            return;
+        const account = shown[index]?.account;
+        notices.push({
+            id: `${row.id}|${row.account ?? ""}|${current.login}|${old.resetsAt}`,
+            rowId: row.id,
+            providerId: row.providerId,
+            ...(account === undefined ? {} : { account }),
+            label: row.label,
+            window: row.window,
+            percentRemaining: row.percentRemaining,
+            atMs: nowMs,
+        });
+    });
+    return notices;
+}
+/**
+ * When each row's reset time was first seen. A provider that repeats a reset time already past
+ * keeps the earlier observation, so the refill it reports later still counts as a reset.
+ */
+function resetSeenTimes(previous, rows, nowMs) {
+    const before = rowsBySlot(previous?.rows ?? []);
+    const seen = {};
+    for (const current of rows) {
+        if (!current.row.resetsAt)
+            continue;
+        const slot = rowSlot(current);
+        const earlier = previous?.resetSeenAtMs[slot];
+        const sameReset = before.get(slot)?.row.resetsAt === current.row.resetsAt;
+        seen[slot] = earlier !== undefined && sameReset ? earlier : nowMs;
+    }
+    return seen;
+}
+function errorMessage(error) {
+    return error instanceof Error ? error.message : String(error);
+}
+export function createQuotaStore(deps) {
+    const now = deps.now ?? Date.now;
+    const log = deps.log ?? ((message) => console.warn(`[opencode-quota] ${message}`));
+    const timeouts = deps.timeouts ?? { readMs: READ_TIMEOUT_MS, fetchMs: FETCH_TIMEOUT_MS };
+    const entries = new Map();
+    /**
+     * By provider id, the last check of a login that can't be saved, as the file had it at the
+     * start. It stands in for this process's own check of such a login until there is one.
+     */
+    const lastChecksFromFile = new Map();
+    /** A login change or settings recheck ended those waits, also before the file was read. */
+    let fileWaitsEnded = false;
+    const inFlight = new Map();
+    /** Running fetches per cache identity (an old one may still run after a login change). */
+    const fetching = new Map();
+    /** The last operation per session, or per credential source for callers without a session. */
+    const views = new Map();
+    /** Last explicit read, including a session whose first provider or identity read still runs. */
+    const sessions = new Map();
+    const listeners = new Set();
+    /** Running operations and background refreshes; `dispose` waits for them. */
+    const tasks = new Set();
+    /** Bumped on every login change; operations of an older generation are stale. */
+    let generation = 0;
+    let disposed = false;
+    let loaded;
+    let writing;
+    let writeAgain = false;
+    /** The last write saved nothing (another process kept the file's lock, say). */
+    let unsaved = false;
+    /** Names this store in its snapshots, so a TUI can tell a restarted server apart. */
+    const serverId = randomUUID();
+    let revision = 0;
+    /** The provider ids subscribers last heard of, per credential source. */
+    const heardProviders = new Map();
+    function forgetInactiveSessions() {
+        const cutoff = now() - SESSION_VIEW_KEEP_MS;
+        for (const [sessionID, readAtMs] of sessions) {
+            if (readAtMs > cutoff)
+                continue;
+            sessions.delete(sessionID);
+            views.delete(`session:${sessionID}`);
+        }
+    }
+    function readSession(sessionID) {
+        forgetInactiveSessions();
+        if (sessionID)
+            sessions.set(sessionID, now());
+    }
+    function track(promise) {
+        tasks.add(promise);
+        promise
+            .finally(() => {
+            tasks.delete(promise);
+        })
+            .catch(() => { });
+        return promise;
+    }
+    /** Runs one operation as a tracked task, from before its first read; none after dispose. */
+    function start(work) {
+        if (disposed)
+            return Promise.reject(new Error("the quota store is disposed"));
+        return track(work());
+    }
+    function isCurrent(operation) {
+        return operation.generation === generation;
+    }
+    function adopt(saved) {
+        for (const [key, entry] of saved.entries) {
+            const ours = entries.get(key);
+            if (!ours || (ours.checkedAtMs ?? 0) < (entry.checkedAtMs ?? 0)) {
+                entries.set(key, { ...entry, persist: true, debug: [] });
+            }
+            else {
+                ours.notices = joinNotices(ours.notices, entry.notices);
+            }
+        }
+    }
+    /** Ends the file's waits: those read already and those a first read still brings. */
+    function endFileWaits() {
+        fileWaitsEnded = true;
+        lastChecksFromFile.clear();
+    }
+    /** `lastChecksFromFile` of a provider whose login can't be saved; none for one that can. */
+    function fileLastCheck(providerId, where) {
+        return where.persist ? undefined : lastChecksFromFile.get(providerId);
+    }
+    function load() {
+        loaded ??= deps.file
+            ? readSavedState(deps.file).then((saved) => {
+                adopt(saved);
+                if (fileWaitsEnded)
+                    return;
+                for (const [providerId, lastCheck] of saved.lastChecks) {
+                    lastChecksFromFile.set(providerId, lastCheck);
+                }
+            })
+            : Promise.resolve();
+        return loaded;
+    }
+    async function writeFile(file) {
+        const saved = new Map();
+        for (const [key, { persist: keep, checkId: _checkId, debug: _memoryOnly, exportPart: _alsoMemoryOnly, ...entry },] of entries) {
+            if (keep)
+                saved.set(key, entry);
+        }
+        // Of a login that can't be saved, only when its provider was last checked.
+        const lastChecks = new Map();
+        for (const entry of entries.values()) {
+            const lastCheck = entry.persist ? undefined : lastCheckOf(entry);
+            const checkId = entry.checkId ?? entry.providerId;
+            const other = lastChecks.get(checkId);
+            if (lastCheck && (!other || other.checkedAtMs < lastCheck.checkedAtMs)) {
+                lastChecks.set(checkId, lastCheck);
+            }
+        }
+        try {
+            const options = { now, noticeMaxAgeMs: RESET_NOTICE_KEEP_MS };
+            adopt(await writeSavedState(file, { entries: saved, lastChecks }, options));
+            unsaved = false;
+        }
+        catch (error) {
+            unsaved = true;
+            log(`could not save the quota snapshot: ${errorMessage(error)}`);
+        }
+    }
+    /** Writes the file soon; writes asked for while one runs are joined into one more write. */
+    function persist() {
+        const file = deps.file;
+        if (!file)
+            return;
+        if (writing) {
+            writeAgain = true;
+            return;
+        }
+        writing = writeFile(file).finally(() => {
+            writing = undefined;
+            if (writeAgain) {
+                writeAgain = false;
+                persist();
+            }
+        });
+    }
+    async function flush() {
+        while (writing)
+            await writing;
+    }
+    /** Who `provider` is signed in as now; unknown (memory only) when that can't be read. */
+    async function resolveKey(provider, scope) {
+        try {
+            const message = `reading the ${provider.id} login timed out`;
+            return resolvedKey(provider.id, await withTimeout(provider.identity(), timeouts.readMs, message));
+        }
+        catch {
+            return resolvedKey(provider.id, { key: `unknown\u001f${scope}`, persist: false });
+        }
+    }
+    /** Starts an operation: loads the file once, reads the providers and who each one is. */
+    async function prepare(model, sessionID) {
+        const startedIn = generation;
+        await load();
+        if (sessionID && deps.sessionModel) {
+            model = await withTimeout(deps.sessionModel(sessionID), timeouts.readMs, "reading the session model timed out");
+        }
+        const message = "reading the quota providers timed out";
+        const source = await withTimeout(deps.source(model), timeouts.readMs, message);
+        const scope = source.scope === undefined ? "" : hashText(source.scope, 32);
+        const keys = new Map();
+        await Promise.all(source.providers.map(async (provider) => {
+            keys.set(provider.key ?? provider.id, await resolveKey(provider, scope));
+        }));
+        const operation = { generation: startedIn, source, keys, model, scope, sessionID };
+        forgetInactiveSessions();
+        if (isCurrent(operation) && (!sessionID || sessions.has(sessionID))) {
+            views.set(sessionID ? `session:${sessionID}` : scope, operation);
+        }
+        // The rows read from the file, or a provider turned on or off, are news to subscribers.
+        if (providerIdsOf(operation) !== heardProviders.get(scope))
+            emit(operation);
+        return operation;
+    }
+    /** The snapshot an operation sees; a stale one shows no rows (whose they are is unknown). */
+    function buildSnapshot(operation) {
+        const { model, sessionID } = operation;
+        const nowMs = now();
+        const current = isCurrent(operation);
+        const resetNotices = [];
+        const groups = new Map();
+        for (const provider of operation.source.providers) {
+            const key = current ? operation.keys.get(provider.key ?? provider.id)?.key : undefined;
+            const entry = key === undefined ? undefined : entries.get(key);
+            for (const notice of entry?.notices ?? []) {
+                if (nowMs - notice.atMs <= RESET_NOTICE_KEEP_MS)
+                    resetNotices.push(notice);
+            }
+            const snapshot = {
+                providerId: provider.id,
+                label: provider.label,
+                rows: [],
+                ...(entry?.okAtMs === undefined ? {} : { okAtMs: entry.okAtMs }),
+                ...(entry?.checkedAtMs === undefined ? {} : { checkedAtMs: entry.checkedAtMs }),
+                ...(entry?.error === undefined ? {} : { error: entry.error }),
+                refreshing: key !== undefined && fetching.has(key),
+                debug: [...(entry?.debug ?? [])],
+            };
+            const exportPart = entry?.exportPart ??
+                (entry?.checkedAtMs === undefined
+                    ? undefined
+                    : provider.restoreExportPart?.({ ...snapshot, rows: shownRows(entry.rows) }));
+            const group = groups.get(provider.id);
+            if (!group) {
+                groups.set(provider.id, {
+                    snapshot,
+                    rows: [...(entry?.rows ?? [])],
+                    parts: exportPart ? [exportPart] : [],
+                });
+                continue;
+            }
+            group.rows.push(...(entry?.rows ?? []));
+            if (exportPart)
+                group.parts.push(exportPart);
+            // A group is only as fresh as its oldest part: "checked … ago" and the retry wait read okAtMs.
+            if (snapshot.okAtMs !== undefined)
+                group.snapshot.okAtMs = Math.min(group.snapshot.okAtMs ?? snapshot.okAtMs, snapshot.okAtMs);
+            if (snapshot.checkedAtMs !== undefined)
+                group.snapshot.checkedAtMs = Math.max(group.snapshot.checkedAtMs ?? 0, snapshot.checkedAtMs);
+            if (snapshot.error && !group.snapshot.error)
+                group.snapshot.error = snapshot.error;
+            group.snapshot.refreshing ||= snapshot.refreshing;
+            group.snapshot.debug?.push(...(snapshot.debug ?? []));
+        }
+        const providers = [...groups.values()].map(({ snapshot, rows, parts }) => {
+            snapshot.rows = shownRows(rows);
+            if (parts.length)
+                snapshot.exportPart = groupedExport(parts, snapshot);
+            return snapshot;
+        });
+        revision += 1;
+        const snapshot = {
+            version: 6,
+            ...(sessionID ? { sessionID } : {}),
+            ...(operation.scope ? { sourceScope: operation.scope } : {}),
+            providers,
+            resetNotices,
+            generatedAtMs: nowMs,
+            serverId,
+            revision,
+        };
+        const modelProviderIds = model ? providerIdsServing(operation, model) : undefined;
+        if (model && modelProviderIds) {
+            snapshot.currentModelProviderIds = modelProviderIds;
+            const { rowPrefixesForModel } = operation.source;
+            if (rowPrefixesForModel)
+                snapshot.currentModelRowPrefixes = rowPrefixesForModel(model);
+        }
+        return snapshot;
+    }
+    /** The operation's providers that serve `model`; undefined when that can't be told. */
+    function providerIdsServing(operation, model) {
+        const { providers, providerIdsForModel } = operation.source;
+        if (!(model.id || model.providerID) || !providerIdsForModel)
+            return undefined;
+        const shown = new Set(providers.map((provider) => provider.id));
+        return providerIdsForModel(model).filter((id) => shown.has(id));
+    }
+    function providerIdsOf(operation) {
+        return JSON.stringify(operation.source.providers.map((provider) => provider.key ?? provider.id));
+    }
+    function emit(operation) {
+        if (listeners.size === 0 || !isCurrent(operation))
+            return;
+        if (operation.sessionID && !sessions.has(operation.sessionID))
+            return;
+        heardProviders.set(operation.scope, providerIdsOf(operation));
+        const snapshot = buildSnapshot(operation);
+        for (const listener of listeners) {
+            try {
+                listener(snapshot);
+            }
+            catch (error) {
+                log(`a quota snapshot subscriber failed: ${errorMessage(error)}`);
+            }
+        }
+    }
+    function record(provider, where, result) {
+        const nowMs = now();
+        const previous = entries.get(where.key);
+        const fresh = loginRows(result);
+        const gotRows = fresh.length > 0;
+        // An answer of nothing replaces the last rows, as an answer with rows does.
+        const replacesRows = gotRows || (result.empty === true && !result.error);
+        const error = result.error ?? (replacesRows ? undefined : { code: "no_data" });
+        // With an error, the logins that did not answer keep their last rows.
+        const answered = new Set(fresh.map((row) => row.login));
+        const kept = gotRows && result.error
+            ? (previous?.rows ?? []).filter((row) => !answered.has(row.login))
+            : [];
+        const rows = replacesRows ? [...fresh, ...kept] : (previous?.rows ?? []);
+        const found = gotRows && previous ? findResets(previous, rows, nowMs) : [];
+        const notices = joinNotices((previous?.notices ?? []).filter((notice) => nowMs - notice.atMs <= RESET_NOTICE_KEEP_MS), found);
+        const okAtMs = replacesRows ? nowMs : previous?.okAtMs;
+        // The check's own rows, numbered among the kept ones as the snapshot numbers them.
+        const exportPart = result.buildExportPart?.({
+            rows: shownRows(rows).slice(0, fresh.length),
+            ...(error === undefined ? {} : { error }),
+            checkedAtMs: nowMs,
+        });
+        entries.set(where.key, {
+            providerId: provider.id,
+            persist: where.persist,
+            ...(provider.key ? { checkId: provider.key } : {}),
+            rows,
+            ...(okAtMs === undefined ? {} : { okAtMs }),
+            checkedAtMs: nowMs,
+            ...(error === undefined ? {} : { error }),
+            // Any error backs off, also when only one of several logins failed. Without an entry, a
+            // login that can't be saved counts on from the file's last check.
+            failures: error === undefined
+                ? 0
+                : (previous?.failures ??
+                    fileLastCheck(provider.key ?? provider.id, where)?.failures ??
+                    0) + 1,
+            debug: result.debug,
+            ...(exportPart === undefined ? {} : { exportPart }),
+            notices,
+            resetSeenAtMs: replacesRows
+                ? resetSeenTimes(previous, rows, nowMs)
+                : (previous?.resetSeenAtMs ?? {}),
+        });
+        if (!where.persist)
+            lastChecksFromFile.delete(provider.key ?? provider.id);
+        persist();
+    }
+    async function fetchProvider(provider, key) {
+        fetching.set(key, (fetching.get(key) ?? 0) + 1);
+        try {
+            const message = `Request timeout after ${Math.round(timeouts.fetchMs / 1000)}s`;
+            return await withTimeout(provider.fetch(), timeouts.fetchMs, message);
+        }
+        catch (error) {
+            return { rows: [], error: classifyError(errorMessage(error), now()), debug: [] };
+        }
+        finally {
+            const left = (fetching.get(key) ?? 1) - 1;
+            if (left > 0)
+                fetching.set(key, left);
+            else
+                fetching.delete(key);
+        }
+    }
+    /** True when a fetch ran; a manual caller joining a skipped pass must still fetch. */
+    async function refreshProviderNow(operation, provider, reason) {
+        const providerKey = provider.key ?? provider.id;
+        const where = operation.keys.get(providerKey);
+        if (!where)
+            return false;
+        const minIntervalMs = provider.minIntervalMs ?? operation.source.minIntervalMs;
+        const entry = entries.get(where.key);
+        const memoryLastCheck = lastCheckOf(entry);
+        const restoredLastCheck = memoryLastCheck === undefined ? fileLastCheck(providerKey, where) : undefined;
+        const last = memoryLastCheck ?? restoredLastCheck;
+        // Memory-only rows are lost on restart, but the file still has their provider's last check.
+        // With nothing to show after a successful check, use the 30 s floor for that restored check
+        // alone, unless the provider sets its own minimum. A failed one keeps the full interval and
+        // its backoff and retry time; checks made here keep the full interval.
+        const intervalMs = restoredLastCheck !== undefined &&
+            restoredLastCheck.failures === 0 &&
+            (entry?.rows.length ?? 0) === 0 &&
+            provider.minIntervalMs === undefined
+            ? Math.min(minIntervalMs, TURN_MIN_INTERVAL_MS)
+            : minIntervalMs;
+        if (!isDue(last, reason, intervalMs, now(), provider.minIntervalMs))
+            return false;
+        const result = await fetchProvider(provider, where.key);
+        // A fetch is stored only under the account it read. A login change (new generation) or
+        // another account now (same generation) drops its answer.
+        if (!isCurrent(operation))
+            return true;
+        const after = await withOpenCodeConfigReadScope(() => resolveKey(provider, operation.scope), {
+            fresh: true,
+        });
+        if (!isCurrent(operation))
+            return true;
+        if (after.key !== where.key) {
+            operation.keys.set(providerKey, after);
+            return true;
+        }
+        record(provider, where, result);
+        // Providers with the same identity share new rows across scopes; each view still reads
+        // its own keys for providers whose credential source differs.
+        forgetInactiveSessions();
+        for (const view of views.values()) {
+            if (view.keys.get(providerKey)?.key === where.key)
+                emit(view);
+        }
+        return true;
+    }
+    function refreshProvider(operation, provider, reason) {
+        // A stale operation never joins or starts a refresh: one of the new generation would join
+        // its run, which fetches nothing.
+        if (disposed || !isCurrent(operation))
+            return Promise.resolve();
+        const key = operation.keys.get(provider.key ?? provider.id)?.key;
+        if (key === undefined)
+            return Promise.resolve();
+        const running = inFlight.get(key);
+        if (running)
+            return running.then((checked) => {
+                if (!checked && reason === "manual")
+                    return refreshProvider(operation, provider, reason);
+            });
+        const run = refreshProviderNow(operation, provider, reason).finally(() => {
+            if (inFlight.get(key) === run)
+                inFlight.delete(key);
+        });
+        inFlight.set(key, run);
+        return run.then(() => { });
+    }
+    /** The providers a refresh asks: all of them, `providerIds`, or those serving `model`. */
+    function providersToRefresh(operation, options) {
+        const { providers } = operation.source;
+        if (options.onlyModelProviders) {
+            const ids = options.model ? providerIdsServing(operation, options.model) : undefined;
+            return providers.filter((provider) => ids?.includes(provider.id));
+        }
+        const { providerIds } = options;
+        return providerIds
+            ? providers.filter((provider) => providerIds.includes(provider.id))
+            : providers;
+    }
+    async function runRefresh(operation, options) {
+        const providers = providersToRefresh(operation, options);
+        await Promise.all(providers.map((provider) => refreshProvider(operation, provider, options.reason)));
+    }
+    /** An operation of the current generation: a login or settings change meanwhile reads again. */
+    async function withCurrentOperation(model, sessionID, work, fresh = false) {
+        for (;;) {
+            const result = await withOpenCodeConfigReadScope(async () => {
+                const operation = await prepare(model, sessionID);
+                if (!isCurrent(operation))
+                    return undefined;
+                return { value: await work(operation) };
+            }, { fresh });
+            if (result)
+                return result.value;
+            fresh = true;
+        }
+    }
+    /**
+     * Starts a new generation: running operations store and tell nothing more, and a new pass
+     * reads the providers and logins, tells subscribers, then refreshes for `reason`.
+     */
+    function supersede(reason, failure) {
+        forgetInactiveSessions();
+        generation += 1;
+        inFlight.clear();
+        const targets = views.size
+            ? [...views.values()]
+            : [{}];
+        // Subscribers see the new providers and rows (or none) before any fetch, then fresh ones.
+        start(async () => {
+            await Promise.all(targets.map(({ model, sessionID }) => withOpenCodeConfigReadScope(async () => {
+                const operation = await prepare(model, sessionID);
+                emit(operation);
+                await runRefresh(operation, { reason });
+            }, { fresh: true })));
+        }).catch((error) => {
+            log(`${failure}: ${errorMessage(error)}`);
+        });
+    }
+    return {
+        snapshot(options = {}) {
+            return start(() => {
+                readSession(options.sessionID);
+                return withCurrentOperation(options.model, options.sessionID, async (operation) => {
+                    if (options.refresh !== false) {
+                        track(runRefresh(operation, { reason: "poll" })).catch((error) => {
+                            log(`background quota refresh failed: ${errorMessage(error)}`);
+                        });
+                    }
+                    return buildSnapshot(operation);
+                });
+            });
+        },
+        refresh(options) {
+            return start(() => {
+                readSession(options.sessionID);
+                return withCurrentOperation(options.model, options.sessionID, async (operation) => {
+                    await runRefresh(operation, { ...options, model: operation.model });
+                    await flush();
+                    // A login or settings change dropped what this pass fetched: the answer shows the
+                    // providers and rows of now, and the new pass's rows follow as events.
+                    if (isCurrent(operation))
+                        return buildSnapshot(operation);
+                    return withCurrentOperation(options.model, options.sessionID, async (current) => buildSnapshot(current), true);
+                });
+            });
+        },
+        subscribe(listener) {
+            listeners.add(listener);
+            return () => {
+                listeners.delete(listener);
+            };
+        },
+        invalidateIdentity() {
+            if (disposed)
+                return;
+            for (const [key, entry] of entries) {
+                if (!entry.persist)
+                    entries.delete(key);
+            }
+            // The new login is checked at once, not after the wait of a login before it.
+            endFileWaits();
+            supersede("poll", "quota refresh after a login change failed");
+        },
+        settingsChanged({ recheck }) {
+            if (disposed)
+                return;
+            if (!recheck) {
+                supersede("poll", "quota refresh after a settings change failed");
+                return;
+            }
+            for (const entry of entries.values())
+                entry.failures = 0;
+            endFileWaits();
+            // A manual refresh waits for no interval: every provider is checked again now.
+            supersede("manual", "quota recheck after a settings change failed");
+        },
+        sessionModelChanged(sessionID) {
+            forgetInactiveSessions();
+            if (disposed || !sessions.has(sessionID))
+                return;
+            supersede("poll", "quota refresh after a session model change failed");
+        },
+        async dispose() {
+            disposed = true;
+            listeners.clear();
+            while (tasks.size > 0)
+                await Promise.allSettled(tasks);
+            await flush();
+            // A write that saved nothing gets one more try; each write saves all the store keeps.
+            if (unsaved) {
+                persist();
+                await flush();
+            }
+        },
+    };
+}
+//# sourceMappingURL=store.js.map

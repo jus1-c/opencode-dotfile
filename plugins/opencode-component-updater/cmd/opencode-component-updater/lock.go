@@ -60,11 +60,21 @@ func acquireOperationLock(value paths, operation string) (*operationLock, error)
 		}
 		contents, readErr := os.ReadFile(value.LockPath)
 		var holder lockRecord
-		if readErr != nil || json.Unmarshal(contents, &holder) != nil || holder.PID <= 0 || !processExists(holder.PID) {
-			if err := os.Remove(value.LockPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return nil, err
-			}
+		if errors.Is(readErr, fs.ErrNotExist) {
 			continue
+		}
+		if readErr != nil {
+			return nil, fmt.Errorf("cannot read updater lock: %w", readErr)
+		}
+		if err := json.Unmarshal(contents, &holder); err != nil || holder.PID <= 0 || holder.Token == "" {
+			return nil, fmt.Errorf("cannot verify updater lock: malformed or incomplete lock file")
+		}
+		alive, processErr := processExists(holder.PID)
+		if processErr != nil {
+			return nil, fmt.Errorf("cannot verify updater lock owner: %w", processErr)
+		}
+		if !alive {
+			return nil, fmt.Errorf("stale updater lock remains; verify pid %d is stopped and remove %s manually", holder.PID, value.LockPath)
 		}
 		return nil, fmt.Errorf("%w: pid %d (%s)", errOperationRunning, holder.PID, holder.Operation)
 	}

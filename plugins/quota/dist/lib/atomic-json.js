@@ -1,6 +1,5 @@
-import { mkdir, rename, rm, writeFile } from "fs/promises";
+import { chmod, mkdir, rename, rm, writeFile } from "fs/promises";
 import { dirname } from "path";
-import { stringifyWithComments } from "./jsonc.js";
 async function safeRm(target) {
     try {
         await rm(target, { force: true });
@@ -9,12 +8,18 @@ async function safeRm(target) {
         // best-effort cleanup
     }
 }
+function renameErrorCode(error) {
+    if (error && typeof error === "object" && "code" in error) {
+        return String(error.code);
+    }
+    return "";
+}
 export async function writeJsonAtomic(path, data, opts = {}) {
-    // Use the comment-preserving stringifier here instead of JSON.stringify.
-    const content = stringifyWithComments(data) + (opts.trailingNewline ? "\n" : "");
+    const content = JSON.stringify(data, null, 2) + (opts.trailingNewline ? "\n" : "");
     await writeTextAtomic(path, content, opts);
 }
 export async function writeTextAtomic(path, content, opts = {}) {
+    const policy = opts.policy ?? "ordinary";
     const dir = dirname(path);
     const tmp = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     await mkdir(dir, opts.directoryMode === undefined
@@ -22,6 +27,10 @@ export async function writeTextAtomic(path, content, opts = {}) {
         : { recursive: true, mode: opts.directoryMode });
     try {
         await writeFile(tmp, content, opts.fileMode === undefined ? "utf-8" : { encoding: "utf-8", mode: opts.fileMode });
+        if (policy === "configuration" && opts.fileMode !== undefined && process.platform !== "win32") {
+            await chmod(tmp, opts.fileMode);
+        }
+        await opts.beforeCommit?.();
     }
     catch (writeError) {
         await safeRm(tmp);
@@ -31,9 +40,11 @@ export async function writeTextAtomic(path, content, opts = {}) {
         await rename(tmp, path);
     }
     catch (renameError) {
-        const code = renameError && typeof renameError === "object" && "code" in renameError
-            ? String(renameError.code)
-            : "";
+        if (policy === "configuration") {
+            await safeRm(tmp);
+            throw renameError;
+        }
+        const code = renameErrorCode(renameError);
         const shouldRetryAsReplace = code === "EPERM" || code === "EEXIST" || code === "EACCES" || code === "ENOTEMPTY";
         if (!shouldRetryAsReplace) {
             await safeRm(tmp);

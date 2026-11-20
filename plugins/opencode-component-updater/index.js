@@ -1,10 +1,9 @@
-import { fileURLToPath } from "node:url";
-import { dirname } from "node:path";
-import { createTuiPlugin } from "./src/tui.js";
+import { Plugin } from "@opencode/plugin";
 
-const pluginRoot = dirname(fileURLToPath(import.meta.url));
-
-export default {
+// Server-side entrypoint. All updater behavior lives in the CLI plugin
+// (./tui), which owns the terminal keymap and dialogs. This entrypoint exists
+// so the package can be listed as a plugin without registering server hooks.
+export default Plugin.define({
   id: "opencode-component-updater",
-  tui: createTuiPlugin({ pluginRoot }),
-};
+  setup() {},
+});

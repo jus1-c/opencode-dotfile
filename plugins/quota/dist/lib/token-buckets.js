@@ -10,9 +10,6 @@ export function addTokenBuckets(a, b) {
         cache_write: a.cache_write + b.cache_write,
     };
 }
-export function totalTokenBuckets(buckets) {
-    return (buckets.input + buckets.output + buckets.reasoning + buckets.cache_read + buckets.cache_write);
-}
 export function tokenBucketsFromMessage(message) {
     const tokens = message.tokens;
     if (!tokens)

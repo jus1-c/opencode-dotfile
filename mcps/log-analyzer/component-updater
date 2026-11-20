@@ -11,8 +11,8 @@ TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
 PACKAGE = "codesdevs-log-analyzer"
 MODULE = "codesdevs_log_analyzer"
 ENTRY_POINT = ("codesdevs-log-analyzer", "codesdevs_log_analyzer.cli:main")
-PYTHON = "python3.14"
-UV = os.path.expanduser("~/.local/bin/uv")
+PYTHON = "3.14"
+UV = "uv"
 
 
 def fail(message):
@@ -78,20 +78,21 @@ def update():
     if count != 1:
         fail("expected one codesdevs-log-analyzer requirement")
     (stage / "requirements.in").write_text(requirements)
+    python = subprocess.check_output([UV, "python", "find", PYTHON], text=True).strip()
     run(
         UV,
         "pip",
         "compile",
         "--quiet",
         "--python",
-        PYTHON,
+        python,
         "--generate-hashes",
         "--output-file",
         "requirements.lock",
         "requirements.in",
         cwd=stage,
     )
-    run(PYTHON, "-m", "venv", "--copies", stage / ".venv")
+    run(python, "-m", "venv", "--copies", stage / ".venv")
     (stage / ".venv/lib64").unlink(missing_ok=True)
     run(
         UV,

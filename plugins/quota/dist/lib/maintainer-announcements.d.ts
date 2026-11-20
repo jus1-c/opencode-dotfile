@@ -4,11 +4,11 @@ export interface MaintainerAnnouncement {
     message: string;
     url?: string;
     startsAt?: string;
-    endsAt?: string;
+    endsAt: string;
     providerIds?: CanonicalQuotaProviderId[];
 }
-export type MaintainerAnnouncementInactiveReason = "invalid_id" | "invalid_message" | "invalid_url" | "invalid_starts_at" | "invalid_ends_at" | "not_started" | "ended" | "invalid_provider_ids" | "provider_mismatch";
-export interface MaintainerAnnouncementEvaluation {
+type MaintainerAnnouncementInactiveReason = "invalid_id" | "invalid_message" | "invalid_url" | "invalid_starts_at" | "invalid_ends_at" | "not_started" | "ended" | "invalid_provider_ids" | "provider_mismatch";
+interface MaintainerAnnouncementEvaluation {
     announcement: MaintainerAnnouncement;
     active: boolean;
     reasons: MaintainerAnnouncementInactiveReason[];
@@ -24,20 +24,9 @@ export interface MaintainerAnnouncementsSummary {
     evaluations: MaintainerAnnouncementEvaluation[];
 }
 export declare const BUNDLED_MAINTAINER_ANNOUNCEMENTS: readonly MaintainerAnnouncement[];
-export declare function evaluateMaintainerAnnouncements(params?: {
-    announcements?: readonly MaintainerAnnouncement[];
-    nowMs?: number;
-    enabledProviders?: string[] | "auto";
-}): MaintainerAnnouncementEvaluation[];
-export declare function getActiveMaintainerAnnouncements(params?: {
-    announcements?: readonly MaintainerAnnouncement[];
-    nowMs?: number;
-    enabledProviders?: string[] | "auto";
-}): MaintainerAnnouncementEvaluation[];
 export declare function getMaintainerAnnouncementsSummary(params?: {
     announcements?: readonly MaintainerAnnouncement[];
     nowMs?: number;
     enabledProviders?: string[] | "auto";
 }): MaintainerAnnouncementsSummary;
-export declare function formatMaintainerAnnouncementHomeCountLine(activeCount: number): string;
-//# sourceMappingURL=maintainer-announcements.d.ts.map
+export {};

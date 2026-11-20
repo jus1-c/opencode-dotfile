@@ -5,7 +5,6 @@
  * remote/provider error text cannot inject terminal control codes into
  * toasts or transcript output.
  */
-import { isValueEntry } from "./entries.js";
 // Remove terminal escape sequences (CSI/OSC/DCS/APC/PM/SOS) and other control
 // characters except newline/tab so provider text cannot inject terminal actions.
 // eslint-disable-next-line no-control-regex
@@ -23,89 +22,5 @@ export function sanitizeDisplaySnippet(text, maxLength) {
 }
 export function sanitizeSingleLineDisplaySnippet(text, maxLength) {
     return sanitizeSingleLineDisplayText(text).slice(0, maxLength);
-}
-export function sanitizeOptionalDisplayText(value) {
-    return typeof value === "string" ? sanitizeDisplayText(value) : undefined;
-}
-export function sanitizeQuotaToastEntry(entry) {
-    if (isValueEntry(entry)) {
-        return {
-            ...entry,
-            accounting: { ...entry.accounting },
-            name: sanitizeDisplayText(entry.name),
-            value: sanitizeDisplayText(entry.value),
-            group: sanitizeOptionalDisplayText(entry.group),
-            label: sanitizeOptionalDisplayText(entry.label),
-            right: sanitizeOptionalDisplayText(entry.right),
-            resetTimeIso: sanitizeOptionalDisplayText(entry.resetTimeIso),
-        };
-    }
-    return {
-        ...entry,
-        accounting: { ...entry.accounting },
-        name: sanitizeDisplayText(entry.name),
-        group: sanitizeOptionalDisplayText(entry.group),
-        label: sanitizeOptionalDisplayText(entry.label),
-        right: sanitizeOptionalDisplayText(entry.right),
-        resetTimeIso: sanitizeOptionalDisplayText(entry.resetTimeIso),
-    };
-}
-export function sanitizeQuotaToastError(error) {
-    return {
-        label: sanitizeDisplayText(error.label),
-        message: sanitizeDisplayText(error.message),
-    };
-}
-export function sanitizeQuotaProviderResult(result) {
-    return {
-        attempted: result.attempted,
-        entries: result.entries.map(sanitizeQuotaToastEntry),
-        errors: result.errors.map(sanitizeQuotaToastError),
-        ...(result.diagnostics
-            ? {
-                diagnostics: result.diagnostics.map((diagnostic) => ({
-                    ...diagnostic,
-                    modelIds: diagnostic.modelIds ? [...diagnostic.modelIds] : null,
-                    checkedPaths: [...diagnostic.checkedPaths],
-                    authPaths: [...diagnostic.authPaths],
-                })),
-            }
-            : {}),
-        ...(result.statusDetails
-            ? {
-                statusDetails: result.statusDetails.map((detail) => ({
-                    key: sanitizeDisplayText(detail.key),
-                    value: sanitizeDisplayText(detail.value),
-                })),
-            }
-            : {}),
-        ...(result.rawDetails
-            ? {
-                rawDetails: result.rawDetails.map((detail) => ({
-                    key: sanitizeDisplayText(detail.key),
-                    value: sanitizeDisplayText(detail.value),
-                })),
-            }
-            : {}),
-        ...(result.presentation ? { presentation: { ...result.presentation } } : {}),
-    };
-}
-export function sanitizeSessionTokensData(data) {
-    if (!data)
-        return undefined;
-    return {
-        ...data,
-        models: data.models.map((model) => ({
-            ...model,
-            modelID: sanitizeDisplayText(model.modelID),
-        })),
-    };
-}
-export function sanitizeQuotaRenderData(data) {
-    return {
-        entries: data.entries.map(sanitizeQuotaToastEntry),
-        errors: data.errors.map(sanitizeQuotaToastError),
-        sessionTokens: sanitizeSessionTokensData(data.sessionTokens),
-    };
 }
 //# sourceMappingURL=display-sanitize.js.map

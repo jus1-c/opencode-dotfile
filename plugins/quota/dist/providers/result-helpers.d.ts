@@ -1,55 +1,37 @@
-import type { AccountingMetadata, QuotaProviderPresentation, QuotaProviderResult, QuotaProviderStatusDetail, QuotaToastEntry, QuotaToastError } from "../lib/entries.js";
-export declare function notAttemptedResult(): QuotaProviderResult;
-export declare function attemptedResult(entries: QuotaToastEntry[], errors?: QuotaToastError[], presentation?: QuotaProviderPresentation): QuotaProviderResult;
-export declare function attemptedErrorResult(label: string, message: string): QuotaProviderResult;
-export declare function statusDetailsFromRecord(values: Readonly<Record<string, string | undefined>>): QuotaProviderStatusDetail[];
+import type { DebugDetail } from "../core/types.js";
+import { type ApiKeySpec, type VendorKeys } from "../lib/api-key-resolver.js";
+export declare function statusDetailsFromRecord(values: Readonly<Record<string, string | undefined>>): DebugDetail[];
 export declare function configStatusDetails(diagnostics: {
     state: string;
     source: string | null;
     checkedPaths: readonly string[];
-    missing?: string | null;
-    error?: string | null;
-}): QuotaProviderStatusDetail[];
+}): DebugDetail[];
 export declare function simpleApiKeyStatusDetails(diagnostics: {
     configured: boolean;
     source: string | null;
     checkedPaths: readonly string[];
-    authPaths: readonly string[];
-}): QuotaProviderStatusDetail[];
+    credentialDatabasePaths: readonly string[];
+}): DebugDetail[];
+type KeyState = {
+    state: "none";
+    source: null;
+} | {
+    state: "configured";
+    source: string;
+} | {
+    state: "invalid";
+    source: "opencode.db";
+    error: string;
+};
+/** The key the vendor uses first: the env or config key, else its first stored login. */
+export declare function vendorKeyState(keys: VendorKeys): KeyState;
+/** Where a vendor's API key was looked for, and what its first key holds. */
+export declare function vendorKeyDetails(spec: ApiKeySpec, keys: VendorKeys, directory: string): DebugDetail[];
 export declare function apiKeyStatusDetails(diagnostics: {
     state: string;
     source: string | null;
     checkedPaths: readonly string[];
-    authPaths: readonly string[];
+    credentialDatabasePaths: readonly string[];
     error?: string;
-}): QuotaProviderStatusDetail[];
-export declare function withStatusDetails(result: QuotaProviderResult, statusDetails: readonly QuotaProviderStatusDetail[]): QuotaProviderResult;
-export declare function inspectGeneratedCounterFile(path: string, expectedVersion: number): Promise<{
-    exists: boolean;
-    health: "missing" | "healthy" | "malformed" | "version_mismatch";
-    version: number | null;
-    lastUpdatedAt: number | null;
-}>;
-export declare function mapNullableProviderResult<TSuccess extends {
-    success: true;
-}>(result: TSuccess | {
-    success: false;
-    error: string;
-} | null, params: {
-    errorLabel: string;
-    onSuccess: (result: TSuccess) => QuotaProviderResult;
-}): QuotaProviderResult;
-export declare function groupedPercentWindowEntries(params: {
-    group: string;
-    accounting: AccountingMetadata;
-    windows: Array<{
-        window?: {
-            percentRemaining: number;
-            resetTimeIso?: string;
-        };
-        suffix: string;
-        label: string;
-    }>;
-    fallbackWhenEmpty?: boolean;
-}): QuotaToastEntry[];
-//# sourceMappingURL=result-helpers.d.ts.map
+}): DebugDetail[];
+export {};

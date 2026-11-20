@@ -1,265 +1,261 @@
 import { readdirSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { readFile } from "fs/promises";
-import { getOpencodeRuntimeDirCandidates } from "./opencode-runtime-paths.js";
+import { nonEmptyString } from "./json-guards.js";
+import { getOpencodeRuntimeDirs } from "./opencode-runtime-paths.js";
 const require = createRequire(import.meta.url);
-function isModuleNotFoundError(error) {
-    if (!error || typeof error !== "object")
-        return false;
-    if ("code" in error && error.code === "MODULE_NOT_FOUND")
-        return true;
-    return error instanceof Error && error.message.includes("Cannot find module");
+const RUNTIME_CANDIDATES = [
+    ["src", "constants.ts"],
+    ["src", "constants.js"],
+    ["dist", "src", "constants.js"],
+    ["dist", "index.js"],
+];
+const PACKAGE_JSON_CANDIDATES = [
+    ["src", "constants.ts"],
+    ["dist", "index.js"],
+];
+function hasErrorCode(error, code) {
+    return Boolean(error && typeof error === "object" && "code" in error && error.code === code);
 }
-function isPackagePathNotExportedError(error) {
-    return Boolean(error &&
-        typeof error === "object" &&
-        "code" in error &&
-        error.code === "ERR_PACKAGE_PATH_NOT_EXPORTED");
+/** "Not installed" or "subpath not exported": the next lookup may still find it. */
+function isNotFoundError(error) {
+    return (hasErrorCode(error, "MODULE_NOT_FOUND") ||
+        hasErrorCode(error, "ERR_PACKAGE_PATH_NOT_EXPORTED") ||
+        (error instanceof Error && error.message.includes("Cannot find module")));
 }
-function isFallthroughResolutionError(error) {
-    return isModuleNotFoundError(error) || isPackagePathNotExportedError(error);
+/**
+ * Where Node resolves `specifier`, then (with `searchCache`) where it resolves
+ * it from OpenCode's cache directory. `failed` marks any other resolver error.
+ */
+function resolveModulePath(specifier, lookup, searchCache) {
+    const attempt = (resolve) => {
+        try {
+            return { path: resolve(), failed: false };
+        }
+        catch (error) {
+            if (hasErrorCode(error, "ERR_PACKAGE_PATH_NOT_EXPORTED"))
+                lookup.packageFound = true;
+            return { path: null, failed: !isNotFoundError(error) };
+        }
+    };
+    const fromProcess = attempt(() => require.resolve(specifier));
+    if (fromProcess.path || fromProcess.failed || !searchCache)
+        return fromProcess;
+    return attempt(() => require.resolve(specifier, { paths: [getOpencodeRuntimeDirs().cacheDir] }));
 }
-function isMissingFileError(error) {
-    if (!error || typeof error !== "object" || !("code" in error))
-        return false;
-    return error.code === "ENOENT" || error.code === "ENOTDIR";
-}
-function markPackageFound(error, context) {
-    if (isPackagePathNotExportedError(error))
-        context.packageFound = true;
-}
-function resolveSpecifier(specifier, searchRuntimePaths, context) {
+/**
+ * Package roots in OpenCode 2's plugin install layout:
+ * `<cache>/npm/<package>@<spec>/<generation>/node_modules/<package>`.
+ * OpenCode 2 loads only the highest-numbered generation of a spec directory.
+ * Generation numbers are install timestamps, so across specs (for example
+ * `@latest` and `@alpha`) the most recent install comes first.
+ */
+function getOpencode2NpmPackageRoots(specsDir, name, packageName) {
+    let specEntries;
     try {
-        return require.resolve(specifier);
+        specEntries = readdirSync(specsDir, { withFileTypes: true });
     }
-    catch (error) {
-        markPackageFound(error, context);
-        if (!searchRuntimePaths || !isFallthroughResolutionError(error))
-            throw error;
-        try {
-            return require.resolve(specifier, {
-                paths: getOpencodeRuntimeDirCandidates().cacheDirs,
-            });
-        }
-        catch (runtimeError) {
-            markPackageFound(runtimeError, context);
-            throw runtimeError;
-        }
+    catch {
+        // A missing OpenCode 2 npm directory is not an installed companion.
+        return [];
     }
-}
-function getRuntimePackageRoots(descriptor) {
-    const cacheDirs = getOpencodeRuntimeDirCandidates().cacheDirs;
-    const packageRoots = cacheDirs.map((cacheDir) => join(cacheDir, "node_modules", descriptor.packageName));
-    for (const cacheDir of cacheDirs) {
+    const installs = [];
+    for (const entry of specEntries) {
+        if (!entry.isDirectory() || !entry.name.startsWith(`${name}@`))
+            continue;
+        const specDir = join(specsDir, entry.name);
+        let generation;
         try {
-            const packagesDir = join(cacheDir, "packages");
-            if (descriptor.packageScan === "scoped") {
-                const [scope, name] = descriptor.packageName.split("/");
-                const scopeDir = join(packagesDir, scope);
-                for (const entry of readdirSync(scopeDir, { withFileTypes: true })) {
-                    if (entry.isDirectory() && entry.name.startsWith(name)) {
-                        const packagePath = join(scopeDir, entry.name);
-                        packageRoots.push(packagePath);
-                        packageRoots.push(join(packagePath, "node_modules", descriptor.packageName));
-                    }
-                }
-            }
-            else {
-                for (const entry of readdirSync(packagesDir, { withFileTypes: true })) {
-                    if (entry.isDirectory() && entry.name.startsWith(descriptor.packageName)) {
-                        const packagePath = join(packagesDir, entry.name);
-                        packageRoots.push(packagePath);
-                        packageRoots.push(join(packagePath, "node_modules", descriptor.packageName));
-                    }
-                }
-            }
+            generation = readdirSync(specDir)
+                .filter((candidate) => /^\d+$/.test(candidate))
+                .sort((left, right) => Number(left) - Number(right))
+                .at(-1);
         }
         catch {
-            // A missing runtime packages directory is not an installed companion.
+            continue;
         }
+        if (!generation)
+            continue;
+        installs.push({
+            generation: Number(generation),
+            packageRoot: join(specDir, generation, "node_modules", packageName),
+        });
+    }
+    return installs
+        .sort((left, right) => right.generation - left.generation)
+        .map((install) => install.packageRoot);
+}
+function getRuntimePackageRoots(packageName) {
+    const { cacheDir } = getOpencodeRuntimeDirs();
+    // Installs of "@scope/name" live in a scope folder, unscoped ones in the parent folder.
+    const [scope, name] = packageName.startsWith("@")
+        ? packageName.split("/")
+        : ["", packageName];
+    const packageRoots = [
+        ...getOpencode2NpmPackageRoots(join(cacheDir, "npm", scope), name, packageName),
+        // OpenCode 1 layouts. OpenCode 2 shares this cache directory and never
+        // removes them, so companions installed before the upgrade still provide
+        // the OAuth client for logins that OpenCode 2 imported from auth.json.
+        join(cacheDir, "node_modules", packageName),
+    ];
+    const packagesDir = join(cacheDir, "packages", scope);
+    try {
+        for (const entry of readdirSync(packagesDir, { withFileTypes: true })) {
+            if (!entry.isDirectory() || !entry.name.startsWith(name))
+                continue;
+            const packagePath = join(packagesDir, entry.name);
+            packageRoots.push(packagePath, join(packagePath, "node_modules", packageName));
+        }
+    }
+    catch {
+        // A missing runtime packages directory is not an installed companion.
     }
     return packageRoots;
 }
-function buildConfiguredState(params) {
+function configuredState(importSpecifier, resolvedPath, client) {
     return {
-        presence: {
-            state: "present",
-            importSpecifier: params.importSpecifier,
-            resolvedPath: params.resolvedPath,
-        },
-        credentials: {
-            state: "configured",
-            clientId: params.clientId,
-            clientSecret: params.clientSecret,
-            resolvedPath: params.resolvedPath,
-        },
+        presence: { state: "present", importSpecifier, resolvedPath },
+        credentials: { state: "configured", ...client, resolvedPath },
     };
 }
-function buildInvalidState(descriptor, importSpecifier, resolvedPath) {
+function invalidState(companion, importSpecifier, resolvedPath) {
+    const error = `Installed ${companion.packageName} package is incompatible`;
+    const path = resolvedPath ? { resolvedPath } : {};
     return {
-        presence: {
-            state: "invalid",
-            importSpecifier,
-            ...(resolvedPath ? { resolvedPath } : {}),
-            error: descriptor.invalidError,
-        },
-        credentials: {
-            state: "invalid",
-            ...(resolvedPath ? { resolvedPath } : {}),
-            error: descriptor.invalidError,
-        },
+        presence: { state: "invalid", importSpecifier, ...path, error },
+        credentials: { state: "invalid", ...path, error },
     };
 }
-function parseSourceCredentials(descriptor, content) {
-    const readConstant = (name) => {
-        const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        return (content
-            .match(new RegExp(`(?:export\\s+const|const|var)\\s+${escapedName}\\s*=\\s*["']([^"']+)["']`))?.[1]
-            ?.trim() ?? "");
-    };
-    const clientId = readConstant(descriptor.clientIdExport);
-    const clientSecret = readConstant(descriptor.clientSecretExport);
-    return clientId && clientSecret ? { clientId, clientSecret } : null;
+function readStringConstant(content, name) {
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return (content
+        .match(new RegExp(`(?:export\\s+const|const|var)\\s+${escapedName}\\s*=\\s*["']([^"']+)["']`))?.[1]
+        ?.trim() ?? "");
 }
-async function readCredentialsPath(descriptor, importSpecifier, resolvedPath, readErrors) {
+/** The client in a source or bundle file; null when the file cannot be read. */
+async function readConstantsFile(companion, importSpecifier, path) {
     let content;
     try {
-        content = await readFile(resolvedPath, "utf8");
+        content = await readFile(path, "utf8");
     }
-    catch (error) {
-        if (readErrors === "fallthrough-all" || isMissingFileError(error))
-            return null;
-        return buildInvalidState(descriptor, importSpecifier, resolvedPath);
-    }
-    const credentials = parseSourceCredentials(descriptor, content);
-    return credentials
-        ? buildConfiguredState({ importSpecifier, resolvedPath, ...credentials })
-        : buildInvalidState(descriptor, importSpecifier, resolvedPath);
-}
-async function resolveStage(descriptor, stage, context) {
-    if (stage.kind === "dynamic-import") {
-        for (const importSpecifier of stage.specifiers) {
-            let resolvedPath;
-            try {
-                resolvedPath = resolveSpecifier(importSpecifier, true, context);
-            }
-            catch (error) {
-                if (isFallthroughResolutionError(error))
-                    continue;
-                return buildInvalidState(descriptor, importSpecifier);
-            }
-            let companionModule;
-            try {
-                companionModule = (await import(pathToFileURL(resolvedPath).href));
-            }
-            catch {
-                return buildInvalidState(descriptor, importSpecifier, resolvedPath);
-            }
-            const clientId = companionModule[descriptor.clientIdExport];
-            const clientSecret = companionModule[descriptor.clientSecretExport];
-            if (typeof clientId !== "string" ||
-                !clientId.trim() ||
-                typeof clientSecret !== "string" ||
-                !clientSecret.trim()) {
-                return buildInvalidState(descriptor, importSpecifier, resolvedPath);
-            }
-            return buildConfiguredState({
-                importSpecifier,
-                resolvedPath,
-                clientId: clientId.trim(),
-                clientSecret: clientSecret.trim(),
-            });
-        }
+    catch {
         return null;
     }
-    if (stage.kind === "runtime-files") {
-        for (const packageRoot of getRuntimePackageRoots(descriptor)) {
-            for (const parts of stage.candidatePaths) {
-                const resolved = await readCredentialsPath(descriptor, stage.importSpecifier, join(packageRoot, ...parts), stage.readErrors);
-                if (resolved)
-                    return resolved;
-            }
-        }
-        return null;
-    }
-    if (stage.kind === "source-specifier") {
-        let resolvedPath;
-        try {
-            resolvedPath = resolveSpecifier(stage.importSpecifier, stage.searchRuntimePaths, context);
-        }
-        catch (error) {
-            return isFallthroughResolutionError(error)
-                ? null
-                : buildInvalidState(descriptor, stage.importSpecifier);
-        }
-        return ((await readCredentialsPath(descriptor, stage.importSpecifier, resolvedPath, stage.readErrors)) ?? buildInvalidState(descriptor, stage.importSpecifier, resolvedPath));
-    }
-    if (stage.kind === "package-json") {
-        let packageJsonPath;
-        try {
-            packageJsonPath = resolveSpecifier(stage.importSpecifier, true, context);
-        }
-        catch (error) {
-            return isFallthroughResolutionError(error)
-                ? null
-                : buildInvalidState(descriptor, stage.resolutionErrorImportSpecifier);
-        }
-        const packageRoot = dirname(packageJsonPath);
-        for (const parts of stage.candidatePaths) {
-            const resolved = await readCredentialsPath(descriptor, stage.candidateImportSpecifier, join(packageRoot, ...parts), stage.readErrors);
-            if (resolved)
-                return resolved;
-        }
-        const invalidPath = stage.exhaustedInvalidPath === "package-json"
-            ? packageJsonPath
-            : join(packageRoot, ...stage.candidatePaths[0]);
-        return buildInvalidState(descriptor, stage.candidateImportSpecifier, invalidPath);
-    }
-    let packageEntryPath;
-    try {
-        packageEntryPath = resolveSpecifier(stage.importSpecifier, true, context);
-    }
-    catch (error) {
-        return isFallthroughResolutionError(error)
-            ? null
-            : buildInvalidState(descriptor, stage.importSpecifier);
-    }
-    return ((await readCredentialsPath(descriptor, stage.importSpecifier, packageEntryPath, stage.readErrors)) ?? buildInvalidState(descriptor, stage.importSpecifier, packageEntryPath));
+    const clientId = readStringConstant(content, companion.clientIdExport);
+    const clientSecret = readStringConstant(content, companion.clientSecretExport);
+    return clientId && clientSecret
+        ? configuredState(importSpecifier, path, { clientId, clientSecret })
+        : invalidState(companion, importSpecifier, path);
 }
-export function createGoogleCompanionCredentialResolver(descriptor) {
-    let resolvedStatePromise = null;
-    async function getResolvedState() {
-        if (!resolvedStatePromise) {
-            resolvedStatePromise = (async () => {
-                const context = { packageFound: false };
-                for (const stage of descriptor.stages) {
-                    const resolved = await resolveStage(descriptor, stage, context);
-                    if (resolved)
-                        return resolved;
-                }
-                if (context.packageFound) {
-                    return buildInvalidState(descriptor, descriptor.packageName);
-                }
-                return {
-                    presence: {
-                        state: "missing",
-                        importSpecifier: descriptor.missingImportSpecifier,
-                        error: descriptor.missingError,
-                    },
-                    credentials: { state: "missing", error: descriptor.missingError },
-                };
-            })();
+/**
+ * Imports the compiled constants module and reads its named exports. A bundled
+ * `dist/index.js` keeps the client private, so only the text readers below read it.
+ */
+async function fromCompiledModule(companion, lookup) {
+    const { packageName } = companion;
+    for (const specifier of [
+        `${packageName}/dist/src/constants.js`,
+        `${packageName}/src/constants.js`,
+    ]) {
+        const { path, failed } = resolveModulePath(specifier, lookup, true);
+        if (failed)
+            return invalidState(companion, specifier);
+        if (!path)
+            continue;
+        let exports;
+        try {
+            exports = (await import(pathToFileURL(path).href));
         }
-        return resolvedStatePromise;
+        catch {
+            return invalidState(companion, specifier, path);
+        }
+        const clientId = nonEmptyString(exports[companion.clientIdExport]);
+        const clientSecret = nonEmptyString(exports[companion.clientSecretExport]);
+        return clientId && clientSecret
+            ? configuredState(specifier, path, { clientId, clientSecret })
+            : invalidState(companion, specifier, path);
     }
+    return null;
+}
+/** Reads the file a specifier resolves to; an unreadable file is an incompatible package. */
+async function fromResolvedFile(companion, specifier, lookup, searchCache) {
+    const { path, failed } = resolveModulePath(specifier, lookup, searchCache);
+    if (failed)
+        return invalidState(companion, specifier);
+    if (!path)
+        return null;
+    return ((await readConstantsFile(companion, specifier, path)) ??
+        invalidState(companion, specifier, path));
+}
+async function fromRuntimeCache(companion, sourceSpecifier) {
+    for (const packageRoot of getRuntimePackageRoots(companion.packageName)) {
+        for (const parts of RUNTIME_CANDIDATES) {
+            const state = await readConstantsFile(companion, sourceSpecifier, join(packageRoot, ...parts));
+            if (state)
+                return state;
+        }
+    }
+    return null;
+}
+async function fromPackageJson(companion, sourceSpecifier, lookup) {
+    const { path, failed } = resolveModulePath(`${companion.packageName}/package.json`, lookup, true);
+    if (failed)
+        return invalidState(companion, sourceSpecifier);
+    if (!path)
+        return null;
+    const packageRoot = dirname(path);
+    for (const parts of PACKAGE_JSON_CANDIDATES) {
+        const state = await readConstantsFile(companion, sourceSpecifier, join(packageRoot, ...parts));
+        if (state)
+            return state;
+    }
+    return invalidState(companion, sourceSpecifier, join(packageRoot, ...PACKAGE_JSON_CANDIDATES[0]));
+}
+async function resolveCompanionState(companion) {
+    const { packageName } = companion;
+    const sourceSpecifier = `${packageName}/src/constants.ts`;
+    const lookup = { packageFound: false };
+    const found = (await fromCompiledModule(companion, lookup)) ??
+        (await fromResolvedFile(companion, sourceSpecifier, lookup, false)) ??
+        (await fromRuntimeCache(companion, sourceSpecifier)) ??
+        (await fromPackageJson(companion, sourceSpecifier, lookup)) ??
+        (await fromResolvedFile(companion, packageName, lookup, true));
+    if (found)
+        return found;
+    if (lookup.packageFound)
+        return invalidState(companion, packageName);
+    const error = `Install ${packageName} separately to enable ${companion.quotaName} quota`;
     return {
-        inspect: async () => (await getResolvedState()).presence,
-        resolveCredentials: async () => (await getResolvedState()).credentials,
+        presence: { state: "missing", importSpecifier: sourceSpecifier, error },
+        credentials: { state: "missing", error },
+    };
+}
+function createCompanionResolver(companion) {
+    let statePromise = null;
+    const getState = () => {
+        statePromise ??= resolveCompanionState(companion);
+        return statePromise;
+    };
+    return {
+        inspect: async () => (await getState()).presence,
+        resolveCredentials: async () => (await getState()).credentials,
         clearCacheForTests: () => {
-            resolvedStatePromise = null;
+            statePromise = null;
         },
     };
 }
+export const agyCompanion = createCompanionResolver({
+    packageName: "@anthonyhaussman/opencode-agy-auth",
+    clientIdExport: "AGY_CLIENT_ID",
+    clientSecretExport: "AGY_CLIENT_SECRET",
+    quotaName: "Google AGY",
+});
+export const geminiCliCompanion = createCompanionResolver({
+    packageName: "opencode-gemini-auth",
+    clientIdExport: "GEMINI_CLIENT_ID",
+    clientSecretExport: "GEMINI_CLIENT_SECRET",
+    quotaName: "Gemini CLI",
+});
 //# sourceMappingURL=google-companion-credentials.js.map

@@ -5,7 +5,11 @@ COMPONENT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PID_FILE="${COMPONENT_DIR}/runtime/state/headless.pid"
 LOG_FILE="${COMPONENT_DIR}/runtime/logs/headless.log"
 JAVA_HOME="${COMPONENT_DIR}/runtime/jdk"
-GHIDRA_HOME="${COMPONENT_DIR}/ghidra"
+GHIDRA_HOME="$(ls -d "${COMPONENT_DIR}"/ghidra-releases/ghidra_* 2>/dev/null | sort -V | tail -1)"
+if [ -z "${GHIDRA_HOME}" ] || [ ! -d "${GHIDRA_HOME}" ]; then
+    echo "start-headless: no Ghidra release found under ${COMPONENT_DIR}/ghidra-releases" >&2
+    exit 1
+fi
 PORT=8089
 BIND="127.0.0.1"
 
@@ -21,7 +25,7 @@ for jar in "${GHIDRA_HOME}"/Ghidra/Processors/*/lib/*.jar; do CLASSPATH="${CLASS
 mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$PID_FILE")"
 
 nohup "${JAVA_HOME}/bin/java" \
-    -Xmx4g -XX:+UseG1GC \
+    ${JAVA_OPTS:--Xmx22g -XX:+UseG1GC} \
     -Dghidra.home="${GHIDRA_HOME}" \
     -Dapplication.name=GhidraMCP \
     -classpath "${CLASSPATH}" \

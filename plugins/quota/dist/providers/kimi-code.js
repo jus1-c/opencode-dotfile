@@ -1,84 +1,308 @@
-import { queryKimiQuota } from "../lib/kimi.js";
-import { DEFAULT_KIMI_AUTH_CACHE_MAX_AGE_MS, getKimiAuthDiagnostics, resolveKimiAuthCached, } from "../lib/kimi-auth.js";
-import { isCanonicalProviderAvailable } from "../lib/provider-availability.js";
+/**
+ * Kimi Code quota (global and China endpoints): the weekly usage and each named limit. Each key
+ * stored in OpenCode is queried as its own account; without stored keys, the key the resolver
+ * finds is.
+ */
+import { classifyWindow } from "../core/windows.js";
+import { API_KEY_VENDORS, readVendorKeys } from "../lib/api-key-resolver.js";
+import { sanitizeDisplaySnippet, sanitizeDisplayText } from "../lib/display-sanitize.js";
+import { clampPercent } from "../lib/format-utils.js";
+import { errorWords, failureFacts, requestJson } from "../lib/http.js";
+import { nonEmptyString } from "../lib/json-guards.js";
 import { normalizeQuotaProviderId } from "../lib/provider-metadata.js";
-import { apiKeyStatusDetails, attemptedErrorResult, attemptedResult, notAttemptedResult, withStatusDetails, } from "./result-helpers.js";
-function formatUsageRight(window) {
-    return `${window.used}/${window.limit}`;
+import { vendorKeysPolicy } from "./cache-policies.js";
+import { failedAccount, fetchError, keySlug, quotaRow, } from "./contract.js";
+import { fetchStoredKeys, isKeyVendorAvailable } from "./key-vendor.js";
+import { statusDetailsFromRecord, vendorKeyDetails } from "./result-helpers.js";
+const USER_AGENT = "OpenCode-Quota-Toast/1.0";
+function getFiniteNumber(value) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+        return value;
+    }
+    if (typeof value === "string") {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed)) {
+            return parsed;
+        }
+    }
+    return undefined;
 }
-export const kimiCodeProvider = {
-    id: "kimi-for-coding",
-    async isAvailable(ctx) {
-        const providerAvailable = await isCanonicalProviderAvailable({
-            ctx,
-            providerId: "kimi-for-coding",
-            fallbackOnError: false,
-        });
-        if (!providerAvailable) {
-            return false;
+function parseResetTimeIso(data) {
+    for (const key of ["reset_at", "resetAt", "reset_time", "resetTime"]) {
+        const val = data[key];
+        if (typeof val === "string" && val.trim().length > 0) {
+            const ms = Date.parse(val);
+            if (Number.isFinite(ms)) {
+                return new Date(ms).toISOString();
+            }
         }
-        const auth = await resolveKimiAuthCached({
-            maxAgeMs: DEFAULT_KIMI_AUTH_CACHE_MAX_AGE_MS,
-        });
-        return auth.state === "configured" || auth.state === "invalid";
-    },
-    matchesCurrentModel(model) {
-        const [provider] = model.toLowerCase().split("/", 2);
-        return normalizeQuotaProviderId(provider) === "kimi-for-coding";
-    },
-    async fetch(ctx) {
-        const diagnostics = await getKimiAuthDiagnostics({
-            maxAgeMs: DEFAULT_KIMI_AUTH_CACHE_MAX_AGE_MS,
-        });
-        const authDetails = apiKeyStatusDetails(diagnostics);
-        const auth = await resolveKimiAuthCached({
-            maxAgeMs: DEFAULT_KIMI_AUTH_CACHE_MAX_AGE_MS,
-        });
-        if (auth.state === "none") {
-            return withStatusDetails(notAttemptedResult(), authDetails);
+    }
+    for (const key of ["reset_in", "resetIn", "ttl"]) {
+        const seconds = getFiniteNumber(data[key]);
+        if (seconds !== undefined && seconds > 0) {
+            return new Date(Date.now() + Math.round(seconds * 1000)).toISOString();
         }
-        if (auth.state === "invalid") {
-            return withStatusDetails(attemptedErrorResult("Kimi Code", auth.error), authDetails);
+    }
+    const window = data.window;
+    if (window !== null && typeof window === "object") {
+        const w = window;
+        const windowSeconds = getFiniteNumber(w.duration);
+        if (windowSeconds !== undefined && windowSeconds > 0) {
+            return new Date(Date.now() + Math.round(windowSeconds * 1000)).toISOString();
         }
-        const result = await queryKimiQuota({ requestTimeoutMs: ctx.config?.requestTimeoutMs });
-        if (!result) {
-            return withStatusDetails(notAttemptedResult(), [
-                ...authDetails,
-                { key: "live_fetch_error", value: "Kimi API key became unavailable before fetch" },
-            ]);
+    }
+    return undefined;
+}
+function buildLimitLabel(item, detail, window, index) {
+    for (const key of ["name", "title", "scope"]) {
+        const val = nonEmptyString(item[key] ?? detail[key]);
+        if (val)
+            return val;
+    }
+    const duration = getFiniteNumber(window.duration ?? item.duration ?? detail.duration);
+    const timeUnit = String(window.timeUnit ?? item.timeUnit ?? detail.timeUnit ?? "");
+    if (duration !== undefined && duration > 0) {
+        if (timeUnit.includes("MINUTE")) {
+            if (duration >= 60 && duration % 60 === 0) {
+                return `${duration / 60}h limit`;
+            }
+            return `${duration}m limit`;
         }
-        if (!result.success) {
-            return withStatusDetails(attemptedErrorResult("Kimi Code", result.error), [
-                ...authDetails,
-                { key: "live_fetch_error", value: result.error },
-            ]);
+        if (timeUnit.includes("HOUR")) {
+            return `${duration}h limit`;
         }
-        const entries = result.windows.map((window) => ({
-            accounting: {
-                resultType: "quota",
-                acquisitionMethod: "remote_api",
-                ownership: "maintained",
-                authority: "provider_reported",
-            },
-            name: `${result.label} ${window.label}`,
-            group: result.label,
-            label: `${window.label}:`,
-            right: formatUsageRight(window),
-            percentRemaining: window.percentRemaining,
-            resetTimeIso: window.resetTimeIso,
-        }));
-        return withStatusDetails(attemptedResult(entries, [], {
-            singleWindowDisplayName: result.label,
-        }), [
-            ...authDetails,
-            ...result.windows.map((window) => ({
-                key: window.label.toLowerCase().replace(/\s+/g, "_"),
-                value: `used=${window.used}/${window.limit} percent_remaining=${window.percentRemaining} reset_at=${window.resetTimeIso ?? "(none)"}`,
-            })),
-            ...(result.windows.length === 0
-                ? [{ key: "live_state", value: "no reportable Kimi quota" }]
-                : []),
-        ]);
-    },
+        if (timeUnit.includes("DAY")) {
+            return `${duration}d limit`;
+        }
+        return `${duration}s limit`;
+    }
+    return `Limit #${index + 1}`;
+}
+function toUsageWindow(data, defaultLabel) {
+    const limit = getFiniteNumber(data.limit);
+    let used = getFiniteNumber(data.used);
+    if (used === undefined) {
+        const remaining = getFiniteNumber(data.remaining);
+        if (remaining !== undefined && limit !== undefined) {
+            used = limit - remaining;
+        }
+    }
+    if (used === undefined && limit === undefined) {
+        return null;
+    }
+    const safeUsed = used ?? 0;
+    const safeLimit = limit ?? 0;
+    const percentRemaining = safeLimit > 0 ? clampPercent(((safeLimit - safeUsed) / safeLimit) * 100) : 0;
+    return {
+        label: nonEmptyString(data.name ?? data.title) ?? defaultLabel,
+        used: safeUsed,
+        limit: safeLimit,
+        percentRemaining,
+        resetTimeIso: parseResetTimeIso(data),
+    };
+}
+function asObject(value) {
+    return value !== null && typeof value === "object"
+        ? value
+        : undefined;
+}
+const USAGE_LABELS = {
+    limit_5h: "5h limit",
+    limit_month_total: "Monthly total limit",
+    limit_month_code: "Monthly code limit",
 };
+/** The label of a `usages` entry: a known one, or the key's words with "limit" after them. */
+function usageLabel(key) {
+    const known = USAGE_LABELS[key];
+    if (known)
+        return known;
+    const words = key
+        .replace(/^limit_/u, "")
+        .replace(/[_-]+/gu, " ")
+        .trim();
+    return words ? `${words.charAt(0).toUpperCase()}${words.slice(1)} limit` : key;
+}
+/** Match ratios by duration or API key, independently of the displayed limit name. */
+function limitUsageKey(item, detail, window, label) {
+    const duration = getFiniteNumber(window.duration ?? item.duration ?? detail.duration);
+    const timeUnit = String(window.timeUnit ?? item.timeUnit ?? detail.timeUnit ?? "");
+    const secondsPerUnit = timeUnit.includes("MINUTE")
+        ? 60
+        : timeUnit.includes("HOUR")
+            ? 3600
+            : timeUnit.includes("DAY")
+                ? 86400
+                : 1;
+    if (duration !== undefined && duration * secondsPerUnit === 18000) {
+        return "limit_5h";
+    }
+    if (duration === undefined && classifyWindow(label) === "five_hour") {
+        return "limit_5h";
+    }
+    return nonEmptyString(item.key ?? detail.key);
+}
+/**
+ * The weekly `usage` row, one row per `limits` item, then the `usages` ratios the limits do not
+ * already report (each may sit under `data`). `used_ratio` is a fraction, so 0.15 means 15% used.
+ */
+function parseKimiWindows(payload) {
+    const data = asObject(payload.data);
+    const usage = asObject(data?.usage ?? payload.usage);
+    const limits = data?.limits ?? payload.limits;
+    const usages = asObject(data?.usages ?? payload.usages);
+    const windows = [];
+    const reportedKeys = new Set();
+    const usageWindow = usage ? toUsageWindow(usage, "Weekly limit") : null;
+    if (usageWindow)
+        windows.push(usageWindow);
+    if (Array.isArray(limits)) {
+        for (const [index, item] of limits.entries()) {
+            const itemMap = asObject(item);
+            if (!itemMap)
+                continue;
+            const detail = asObject(itemMap.detail) ?? itemMap;
+            const window = asObject(itemMap.window) ?? {};
+            const limitWindow = toUsageWindow(detail, buildLimitLabel(itemMap, detail, window, index));
+            if (!limitWindow)
+                continue;
+            windows.push(limitWindow);
+            const key = limitUsageKey(itemMap, detail, window, limitWindow.label);
+            if (key)
+                reportedKeys.add(key);
+        }
+    }
+    if (usages) {
+        for (const [key, item] of Object.entries(usages)) {
+            const itemMap = asObject(item);
+            if (!itemMap)
+                continue;
+            const label = usageLabel(key);
+            if (reportedKeys.has(key))
+                continue;
+            const usedRatio = getFiniteNumber(itemMap.used_ratio ?? itemMap.usedRatio);
+            if (usedRatio === undefined)
+                continue;
+            windows.push({
+                label,
+                percentRemaining: clampPercent(100 - usedRatio * 100),
+                resetTimeIso: parseResetTimeIso(itemMap),
+            });
+        }
+    }
+    return windows;
+}
+async function queryKimiWindows(spec, apiKey, requestTimeoutMs) {
+    const reply = await requestJson(`${spec.apiBaseUrl}/usages`, {
+        headers: { Authorization: `Bearer ${apiKey}`, "User-Agent": USER_AGENT },
+        secrets: [apiKey],
+        timeoutMs: requestTimeoutMs,
+    });
+    if (!reply.ok) {
+        const { failure } = reply;
+        return {
+            success: false,
+            error: failure.kind === "http"
+                ? `Kimi API error ${failure.status}${errorWords(sanitizeDisplaySnippet(failure.detail, 120))}`
+                : failure.detail,
+            facts: failureFacts(failure),
+        };
+    }
+    try {
+        const payload = reply.json;
+        // Read the keys first: a `null` body must fail with Object.keys' error.
+        const topLevelKeys = Object.keys(payload);
+        const windows = parseKimiWindows(payload);
+        if (windows.length > 0)
+            return { success: true, windows };
+        const keys = topLevelKeys.length ? topLevelKeys.join(", ") : "(empty)";
+        return { success: false, error: `Unexpected response structure (keys: ${keys})` };
+    }
+    catch (err) {
+        return {
+            success: false,
+            error: sanitizeDisplayText(err instanceof Error ? err.message : String(err)),
+        };
+    }
+}
+/** The weekly window keeps the key `weekly`; every other limit is `limit.<its name>`. */
+function kimiRows(windows) {
+    return windows.flatMap((window) => {
+        const name = window.label.replace(/:+$/u, "").trim();
+        const kind = classifyWindow(name);
+        const values = { percentRemaining: window.percentRemaining, resetsAt: window.resetTimeIso };
+        if (kind === "week")
+            return [quotaRow({ key: "weekly", label: name, window: kind, ...values })];
+        const limit = keySlug(name.replace(/\s+limit$/iu, "")) || keySlug(name);
+        return limit ? [quotaRow({ key: `limit.${limit}`, label: name, window: kind, ...values })] : [];
+    });
+}
+async function fetchKimiQuota(spec, ctx) {
+    const keys = await readVendorKeys(spec.auth, ctx.locationDirectory);
+    const authDetails = [
+        ...vendorKeyDetails(spec.auth, keys, ctx.locationDirectory),
+        ...statusDetailsFromRecord({ api_endpoint: spec.endpoint }),
+    ];
+    const query = (apiKey) => queryKimiWindows(spec, apiKey, ctx.config?.requestTimeoutMs);
+    if (!keys.envOrConfig) {
+        const stored = await fetchStoredKeys({
+            providerName: spec.label,
+            keys,
+            brokenFirst: true,
+            async fetchKey(apiKey) {
+                const result = await query(apiKey);
+                return result.success
+                    ? { rows: kimiRows(result.windows), errors: [] }
+                    : { rows: [], errors: [fetchError(result.error, result.facts)] };
+            },
+        });
+        return { ...stored, debug: authDetails };
+    }
+    const result = await query(keys.envOrConfig.key);
+    if (!result.success) {
+        return {
+            attempted: true,
+            accounts: [failedAccount(spec.label, result.error, result.facts)],
+            debug: [...authDetails, { key: "live_fetch_error", value: result.error }],
+        };
+    }
+    return {
+        attempted: true,
+        accounts: [{ name: spec.label, rows: kimiRows(result.windows), errors: [] }],
+        debug: authDetails,
+    };
+}
+function kimiProvider(spec) {
+    return {
+        id: spec.id,
+        cachePolicy: vendorKeysPolicy(spec.id, spec.endpoint),
+        async isAvailable(ctx) {
+            return await isKeyVendorAvailable({
+                ctx,
+                providerId: spec.id,
+                availability: "listed-and-key",
+                readKeys: () => readVendorKeys(spec.auth, ctx.locationDirectory),
+            });
+        },
+        matchesCurrentModel(model) {
+            const [provider = "", modelId] = model.toLowerCase().split("/", 2);
+            return Boolean(modelId) && normalizeQuotaProviderId(provider) === spec.id;
+        },
+        fetch: (ctx) => fetchKimiQuota(spec, ctx),
+    };
+}
+// Each region has its own key; the legacy aliases (`kimi`, `kimi-code`, ...) belong to CN.
+export const kimiCodePlanGlobalProvider = kimiProvider({
+    id: "kimi-code-plan-global",
+    label: "Kimi Code",
+    endpoint: "global",
+    apiBaseUrl: "https://api.kimi.ai/coding/v1",
+    auth: API_KEY_VENDORS["kimi-code-plan-global"],
+});
+export const kimiCodePlanCnProvider = kimiProvider({
+    id: "kimi-code-plan-cn",
+    label: "Kimi Code (CN)",
+    endpoint: "cn",
+    apiBaseUrl: "https://api.kimi.com/coding/v1",
+    auth: API_KEY_VENDORS["kimi-code-plan-cn"],
+});
 //# sourceMappingURL=kimi-code.js.map

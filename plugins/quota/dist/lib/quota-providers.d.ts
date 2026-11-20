@@ -1,11 +1,32 @@
-import type { AccountingResultType } from "./entries.js";
+import type { ProviderRow } from "../providers/contract.js";
 export declare const QUOTA_PROVIDER_REMOTE_FORMATS: readonly ["quota-v1", "openrouter-key-v1", "json-v1"];
 export declare const QUOTA_PROVIDER_MODES: readonly ["remote-api", "local-estimate"];
 export declare const QUOTA_PROVIDER_WINDOW_TYPES: readonly ["utc-day", "rolling"];
 export declare const QUOTA_PROVIDERS_AGGREGATE_ID = "quota-providers";
-export declare const MAINTAINED_LOCAL_ESTIMATE_IDS: readonly ["qwen-code", "alibaba-coding-plan"];
-export declare function isMaintainedQuotaProviderTuning(definition: QuotaProviderDefinition): boolean;
+/**
+ * The built-in of this id reads the official CLI now, so a leftover tuning tunes nothing: it is
+ * ignored rather than left to collide with the built-in, which would void every other definition.
+ */
+export declare function isRetiredEstimateTuning(definition: {
+    id: string;
+    mode: unknown;
+}): boolean;
+/**
+ * The custom definitions that run: not switched off. A switched-off definition is never fetched
+ * and its key is never sent.
+ */
 export declare function customQuotaProviderDefinitions(definitions: readonly QuotaProviderDefinition[]): QuotaProviderDefinition[];
+/**
+ * Where a remote custom provider sends its key, for the user to check before switching it on:
+ * the URL's origin and path (the scheme shows http or https), and where the key comes from.
+ * Never the key itself. `insecure` is true for plain HTTP to any host but localhost, 127.0.0.1
+ * or ::1. Null for a local estimate, which sends nothing.
+ */
+export declare function describeQuotaProviderRequest(definition: QuotaProviderDefinition): {
+    url: string;
+    key: string;
+    insecure: boolean;
+} | null;
 export declare function resolveQuotaProviderSessionModelIdentity(params: {
     currentModel: string;
     currentProviderID?: string;
@@ -13,6 +34,33 @@ export declare function resolveQuotaProviderSessionModelIdentity(params: {
     providerId: string;
     modelId: string;
 } | null;
+/**
+ * The row key a custom source's mapping or entry name gets: spaces become "_", and the name
+ * stays as it is when that leaves only letters, digits, "_" and "-" ("Daily limit" →
+ * "Daily_limit", "Daily-limit" → "Daily-limit"). Other characters are dropped and a short hash
+ * of the exact name is added, so names stay apart ("日次" → 8 hex digits).
+ */
+export declare function customRowKey(name: string): string;
+/** What a custom row means; custom configs may still say `rate_limit` and `spend` (ADR 0001). */
+export type CustomResultType = "quota" | "rate_limit" | "usage" | "spend" | "budget" | "balance" | "status";
+/**
+ * One custom row. `key` is the part of its id after `custom.<definition id>.`; its label is the
+ * configured label without a trailing colon, or else its name; its window is the one its name
+ * or label names ("Daily" → day).
+ */
+export declare function customRow(params: {
+    key: string;
+    name: string;
+    label?: string;
+    resultType: CustomResultType;
+    method: "remote_api" | "local_estimation";
+    value: {
+        percentRemaining: number;
+    } | {
+        text: string;
+    };
+    resetsAt?: string;
+}): ProviderRow;
 export declare function selectEligibleQuotaProviderDefinitions(params: {
     definitions: readonly QuotaProviderDefinition[];
     availableProviderIds: ReadonlySet<string>;
@@ -21,8 +69,8 @@ export declare function selectEligibleQuotaProviderDefinitions(params: {
     currentProviderID?: string;
 }): QuotaProviderDefinition[];
 export type QuotaProviderRemoteFormat = (typeof QUOTA_PROVIDER_REMOTE_FORMATS)[number];
-export type QuotaProviderMode = (typeof QUOTA_PROVIDER_MODES)[number];
-export type QuotaProviderWindowType = (typeof QUOTA_PROVIDER_WINDOW_TYPES)[number];
+type QuotaProviderMode = (typeof QUOTA_PROVIDER_MODES)[number];
+type QuotaProviderWindowType = (typeof QUOTA_PROVIDER_WINDOW_TYPES)[number];
 export type JsonV1Path = string[];
 export type JsonV1NumberSource = {
     path: JsonV1Path;
@@ -72,7 +120,7 @@ export type JsonV1Metric = {
     value: JsonV1TextSource;
 };
 export interface JsonV1Mapping {
-    resultType: AccountingResultType;
+    resultType: CustomResultType;
     name: string;
     label?: string;
     unit?: string;
@@ -94,6 +142,13 @@ interface QuotaProviderDefinitionBase {
     mode: QuotaProviderMode;
     /** Exact OpenCode model ids, without a provider prefix. Omission covers the provider. */
     modelIds?: string[];
+    /** Hard minimum between automatic checks of this definition, in whole milliseconds. */
+    minIntervalMs?: number;
+    /**
+     * `false` switches the definition off: it is never fetched and its key is never sent. Omission
+     * means on. Agents add definitions switched off; only the user switches them on.
+     */
+    enabled?: boolean;
 }
 interface RemoteApiQuotaProviderDefinitionBase extends QuotaProviderDefinitionBase {
     mode: "remote-api";
@@ -127,32 +182,26 @@ export interface LocalEstimateQuotaProviderDefinition extends QuotaProviderDefin
     pricingModelMap?: Record<string, string>;
 }
 export type QuotaProviderDefinition = RemoteApiQuotaProviderDefinition | LocalEstimateQuotaProviderDefinition;
-export interface QuotaProviderValidationIssue {
+interface QuotaProviderValidationIssue {
     key: string;
     message: string;
 }
-export type QuotaProvidersValidationResult = {
+type QuotaProvidersValidationResult = {
     value: QuotaProviderDefinition[];
     issues: [];
 } | {
     value?: undefined;
     issues: QuotaProviderValidationIssue[];
 };
-export declare const JSON_V1_MAX_MAPPINGS = 16;
-export declare const JSON_V1_MAX_ADAPTER_DEPTH = 8;
-export declare const JSON_V1_MAX_ADAPTER_OBJECTS = 128;
-export declare const JSON_V1_MAX_ADAPTER_PROPERTIES = 384;
-export declare const JSON_V1_MAX_ADAPTER_ARRAY_ELEMENTS = 640;
-export declare const JSON_V1_MAX_PATH_SEGMENTS = 8;
-export declare const JSON_V1_MAX_PATH_SEGMENT_CODE_POINTS = 64;
-export declare const JSON_V1_MAX_STATIC_NAME_CODE_POINTS = 80;
-export declare const JSON_V1_MAX_STATIC_UNIT_CODE_POINTS = 32;
+/** Every top-level field a definition can have, in either mode. */
+export declare const QUOTA_PROVIDER_FIELDS: readonly string[];
 export declare const JSON_V1_MAX_DISPLAY_CODE_POINTS = 160;
+/** Most items a reply's list may hold; each becomes its own row. */
+export declare const JSON_V1_MAX_ITEMS = 100;
 export declare const JSON_V1_MAX_NUMBER_MAGNITUDE = 1000000000000000;
+export declare const CUSTOM_RESULT_TYPES: ReadonlySet<string>;
 export declare function normalizeJsonV1Timestamp(value: unknown, encoding: JsonV1TimestampEncoding): string | null;
 /** Validate and normalize the complete global-only quotaProviders array atomically. */
 export declare function validateQuotaProviders(value: unknown): QuotaProvidersValidationResult;
 export declare function cloneQuotaProviders(definitions: readonly QuotaProviderDefinition[]): QuotaProviderDefinition[];
-export declare function findQuotaProviderDefinition(definitions: readonly QuotaProviderDefinition[], id: string): QuotaProviderDefinition | undefined;
 export {};
-//# sourceMappingURL=quota-providers.d.ts.map

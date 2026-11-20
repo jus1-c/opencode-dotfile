@@ -6,4 +6,3 @@
  */
 import type { QuotaProvider } from "../lib/entries.js";
 export declare const copilotProvider: QuotaProvider;
-//# sourceMappingURL=copilot.d.ts.map

@@ -1,0 +1,6 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "skills": [
+    "{env:HOME}/.config/opencode/plugins/ctf-skills/skills"
+  ]
+}

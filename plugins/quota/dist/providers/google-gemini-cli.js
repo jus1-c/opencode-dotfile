@@ -1,99 +1,57 @@
-import { sanitizeDisplayText } from "../lib/display-sanitize.js";
-import { hasGeminiCliQuotaRuntimeAvailable, inspectGeminiCliAuthPresence, queryGeminiCliQuota, } from "../lib/google-gemini-cli.js";
-import { inspectGeminiCliCompanionPresence } from "../lib/google-gemini-cli-companion.js";
+import { classifyWindow } from "../core/windows.js";
+import { GEMINI_CLI_FLAVOR } from "../lib/google-gemini-cli.js";
 import { parseProviderModelRef } from "../lib/provider-model-matching.js";
-import { createGoogleAccountLabelMap, formatGoogleAccountErrors, formatGoogleAccountLabel, } from "./google-account-format.js";
-import { attemptedErrorResult, attemptedResult, notAttemptedResult, statusDetailsFromRecord, withStatusDetails, } from "./result-helpers.js";
+import { keySlug, quotaRow } from "./contract.js";
+import { fetchGoogleProviderQuota, googleCachePolicy, isGoogleProviderAvailable, remainingCount, } from "./google-oauth-provider.js";
 function isGeminiCliModel(model) {
     const { providerId, modelId } = parseProviderModelRef(model);
     if (["google-gemini-cli", "gemini-cli", "gemini", "opencode-gemini-auth"].includes(providerId)) {
         return true;
     }
-    return providerId === "google" && modelId.includes("gemini");
+    return (providerId === "google" && !modelId.startsWith("antigravity-") && modelId.includes("gemini"));
 }
-async function isGeminiCliConfigured(ctx) {
-    try {
-        return await hasGeminiCliQuotaRuntimeAvailable(ctx.client);
-    }
-    catch {
-        return false;
-    }
+const GEMINI_TIER_KEYS = {
+    "Gemini Pro": "pro",
+    "Gemini Flash": "flash",
+    "Gemini Flash Lite": "flash_lite",
+};
+/** Gemini's token types as count units; a type it does not name counts plain units. */
+const GEMINI_TOKEN_UNITS = {
+    REQUESTS: "request",
+    TOKENS: "token",
+};
+/**
+ * The quality tiers keep fixed keys; other models are keyed `model.<name>`. The row has the
+ * remaining count when Gemini gives one.
+ */
+function geminiCliRow(bucket) {
+    const model = bucket.displayName.replace(/:+$/u, "").trim();
+    if (!model)
+        return undefined;
+    const short = model.replace(/^Gemini\s+/u, "") || model;
+    const unit = GEMINI_TOKEN_UNITS[bucket.tokenType?.trim().toUpperCase() ?? ""] ?? "unit";
+    const remaining = remainingCount(bucket.remainingAmount, unit);
+    return {
+        ...quotaRow({
+            key: GEMINI_TIER_KEYS[model] ?? `model.${keySlug(short)}`,
+            label: short,
+            window: classifyWindow(model),
+            percentRemaining: bucket.percentRemaining,
+            resetsAt: bucket.resetTimeIso,
+        }),
+        ...(remaining ? { remaining } : {}),
+    };
 }
+const GEMINI_CLI_PROVIDER = {
+    quota: GEMINI_CLI_FLAVOR,
+    failedLoginError: (resolveError) => `Gemini CLI sign-in could not be refreshed: ${resolveError}. Run \`opencode auth login google\`.`,
+    row: geminiCliRow,
+};
 export const googleGeminiCliProvider = {
     id: "google-gemini-cli",
-    async isAvailable(ctx) {
-        return await isGeminiCliConfigured(ctx);
-    },
-    matchesCurrentModel(model) {
-        return isGeminiCliModel(model);
-    },
-    async fetch(ctx) {
-        const [auth, companion] = await Promise.all([
-            inspectGeminiCliAuthPresence(ctx.client),
-            inspectGeminiCliCompanionPresence(),
-        ]);
-        const statusDetails = statusDetailsFromRecord({
-            auth_state: auth.state,
-            auth_source: auth.sourceKey ?? "(none)",
-            account_count: String(auth.accountCount),
-            valid_account_count: String(auth.validAccountCount),
-            companion_package_state: companion.state,
-            companion_package_path: companion.state === "present" || companion.state === "invalid"
-                ? (companion.resolvedPath ?? "(none)")
-                : "(none)",
-            auth_error: auth.state === "invalid" ? sanitizeDisplayText(auth.error) : undefined,
-            companion_error: companion.state !== "present" ? sanitizeDisplayText(companion.error) : undefined,
-        });
-        const result = await queryGeminiCliQuota(ctx.client, {
-            requestTimeoutMs: ctx.config?.requestTimeoutMsConfigured
-                ? ctx.config.requestTimeoutMs
-                : undefined,
-        });
-        if (!result) {
-            return withStatusDetails(notAttemptedResult(), statusDetails);
-        }
-        if (!result.success) {
-            return withStatusDetails(attemptedErrorResult("Gemini CLI", result.error), statusDetails);
-        }
-        const accountLabels = createGoogleAccountLabelMap([
-            ...result.buckets.map((bucket) => bucket.accountEmail),
-            ...(result.errors ?? []).map((error) => error.email),
-        ], "domainHint");
-        const entries = result.buckets.map((bucket) => {
-            const emailLabel = bucket.accountEmail
-                ? (accountLabels.get(bucket.accountEmail) ??
-                    formatGoogleAccountLabel(bucket.accountEmail, "domainHint"))
-                : formatGoogleAccountLabel(undefined, "domainHint");
-            const parsedRemaining = bucket.remainingAmount
-                ? Number.parseInt(bucket.remainingAmount, 10)
-                : Number.NaN;
-            const remainingAmount = bucket.remainingAmount
-                ? `${Number.isFinite(parsedRemaining) ? parsedRemaining.toLocaleString("en-US") : bucket.remainingAmount} left`
-                : undefined;
-            const tokenType = bucket.tokenType?.trim().toUpperCase();
-            const right = [remainingAmount, tokenType && tokenType !== "REQUESTS" ? tokenType : undefined]
-                .filter(Boolean)
-                .join(" ");
-            return {
-                accounting: {
-                    resultType: "quota",
-                    acquisitionMethod: "remote_api",
-                    ownership: "maintained",
-                    authority: "provider_reported",
-                    ...(bucket.accountEmail ? { sourceId: bucket.accountEmail } : {}),
-                },
-                name: `${bucket.displayName} (${emailLabel})`,
-                group: `Gemini CLI (${emailLabel})`,
-                label: `${bucket.displayName}:`,
-                ...(right ? { right } : {}),
-                percentRemaining: bucket.percentRemaining,
-                resetTimeIso: bucket.resetTimeIso,
-            };
-        });
-        return withStatusDetails(attemptedResult(entries, formatGoogleAccountErrors(result.errors, "domainHint", accountLabels), {
-            singleWindowDisplayName: "Gemini CLI",
-            singleWindowShowRight: true,
-        }), statusDetails);
-    },
+    cachePolicy: googleCachePolicy(GEMINI_CLI_PROVIDER),
+    isAvailable: (ctx) => isGoogleProviderAvailable(GEMINI_CLI_PROVIDER, ctx),
+    matchesCurrentModel: isGeminiCliModel,
+    fetch: (ctx) => fetchGoogleProviderQuota(GEMINI_CLI_PROVIDER, ctx),
 };
 //# sourceMappingURL=google-gemini-cli.js.map

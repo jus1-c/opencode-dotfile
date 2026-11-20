@@ -38,4 +38,6 @@ if ! is_running; then
 fi
 
 export GHIDRA_MCP_URL="http://127.0.0.1:8089"
+# 16 GB heap: 14 MB native targets (EliteOne.dll) OOM at the 4 GB default
+export JAVA_OPTS="${JAVA_OPTS:--Xmx22g -XX:+UseG1GC}"
 exec "${COMPONENT_DIR}/runtime/.venv/bin/bridge-mcp-ghidra" "$@"

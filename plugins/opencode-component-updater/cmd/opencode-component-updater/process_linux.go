@@ -3,6 +3,9 @@
 package main
 
 import (
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -37,9 +40,22 @@ func listOpenCodeProcesses() ([]openCodeProcess, error) {
 	return processes, nil
 }
 
-func processExists(pid int) bool {
-	_, err := os.Stat(filepath.Join("/proc", strconv.Itoa(pid)))
-	return err == nil
+func processExists(pid int) (bool, error) {
+	procInfo, err := os.Stat("/proc")
+	if err != nil {
+		return false, fmt.Errorf("cannot inspect /proc: %w", err)
+	}
+	if !procInfo.IsDir() {
+		return false, errors.New("/proc is not a directory")
+	}
+	_, err = os.Stat(filepath.Join("/proc", strconv.Itoa(pid)))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func processIsZombie(pid int) bool {

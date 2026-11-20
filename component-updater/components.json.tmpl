@@ -4,9 +4,30 @@
     "checkIntervalHours": 24,
     "checkTimeoutMs": 60000,
     "updateTimeoutMs": 1800000,
-    "maxOutputBytes": 65536
+    "maxOutputBytes": 65536,
+    "checkConcurrency": 16,
+    "stageConcurrency": 8,
+    "archiveConcurrency": 4
   },
   "components": {
+    "mcp.agent-browser": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "agent-browser",
+      "target": "__HOME__/.config/opencode/mcps/agent-browser",
+      "enabled": true,
+      "source": {
+        "type": "npm",
+        "name": "agent-browser",
+        "path": "runtime"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
     "mcp.anysearch": {
       "scope": "global",
       "kind": "mcp",
@@ -15,22 +36,6 @@
       "source": {},
       "policy": {
         "apply": "manual",
-        "dirty": "refuse"
-      },
-      "check": {},
-      "update": {}
-    },
-    "mcp.cloakbrowser": {
-      "scope": "global",
-      "kind": "mcp",
-      "name": "cloakbrowser",
-      "target": "__HOME__/.config/opencode/mcps/cloakbrowser",
-      "enabled": true,
-      "source": {
-        "type": "script"
-      },
-      "policy": {
-        "apply": "manifest",
         "dirty": "refuse"
       },
       "check": {},
@@ -113,6 +118,19 @@
       "check": {},
       "update": {}
     },
+    "mcp.github": {
+      "scope": "global",
+      "kind": "mcp",
+      "name": "github",
+      "enabled": false,
+      "source": {},
+      "policy": {
+        "apply": "manual",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
     "mcp.ghidra-mcp": {
       "scope": "global",
       "kind": "mcp",
@@ -124,34 +142,6 @@
       },
       "policy": {
         "apply": "manifest",
-        "dirty": "refuse"
-      },
-      "check": {},
-      "update": {}
-    },
-    "mcp.headroom-ctl": {
-      "scope": "global",
-      "kind": "mcp",
-      "name": "headroom-ctl",
-      "target": "__HOME__/.config/opencode/mcps/headroom-ctl",
-      "enabled": false,
-      "source": {},
-      "policy": {
-        "apply": "manual",
-        "dirty": "refuse"
-      },
-      "check": {},
-      "update": {}
-    },
-    "mcp.headroom-memory": {
-      "scope": "global",
-      "kind": "mcp",
-      "name": "headroom-memory",
-      "target": null,
-      "enabled": false,
-      "source": {},
-      "policy": {
-        "apply": "manual",
         "dirty": "refuse"
       },
       "check": {},
@@ -253,6 +243,40 @@
       "check": {},
       "update": {}
     },
+    "plugin.ctf-skills": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "ctf-skills",
+      "target": "__HOME__/.config/opencode/plugins/ctf-skills",
+      "enabled": true,
+      "source": {
+        "mode": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse",
+        "allowedPaths": [
+          "skills",
+          ".component-updater-provenance.json"
+        ]
+      },
+      "check": {
+        "command": [
+          "__HOME__/.config/opencode/plugins/ctf-skills/component-updater",
+          "check"
+        ]
+      },
+      "update": {
+        "command": [
+          "__HOME__/.config/opencode/plugins/ctf-skills/component-updater",
+          "update"
+        ],
+        "healthcheck": [
+          "__HOME__/.config/opencode/plugins/ctf-skills/component-updater",
+          "healthcheck"
+        ]
+      }
+    },
     "plugin.goal": {
       "scope": "global",
       "kind": "plugin",
@@ -265,56 +289,6 @@
       },
       "policy": {
         "apply": "manifest",
-        "dirty": "refuse"
-      },
-      "check": {},
-      "update": {}
-    },
-    "plugin.headroom": {
-      "scope": "global",
-      "kind": "plugin",
-      "name": "headroom",
-      "target": "__HOME__/.config/opencode/plugins/headroom",
-      "enabled": true,
-      "source": {
-        "mode": "script"
-      },
-      "policy": {
-        "apply": "manifest",
-        "dirty": "refuse",
-        "allowedPaths": [
-          "dist",
-          "hook-shim",
-          "VERSION",
-          "component-updater"
-        ]
-      },
-      "check": {
-        "command": [
-          "__HOME__/.config/opencode/plugins/headroom/component-updater",
-          "check"
-        ]
-      },
-      "update": {
-        "command": [
-          "__HOME__/.config/opencode/plugins/headroom/component-updater",
-          "update"
-        ],
-        "healthcheck": [
-          "__HOME__/.config/opencode/plugins/headroom/component-updater",
-          "healthcheck"
-        ]
-      }
-    },
-    "plugin.headroom-ctl": {
-      "scope": "global",
-      "kind": "plugin",
-      "name": "headroom-ctl",
-      "target": "__HOME__/.config/opencode/plugins/headroom-ctl",
-      "enabled": false,
-      "source": {},
-      "policy": {
-        "apply": "manual",
         "dirty": "refuse"
       },
       "check": {},
@@ -365,15 +339,31 @@
       "check": {},
       "update": {}
     },
-    "plugin.opencode-md-table-formatter": {
+    "plugin.opencode-mcp-manager": {
       "scope": "global",
       "kind": "plugin",
-      "name": "opencode-md-table-formatter",
-      "target": "__HOME__/.config/opencode/plugins/opencode-md-table-formatter",
+      "name": "opencode-mcp-manager",
+      "target": "__HOME__/.config/opencode/plugins/opencode-mcp-manager",
+      "enabled": true,
+      "source": {
+        "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "plugin.opencode-mini-session": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "opencode-mini-session",
+      "target": "__HOME__/.config/opencode/plugins/opencode-mini-session",
       "enabled": true,
       "source": {
         "type": "npm",
-        "name": "@franlol/opencode-md-table-formatter"
+        "name": "opencode-mini-session"
       },
       "policy": {
         "apply": "manifest",
@@ -423,6 +413,25 @@
       "enabled": true,
       "source": {
         "type": "script"
+      },
+      "policy": {
+        "apply": "manifest",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "plugin.reverse-skill": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "reverse-skill",
+      "target": "__HOME__/.config/opencode/plugins/reverse-skill",
+      "enabled": true,
+      "source": {
+        "type": "git",
+        "url": "https://github.com/zhaoxuya520/reverse-skill.git",
+        "path": "repo",
+        "track": "release"
       },
       "policy": {
         "apply": "manifest",
@@ -505,6 +514,20 @@
       "name": "vilao-provider",
       "target": "__HOME__/.config/opencode/plugins/vilao-provider",
       "enabled": false,
+      "source": {},
+      "policy": {
+        "apply": "manual",
+        "dirty": "refuse"
+      },
+      "check": {},
+      "update": {}
+    },
+    "plugin.prompt-attachment-guard": {
+      "scope": "global",
+      "kind": "plugin",
+      "name": "prompt-attachment-guard",
+      "target": "__HOME__/.config/opencode/plugins/prompt-attachment-guard",
+      "enabled": true,
       "source": {},
       "policy": {
         "apply": "manual",

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -118,6 +119,12 @@ func upgradeAll(ctx context.Context, value paths, bestEffort bool, report report
 		return err
 	}
 	staged, stageFailures := stageAll(ctx, value, summary.Config, plan, bestEffort, report)
+	if err := ctx.Err(); err != nil {
+		// Cancellation aborts the remaining stages; report it as cancellation so
+		// the CLI exits as interrupted instead of claiming a partial upgrade.
+		cleanupStages(staged)
+		return err
+	}
 	if len(stageFailures) > 0 && !bestEffort {
 		cleanupStages(staged)
 		return &preflightError{Failures: stageFailures}
@@ -188,7 +195,7 @@ func buildUpgradePlan(ctx context.Context, value paths, summary checkSummary, be
 }
 
 func eligibleForUpgrade(item component) bool {
-	return item.Enabled && item.Target != nil && item.Policy.Apply == "manifest" && len(item.Update.Command) > 0
+	return item.Enabled && item.Target != nil && item.Policy.Apply == "manifest" && (item.Source.Type != "" || len(item.Update.Command) > 0)
 }
 
 func chooseCheckResult(ctx context.Context, value paths, id string, item component, summary checkSummary) (checkResult, string, bool) {
@@ -216,6 +223,9 @@ func validCachedResult(ctx context.Context, value paths, item component, cached 
 	source, err := detectSource(ctx, item, value)
 	if err != nil || source.Dirty && item.Policy.Dirty != "allow" {
 		return false
+	}
+	if source.Type == "script" {
+		return sourceFingerprint(source) == cached.SourceFingerprint
 	}
 	if sourceFingerprint(source) != cached.SourceFingerprint || source.Current == "" || source.Current != cached.Current {
 		return false
@@ -250,27 +260,46 @@ func saveUpgradePlan(value paths, plan upgradePlan) error {
 func stageAll(ctx context.Context, value paths, settings config, plan upgradePlan, bestEffort bool, report reporter) ([]plannedComponent, []string) {
 	staged := []plannedComponent{}
 	failures := []string{}
+	total := len(plan.Components)
+	safe := newSafeReporter(report, total)
+	outcomes := make([]plannedComponent, total)
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	indices := make([]int, 0, total)
 	for index, componentPlan := range plan.Components {
-		if err := ctx.Err(); err != nil {
-			failures = append(failures, err.Error())
-			break
-		}
-		if report != nil {
-			report(progress{Phase: "stage", Component: componentPlan.ID, Detail: "staging", Current: index, Total: len(plan.Components)})
-		}
+		safe.emit(progress{Phase: "stage", Component: componentPlan.ID, Detail: "staging"})
+		indices = append(indices, index)
+	}
+	stage := func(worker context.Context, index int) error {
+		componentPlan := plan.Components[index]
 		item := settings.Components[componentPlan.ID]
-		stagedPlan, err := stageComponent(ctx, value, settings.Defaults, item, componentPlan)
+		stagedPlan, err := stageComponent(worker, value, settings.Defaults, item, componentPlan)
 		if err != nil {
-			failures = append(failures, componentPlan.ID+": "+sanitizeSummary(err.Error()))
 			if !bestEffort {
-				break
+				cancel()
 			}
+			return err
+		}
+		outcomes[index] = stagedPlan
+		safe.done(progress{Phase: "stage", Component: componentPlan.ID, Detail: "ready"})
+		return nil
+	}
+	errs := runBounded(workerCtx, settings.Defaults.StageConcurrency, indices, func(worker context.Context, _ int, index int) error {
+		return stage(worker, index)
+	})
+
+	for index, componentPlan := range plan.Components {
+		if err := errs[index]; err != nil {
+			// Failures caused only by aborting the remaining stages would hide
+			// the real failure.
+			if !bestEffort && len(failures) > 0 && errors.Is(err, context.Canceled) {
+				continue
+			}
+			failures = append(failures, componentPlan.ID+": "+sanitizeSummary(err.Error()))
 			continue
 		}
-		staged = append(staged, stagedPlan)
-		if report != nil {
-			report(progress{Phase: "stage", Component: componentPlan.ID, Detail: "ready", Current: index + 1, Total: len(plan.Components)})
-		}
+		staged = append(staged, outcomes[index])
 	}
 	if len(failures) > 0 && !bestEffort {
 		cleanupStages(staged)
@@ -300,7 +329,17 @@ func stageComponent(ctx context.Context, value paths, settings defaults, item co
 	}
 	manifestPath := filepath.Join(stage, ".opencode-component-updater-manifest.json")
 	environment := stageEnvironment(componentPlan, stage, manifestPath, planPath)
-	output := runCommand(ctx, item.Update.Command, stage, environment, settings.UpdateTimeoutMS, settings.MaxOutputBytes)
+	var output commandOutput
+	if item.Source.Type == "script" {
+		output = runCommand(ctx, []string{componentScript(componentPlan.Target), "update"}, componentPlan.Target, environment, settings.UpdateTimeoutMS, settings.MaxOutputBytes)
+	} else if item.Source.Type != "" {
+		if err := stageBuiltInSource(ctx, item, componentPlan, stage, manifestPath, settings); err != nil {
+			return plannedComponent{}, err
+		}
+		output = commandOutput{}
+	} else {
+		output = runCommand(ctx, item.Update.Command, stage, environment, settings.UpdateTimeoutMS, settings.MaxOutputBytes)
+	}
 	if output.Code != 0 || output.Reason != "" {
 		detail := firstOutputLine(output)
 		if detail == "" {
@@ -312,8 +351,14 @@ func stageComponent(ctx context.Context, value paths, settings defaults, item co
 	if err != nil {
 		return plannedComponent{}, err
 	}
-	if len(item.Update.Healthcheck) > 0 {
-		output := runCommand(ctx, item.Update.Healthcheck, stage, environment, settings.UpdateTimeoutMS, settings.MaxOutputBytes)
+	if item.Source.Type == "script" || len(item.Update.Healthcheck) > 0 {
+		command := item.Update.Healthcheck
+		cwd := stage
+		if item.Source.Type == "script" {
+			command = []string{componentScript(componentPlan.Target), "healthcheck"}
+			cwd = componentPlan.Target
+		}
+		output := runCommand(ctx, command, cwd, environment, settings.UpdateTimeoutMS, settings.MaxOutputBytes)
 		if output.Code != 0 || output.Reason != "" {
 			detail := firstOutputLine(output)
 			if detail == "" {
@@ -322,6 +367,10 @@ func stageComponent(ctx context.Context, value paths, settings defaults, item co
 			return plannedComponent{}, fmt.Errorf("stage healthcheck failed: %s", detail)
 		}
 	}
+	manifest, err = validateManifest(item, componentPlan, stage)
+	if err != nil {
+		return plannedComponent{}, fmt.Errorf("post-healthcheck manifest validation: %w", err)
+	}
 	componentPlan.Manifest = manifest
 	cleanup = false
 	return componentPlan, nil
@@ -329,19 +378,18 @@ func stageComponent(ctx context.Context, value paths, settings defaults, item co
 
 func stageEnvironment(componentPlan plannedComponent, stage, manifestPath, planPath string) map[string]string {
 	environment := map[string]string{
-		"OPENCODE_UPDATER_COMPONENT_ID": componentPlan.ID,
-		"OPENCODE_UPDATER_TARGET":       componentPlan.Target,
-		"OPENCODE_UPDATER_STAGE":        stage,
-		"OPENCODE_UPDATER_MANIFEST":     manifestPath,
-		"OPENCODE_UPDATER_PLAN":         planPath,
-		"OPENCODE_UPDATER_PLAN_SHA256":  componentPlan.PlanSHA256,
-		"OPENCODE_UPDATER_CURRENT":      componentPlan.Current,
-		"OPENCODE_UPDATER_LATEST":       componentPlan.Latest,
-		"OPENCODE_UPDATER_PLAN_SOURCE":  componentPlan.ResultSource,
-		"OPENCODE_UPDATER_SOURCE_URL":   componentPlan.Source.URL,
-		"OPENCODE_UPDATER_SOURCE_TYPE":  componentPlan.Source.Type,
-		"OPENCODE_UPDATER_SOURCE_NAME":  componentPlan.Source.Name,
-		// Provenance only; registry components are pinned by artifact, not by commit.
+		"OPENCODE_UPDATER_COMPONENT_ID":  componentPlan.ID,
+		"OPENCODE_UPDATER_TARGET":        componentPlan.Target,
+		"OPENCODE_UPDATER_STAGE":         stage,
+		"OPENCODE_UPDATER_MANIFEST":      manifestPath,
+		"OPENCODE_UPDATER_PLAN":          planPath,
+		"OPENCODE_UPDATER_PLAN_SHA256":   componentPlan.PlanSHA256,
+		"OPENCODE_UPDATER_CURRENT":       componentPlan.Current,
+		"OPENCODE_UPDATER_LATEST":        componentPlan.Latest,
+		"OPENCODE_UPDATER_PLAN_SOURCE":   componentPlan.ResultSource,
+		"OPENCODE_UPDATER_SOURCE_TYPE":   componentPlan.Source.Type,
+		"OPENCODE_UPDATER_SOURCE_URL":    componentPlan.Source.URL,
+		"OPENCODE_UPDATER_SOURCE_NAME":   componentPlan.Source.Name,
 		"OPENCODE_UPDATER_SOURCE_COMMIT": componentPlan.SourceCommit,
 	}
 	if componentPlan.Artifact != nil {

@@ -2,112 +2,85 @@ import { existsSync } from "fs";
 import { readFile } from "fs/promises";
 import { homedir, platform } from "os";
 import { join } from "path";
-import { CURSOR_LEGACY_PROVIDER_ID } from "./cursor-pricing.js";
-import { parseJsonOrJsonc } from "./jsonc.js";
-import { getAuthPaths } from "./opencode-auth.js";
-import { getOpencodeRuntimeDirCandidates } from "./opencode-runtime-paths.js";
+import { getPluginSpecFromEntry } from "./config-file-utils.js";
+import { asRecord, isRecord } from "./json-guards.js";
+import { getCredentialDatabasePaths, readCredentialRows } from "./opencode-auth.js";
+import { existingOpenCodeConfigFiles, readOpenCodeConfigs } from "./opencode-config-files.js";
 import { getQuotaProviderRuntimeIds } from "./provider-metadata.js";
-export const CURSOR_CANONICAL_PLUGIN_PACKAGE = "@playwo/opencode-cursor-oauth";
-const CURSOR_LEGACY_PLUGIN_PACKAGES = ["opencode-cursor", "opencode-cursor-oauth"];
-const CURSOR_COMPAT_PLUGIN_PACKAGES = new Set([
-    CURSOR_CANONICAL_PLUGIN_PACKAGE,
-    ...CURSOR_LEGACY_PLUGIN_PACKAGES,
-    CURSOR_LEGACY_PROVIDER_ID,
-    "open-cursor",
-    "@rama_nigg/open-cursor",
-]);
-const CURSOR_COMPAT_PLUGIN_SUFFIXES = [
-    `/${CURSOR_CANONICAL_PLUGIN_PACKAGE}`,
-    ...CURSOR_LEGACY_PLUGIN_PACKAGES.map((pkg) => `/${pkg}`),
-    "/open-cursor",
-];
+export const CURSOR_CANONICAL_PLUGIN_PACKAGE = "cursor-opencode-provider";
+/**
+ * `cursor-opencode-provider` specs: the bare package (OpenCode 2 resolves its `./server`
+ * export), its OpenCode 2 entry `/plugin/opencode2`, or `/server`, each optionally
+ * version-pinned on the package or the entry, e.g. `cursor-opencode-provider@0.7.3/plugin/opencode2`.
+ */
+const CURSOR_PLUGIN_SPEC_PATTERN = /^cursor-opencode-provider(@[^/]+)?(\/plugin\/opencode2|\/server)?(@[^/]+)?$/;
+const CURSOR_API_KEY_ENV = "CURSOR_API_KEY";
 function dedupe(list) {
     return [...new Set(list.filter(Boolean))];
 }
-function asRecord(value) {
-    return value && typeof value === "object" ? value : null;
-}
-function getCursorHomeDir() {
-    return process.env.CURSOR_ACP_HOME_DIR?.trim() || homedir();
-}
-export function getCursorAuthCandidatePaths() {
-    const home = getCursorHomeDir();
-    const authFiles = ["cli-config.json", "auth.json"];
-    const paths = [];
+function getCursorAuthCandidatePaths() {
+    const home = process.env.CURSOR_ACP_HOME_DIR?.trim() || homedir();
+    const dirs = [];
     if (platform() === "darwin") {
-        for (const file of authFiles)
-            paths.push(join(home, ".cursor", file));
-        for (const file of authFiles)
-            paths.push(join(home, ".config", "cursor", file));
+        dirs.push(join(home, ".cursor"), join(home, ".config", "cursor"));
     }
     else {
-        for (const file of authFiles)
-            paths.push(join(home, ".config", "cursor", file));
+        dirs.push(join(home, ".config", "cursor"));
         const xdgConfigHome = process.env.XDG_CONFIG_HOME?.trim();
         if (xdgConfigHome && xdgConfigHome !== join(home, ".config")) {
-            for (const file of authFiles)
-                paths.push(join(xdgConfigHome, "cursor", file));
+            dirs.push(join(xdgConfigHome, "cursor"));
         }
-        for (const file of authFiles)
-            paths.push(join(home, ".cursor", file));
+        dirs.push(join(home, ".cursor"));
     }
-    return dedupe(paths);
+    return dedupe(dirs.flatMap((dir) => [join(dir, "cli-config.json"), join(dir, "auth.json")]));
 }
 function hasNonEmptyString(value) {
     return typeof value === "string" && value.trim().length > 0;
 }
-function isValidCursorOAuthEntry(value) {
-    if (!value || typeof value !== "object")
+/** OpenCode 2 stores Cursor OAuth tokens as `oauth`, and an API key `key` credential that our reader maps to `api`. */
+function isValidCursorCredential(value) {
+    if (!isRecord(value))
         return false;
-    const entry = value;
-    return (entry.type === "oauth" && (hasNonEmptyString(entry.refresh) || hasNonEmptyString(entry.access)));
+    if (value.type === "oauth") {
+        return hasNonEmptyString(value.refresh) || hasNonEmptyString(value.access);
+    }
+    return value.type === "api" && hasNonEmptyString(value.key);
 }
 export async function inspectCursorAuthPresence() {
-    const authCandidatePaths = getAuthPaths();
+    const credentialDatabasePaths = getCredentialDatabasePaths();
     const legacyCandidatePaths = getCursorAuthCandidatePaths();
-    const candidatePaths = dedupe([...authCandidatePaths, ...legacyCandidatePaths]);
+    const candidatePaths = dedupe([...credentialDatabasePaths, ...legacyCandidatePaths]);
     const presentPaths = candidatePaths.filter((path) => existsSync(path));
+    const credentialDatabasePath = credentialDatabasePaths.find((path) => existsSync(path));
+    const present = (selectedPath) => ({
+        state: "present",
+        selectedPath,
+        presentPaths,
+        candidatePaths,
+    });
     let invalidPath;
     let invalidError;
-    for (const path of authCandidatePaths) {
-        if (!existsSync(path))
-            continue;
-        try {
-            const raw = await readFile(path, "utf8");
-            const parsed = JSON.parse(raw);
-            const cursorAuth = parsed?.cursor;
-            if (!cursorAuth)
-                continue;
-            if (isValidCursorOAuthEntry(cursorAuth)) {
-                return {
-                    state: "present",
-                    selectedPath: path,
-                    presentPaths,
-                    candidatePaths,
-                };
-            }
-            invalidPath ??= path;
-            invalidError ??= "Cursor auth entry in auth.json is missing a valid oauth token payload";
+    const [cursorLogin] = await readCredentialRows(["cursor"], { firstOnly: true });
+    if (cursorLogin) {
+        if (cursorLogin.resolveError === undefined && isValidCursorCredential(cursorLogin.value)) {
+            return present(credentialDatabasePath);
         }
-        catch (error) {
-            invalidPath ??= path;
-            invalidError ??= error instanceof Error ? error.message : String(error);
-        }
+        invalidPath = credentialDatabasePath;
+        invalidError =
+            cursorLogin.resolveError !== undefined
+                ? `OpenCode could not read this login: ${cursorLogin.resolveError}`
+                : "Cursor credential in the OpenCode database is missing a valid OAuth token or API key";
+    }
+    if (hasNonEmptyString(process.env[CURSOR_API_KEY_ENV])) {
+        return present(`env:${CURSOR_API_KEY_ENV}`);
     }
     for (const path of legacyCandidatePaths) {
         if (!existsSync(path))
             continue;
         try {
-            const raw = await readFile(path, "utf8");
-            const parsed = JSON.parse(raw);
-            if (parsed && typeof parsed === "object") {
-                return {
-                    state: "present",
-                    selectedPath: path,
-                    presentPaths,
-                    candidatePaths,
-                };
-            }
+            const parsed = JSON.parse(await readFile(path, "utf8"));
+            if (parsed && typeof parsed === "object")
+                return present(path);
         }
         catch (error) {
             invalidPath ??= path;
@@ -123,64 +96,40 @@ export async function inspectCursorAuthPresence() {
             error: invalidError,
         };
     }
+    return { state: "missing", presentPaths, candidatePaths };
+}
+/** OpenCode 2 reads both the legacy `plugin`/`provider` keys and the native `plugins`/`providers` keys. */
+function inspectOpenCodeConfig(parsed) {
+    const pluginSpecs = [
+        ...(Array.isArray(parsed.plugin) ? parsed.plugin : []),
+        ...(Array.isArray(parsed.plugins) ? parsed.plugins.map(getPluginSpecFromEntry) : []),
+    ];
+    const cursorRuntimeIds = getQuotaProviderRuntimeIds("cursor");
     return {
-        state: "missing",
-        presentPaths,
-        candidatePaths,
+        matchedPlugin: pluginSpecs.some((spec) => typeof spec === "string" && CURSOR_PLUGIN_SPEC_PATTERN.test(spec.trim().toLowerCase())),
+        matchedProvider: [parsed.provider, parsed.providers].some((value) => {
+            const providers = asRecord(value);
+            return providers !== null && cursorRuntimeIds.some((id) => Object.hasOwn(providers, id));
+        }),
     };
 }
-function pluginIncludesCursor(value) {
-    if (typeof value !== "string")
-        return false;
-    const normalized = value.trim().toLowerCase();
-    return (CURSOR_COMPAT_PLUGIN_PACKAGES.has(normalized) ||
-        CURSOR_COMPAT_PLUGIN_SUFFIXES.some((suffix) => normalized.endsWith(suffix)));
-}
-function providerConfigIncludesCursor(value) {
-    const providerConfig = asRecord(value);
-    if (!providerConfig)
-        return false;
-    return getQuotaProviderRuntimeIds("cursor").some((id) => Object.hasOwn(providerConfig, id));
-}
-function parseOpenCodeConfig(raw, isJsonc) {
-    const parsed = asRecord(parseJsonOrJsonc(raw, isJsonc));
-    return {
-        plugin: Array.isArray(parsed?.plugin) ? parsed.plugin : [],
-        provider: asRecord(parsed?.provider),
-    };
-}
-export async function inspectCursorOpenCodeIntegration() {
-    const { configDirs } = getOpencodeRuntimeDirCandidates();
-    const checkedPaths = dedupe([...configDirs, process.cwd()].flatMap((dir) => [
-        join(dir, "opencode.json"),
-        join(dir, "opencode.jsonc"),
-    ]));
+/**
+ * Whether an OpenCode config file that counts for a session in `directory` loads Cursor's
+ * plugin or declares its provider. Files that do not parse are left out.
+ */
+export async function inspectCursorOpenCodeIntegration(directory) {
+    const checkedPaths = existingOpenCodeConfigFiles(directory);
     const matchedPaths = [];
     let pluginEnabled = false;
     let providerConfigured = false;
-    for (const path of checkedPaths) {
-        if (!existsSync(path))
-            continue;
-        try {
-            const raw = await readFile(path, "utf8");
-            const { plugin, provider } = parseOpenCodeConfig(raw, path.endsWith(".jsonc"));
-            const matchedPlugin = plugin.some(pluginIncludesCursor);
-            const matchedProvider = providerConfigIncludesCursor(provider);
-            if (matchedPlugin || matchedProvider) {
-                matchedPaths.push(path);
-            }
-            pluginEnabled ||= matchedPlugin;
-            providerConfigured ||= matchedProvider;
+    for (const { path, config } of await readOpenCodeConfigs(directory)) {
+        const { matchedPlugin, matchedProvider } = inspectOpenCodeConfig(config);
+        if (matchedPlugin || matchedProvider) {
+            matchedPaths.push(path);
         }
-        catch {
-            // Ignore invalid user configs here and let status output show missing matches.
-        }
+        pluginEnabled ||= matchedPlugin;
+        providerConfigured ||= matchedProvider;
     }
-    return {
-        pluginEnabled,
-        providerConfigured,
-        matchedPaths,
-        checkedPaths,
-    };
+    return { pluginEnabled, providerConfigured, matchedPaths, checkedPaths };
 }
 //# sourceMappingURL=cursor-detection.js.map

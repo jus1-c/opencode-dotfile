@@ -1,5 +1,7 @@
-import { type OpencodeRuntimeDirs } from "./opencode-runtime-paths.js";
-import type { PricingSnapshotSource } from "./types.js";
+import type { Settings } from "../settings/schema.js";
+type PricingSettings = Settings["providers"]["pricing"];
+/** Which price list reports use: "auto" (the newer of runtime and bundled), or one of them. */
+export type PricingSnapshotSource = PricingSettings["source"];
 export type CostBuckets = {
     input?: number;
     output?: number;
@@ -7,7 +9,7 @@ export type CostBuckets = {
     cache_write?: number;
     reasoning?: number;
 };
-export type PricingSnapshot = {
+type PricingSnapshot = {
     _meta: {
         source: string;
         generatedAt: number;
@@ -16,14 +18,7 @@ export type PricingSnapshot = {
     };
     providers: Record<string, Record<string, CostBuckets>>;
 };
-export declare const DEFAULT_PRICING_SNAPSHOT_MAX_AGE_MS: number;
-export type PricingSnapshotHealth = {
-    generatedAt: number;
-    ageMs: number;
-    maxAgeMs: number;
-    stale: boolean;
-};
-export interface PricingRefreshStateV1 {
+interface PricingRefreshStateV1 {
     version: 1;
     updatedAt: number;
     lastAttemptAt?: number;
@@ -34,60 +29,57 @@ export interface PricingRefreshStateV1 {
     etag?: string;
     lastModified?: string;
 }
-export interface PricingRefreshPolicy {
-    enabled: boolean;
-    maxAgeMs: number;
-    minAttemptIntervalMs: number;
-    timeoutMs: number;
+type ListSource = "runtime" | "bundled" | "empty";
+/** Everything the status report and `status --json` say about the price list. */
+export interface PriceListDescription {
+    /** The settings' choice. */
+    selection: PricingSnapshotSource;
+    /** The list in use: downloaded, shipped, or none readable. */
+    source: ListSource;
+    meta: PricingSnapshot["_meta"];
+    /** The list's age against the days the settings allow. */
+    health: {
+        ageMs: number;
+        maxAgeMs: number;
+        stale: boolean;
+    };
+    paths: {
+        snapshot: string;
+        refreshState: string;
+    };
+    refreshState: PricingRefreshStateV1 | null;
+    /** The ids of the list shipped in this package, never a downloaded one. */
+    bundledProviderIds: ReadonlySet<string>;
+    /** The model ids of the shipped list, under any provider. */
+    bundledModelIds: ReadonlySet<string>;
 }
-export interface PricingRefreshOptions {
-    reason?: "init" | "tokens" | "status" | "manual";
-    force?: boolean;
-    nowMs?: number;
-    maxAgeMs?: number;
-    minAttemptIntervalMs?: number;
-    timeoutMs?: number;
-    runtimeDirs?: OpencodeRuntimeDirs;
-    fetchFn?: typeof fetch;
-    bootstrapSnapshotOverride?: PricingSnapshot;
-    providerAllowlist?: string[];
-    snapshotSelection?: PricingSnapshotSource;
-    allowRefreshWhenSelectionBundled?: boolean;
-}
-export interface PricingRefreshResult {
-    attempted: boolean;
-    updated: boolean;
-    state: PricingRefreshStateV1;
-    error?: string;
-    reason?: string;
-}
-export declare function getPricingRefreshPolicy(): PricingRefreshPolicy;
-export declare function setPricingSnapshotAutoRefresh(days: number): void;
-export declare function getRuntimePricingSnapshotPath(runtimeDirs?: OpencodeRuntimeDirs): string;
-export declare function getRuntimePricingRefreshStatePath(runtimeDirs?: OpencodeRuntimeDirs): string;
-export declare function readPricingRefreshState(runtimeDirs?: OpencodeRuntimeDirs): Promise<PricingRefreshStateV1 | null>;
-export declare function maybeRefreshPricingSnapshot(opts?: PricingRefreshOptions): Promise<PricingRefreshResult>;
-export declare function setPricingSnapshotSelection(selection: PricingSnapshotSource): void;
-export declare function getPricingSnapshotSelection(): PricingSnapshotSource;
-export declare function getPricingSnapshotMeta(): PricingSnapshot["_meta"];
-export declare function getPricingSnapshotSource(): "runtime" | "bundled" | "empty";
-export declare function getPricingSnapshotHealth(opts?: {
-    nowMs?: number;
-    maxAgeMs?: number;
-}): PricingSnapshotHealth;
-export declare function hasProvider(providerId: string): boolean;
-export declare function isModelsDevProviderId(providerId: string): boolean;
-export declare function hasModel(providerId: string, modelId: string): boolean;
 /**
- * Infer the snapshot provider that owns a modelId.
- * Returns null when model is not found or is ambiguous across providers.
+ * Follows the pricing settings `current` gives, read each time they matter (which list and how
+ * many days old it may get before a download), until the returned function unbinds them.
+ * Unbinding removes only this binding; the last binding still bound wins, else "auto", 7 days.
  */
-export declare function inferProviderForModelId(modelId: string): string | null;
-export declare function getProviderModelCount(providerId: string): number;
-export declare function listProviders(): string[];
-export declare function listModelsForProvider(providerId: string): string[];
-export declare function listProvidersForModelId(modelId: string): string[];
+export declare function usePricingSettings(current: () => PricingSettings): () => void;
+/**
+ * Starts a models.dev download when the list is due for one (see `refresh`) and waits for it at
+ * most 0.75 s; a slower download goes on in the background. The wait's timer ends with the wait,
+ * so it never keeps the process running.
+ */
+export declare function refreshPricesIfDue(): Promise<void>;
+/**
+ * Downloads the price list from models.dev now, whatever its age. With the settings on the
+ * bundled list, the download is kept but lookups keep using the bundled one.
+ */
+export declare function downloadPrices(): Promise<{
+    ok: boolean;
+    message: string;
+}>;
+/** The list lookups use now: the settings' choice, the list it gave and its header. */
+export declare function activePriceList(): Pick<PriceListDescription, "selection" | "source" | "meta">;
+export declare function describePriceList(): Promise<PriceListDescription>;
+/** A model's prices; own keys only, so "constructor" or "__proto__" is never a model. */
 export declare function lookupCost(providerId: string, modelId: string): CostBuckets | null;
-export declare function hasCost(providerId: string, modelId: string): boolean;
+export declare function hasProvider(providerId: string): boolean;
+export declare function hasModel(providerId: string, modelId: string): boolean;
+export declare function listProvidersForModelId(modelId: string): string[];
 export declare function __resetPricingSnapshotForTests(): void;
-//# sourceMappingURL=modelsdev-pricing.d.ts.map
+export {};

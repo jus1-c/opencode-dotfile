@@ -1,7 +1,0 @@
-{
-  "name": "opencode-cloakbrowser-mcp-runtime",
-  "private": true,
-  "dependencies": {
-    "cloakbrowser-mcp": "1.13.0"
-  }
-}

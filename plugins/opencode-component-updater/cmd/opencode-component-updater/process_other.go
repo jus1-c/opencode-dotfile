@@ -2,6 +2,8 @@
 
 package main
 
+import "errors"
+
 type openCodeProcess struct {
 	PID        int
 	Executable string
@@ -9,11 +11,11 @@ type openCodeProcess struct {
 }
 
 func listOpenCodeProcesses() ([]openCodeProcess, error) {
-	return []openCodeProcess{}, nil
+	return nil, errors.New("OpenCode process detection is unsupported on this platform")
 }
 
-func processExists(pid int) bool {
-	return false
+func processExists(pid int) (bool, error) {
+	return false, errors.New("process detection is unsupported on this platform")
 }
 
 func isOpenCodeProcess(executable, comm string, executableAvailable bool) bool {

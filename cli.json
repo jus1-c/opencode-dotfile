@@ -1,9 +1,39 @@
 {
   "$schema": "https://opencode.ai/v2/cli.json",
+  "theme": {
+    "name": "catppuccin-macchiato"
+  },
   "plugins": [
-    "file://{env:HOME}/.config/opencode/plugins/quota",
-    "file://{env:HOME}/.config/opencode/plugins/goal/node_modules/@prevalentware/opencode-goal-plugin",
-    "file://{env:HOME}/.config/opencode/plugins/opencode-component-updater",
-    "file://{env:HOME}/.config/opencode/plugins/vilao-provider"
-  ]
+    "./plugins/quota",
+    "./plugins/goal",
+    "./plugins/opencode-mcp-manager",
+    "./plugins/vilao-provider",
+    "./plugins/opencode-component-updater",
+    "./plugins/opencode-mini-session"
+  ],
+  "diffs": {
+    "wrap": "word",
+    "view": "auto"
+  },
+  "session": {
+    "sidebar": "auto",
+    "scrollbar": false,
+    "thinking": "show",
+    "grouping": "auto",
+    "image_preview": true,
+    "markdown": "rendered",
+    "tps": true
+  },
+  "animations": true,
+  "prompt": {
+    "paste": "compact",
+    "editor": true,
+    "image_preview": true
+  },
+  "debug": {
+    "devtools": false
+  },
+  "keybinds": {
+    "agent.cycle": "tab"
+  }
 }

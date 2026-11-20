@@ -10,14 +10,14 @@
   },
   "exports": {
     ".": "./index.js",
-    "./tui": "./index.js"
+    "./tui": "./src/cli.js"
   },
-  "oc-plugin": [
-    "tui"
-  ],
   "scripts": {
     "test": "node --test",
-    "check": "node --check index.js && node --check src/json.js && node --check src/paths.js && node --check src/status.js && node --check src/tui.js"
+    "check": "node --check index.js && node --check src/cli.js && node --check src/json.js && node --check src/paths.js && node --check src/status.js && node --check src/tui.js"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "*"
   },
   "engines": {
     "node": ">=20"

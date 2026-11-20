@@ -1,5 +1,5 @@
 import type { ObservableResult } from "@opentelemetry/api";
-import type { QuotaProviderResult } from "./entries.js";
+import type { QuotaSnapshot } from "../core/types.js";
 type ObservableCallback = (result: ObservableResult) => void;
 type ObservableGauge = {
     addCallback(callback: ObservableCallback): void;
@@ -16,7 +16,7 @@ type TelemetryApi = {
     };
 };
 type TelemetryApiLoader = () => Promise<TelemetryApi>;
-export interface QuotaTelemetryToken {
+interface QuotaTelemetryToken {
     readonly ownerId: number;
     readonly generation: number;
 }
@@ -26,20 +26,12 @@ export declare function configureQuotaTelemetry(params: {
     identity: string;
 }): QuotaTelemetryToken | undefined;
 export declare function disposeQuotaTelemetryOwner(ownerKey: object): void;
-export declare function updateQuotaTelemetrySnapshot(params: {
-    token?: QuotaTelemetryToken;
-    snapshotId: string;
-    supersededSnapshotIds?: readonly string[];
-    providerId: string;
-    cacheTimestamp?: number;
-    result: QuotaProviderResult | null;
-}): void;
-export declare function retainQuotaTelemetryProviders(params: {
-    token?: QuotaTelemetryToken;
-    providerIds: readonly string[];
-}): void;
+/**
+ * Publishes the percent rows of a quota snapshot as this owner's series, replacing what the
+ * owner published before. Each provider reports how old its rows are (`okAtMs`).
+ */
+export declare function publishQuotaTelemetry(token: QuotaTelemetryToken | undefined, snapshot: QuotaSnapshot): void;
 export declare function __flushQuotaTelemetryInitializationForTests(): Promise<void>;
 export declare function __setQuotaTelemetryApiLoaderForTests(loader: TelemetryApiLoader): void;
 export declare function __resetQuotaTelemetryForTests(): void;
 export {};
-//# sourceMappingURL=quota-telemetry.d.ts.map

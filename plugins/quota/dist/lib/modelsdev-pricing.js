@@ -1,624 +1,417 @@
-import { readFileSync } from "fs";
-import { readFile } from "fs/promises";
-import { join } from "path";
+/**
+ * The models.dev price list, one per process: which list is in use (the one shipped in this
+ * package or the one downloaded into OpenCode's cache folder), price lookups, downloads, and a
+ * description for the status report. It follows the pricing settings `usePricingSettings` gives.
+ */
+import { readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { writeJsonAtomic } from "./atomic-json.js";
 import { fetchWithTimeout } from "./http.js";
 import { getOpencodeRuntimeDirs } from "./opencode-runtime-paths.js";
 const SOURCE_URL = "https://models.dev/api.json";
+const UNITS = "USD per 1M tokens";
 const DEFAULT_MODELSDEV_PROVIDERS = ["anthropic", "google", "moonshotai", "openai", "xai", "zai"];
-const COST_KEYS = ["input", "output", "cache_read", "cache_write"];
-const RUNTIME_SNAPSHOT_FILENAME = "modelsdev-pricing.runtime.min.json";
-const RUNTIME_REFRESH_STATE_FILENAME = "modelsdev-pricing.refresh-state.json";
-const DEFAULT_REFRESH_MIN_ATTEMPT_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const DEFAULT_REFRESH_TIMEOUT_MS = 6_000;
+/** The prices read from models.dev; a saved snapshot may also carry `reasoning`. */
+const API_COST_KEYS = ["input", "output", "cache_read", "cache_write"];
+const SNAPSHOT_COST_KEYS = [...API_COST_KEYS, "reasoning"];
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
-export const DEFAULT_PRICING_SNAPSHOT_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000;
+const DEFAULT_SETTINGS = { source: "auto", autoRefreshDays: 7 };
+const REFRESH_MIN_ATTEMPT_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const REFRESH_TIMEOUT_MS = 6_000;
+/** How long a check waits for a due download before it goes on with the list in use. */
+const REFRESH_WAIT_MS = 750;
 const EMPTY_SNAPSHOT = {
-    _meta: {
-        source: "none",
-        generatedAt: 0,
-        providers: [],
-        units: "USD per 1M tokens",
-    },
+    _meta: { source: "none", generatedAt: 0, providers: [], units: UNITS },
     providers: {},
 };
-let SNAPSHOT = null;
-let SNAPSHOT_SOURCE = "bundled";
-let SNAPSHOT_SELECTION = "auto";
-let MODEL_INDEX = null;
+const REFRESH_RESULTS = new Set([
+    "success",
+    "not_modified",
+    "skipped_fresh",
+    "skipped_throttled",
+    "failed",
+]);
+/** The bound settings, oldest first; the last one still bound is followed. */
+const SETTINGS_BINDINGS = [];
+let LOADED = null;
 let REFRESH_IN_FLIGHT = null;
 let PROCESS_REFRESH_CHECKED = false;
-let CONFIGURED_PRICING_SNAPSHOT_MAX_AGE_MS = DEFAULT_PRICING_SNAPSHOT_MAX_AGE_MS;
+let BUNDLED_IDS = null;
+/**
+ * Follows the pricing settings `current` gives, read each time they matter (which list and how
+ * many days old it may get before a download), until the returned function unbinds them.
+ * Unbinding removes only this binding; the last binding still bound wins, else "auto", 7 days.
+ */
+export function usePricingSettings(current) {
+    const binding = { current };
+    SETTINGS_BINDINGS.push(binding);
+    return () => {
+        const index = SETTINGS_BINDINGS.indexOf(binding);
+        if (index !== -1)
+            SETTINGS_BINDINGS.splice(index, 1);
+    };
+}
+function pricingSettings() {
+    return SETTINGS_BINDINGS.at(-1)?.current() ?? DEFAULT_SETTINGS;
+}
+/** An object or an array (an array's entries are keyed by position). */
 function asRecord(value) {
     return value && typeof value === "object" ? value : null;
 }
-function sortRecordByKeys(obj) {
-    const out = {};
-    for (const key of Object.keys(obj).sort((a, b) => a.localeCompare(b))) {
-        out[key] = obj[key];
-    }
-    return out;
+/** Sorted by key, so a saved snapshot reads and diffs in a stable order. */
+function sortByKey(record) {
+    return Object.fromEntries(Object.entries(record).sort(([a], [b]) => a.localeCompare(b)));
 }
-function pricingSnapshotDaysToMs(days) {
-    if (typeof days !== "number" || !Number.isFinite(days) || days <= 0) {
-        return DEFAULT_PRICING_SNAPSHOT_MAX_AGE_MS;
-    }
-    return Math.floor(days * MS_PER_DAY);
-}
-export function getPricingRefreshPolicy() {
-    return {
-        enabled: true,
-        maxAgeMs: CONFIGURED_PRICING_SNAPSHOT_MAX_AGE_MS,
-        minAttemptIntervalMs: DEFAULT_REFRESH_MIN_ATTEMPT_INTERVAL_MS,
-        timeoutMs: DEFAULT_REFRESH_TIMEOUT_MS,
-    };
-}
-export function setPricingSnapshotAutoRefresh(days) {
-    CONFIGURED_PRICING_SNAPSHOT_MAX_AGE_MS = pricingSnapshotDaysToMs(days);
-}
-function normalizeSnapshot(raw) {
-    const root = asRecord(raw);
-    if (!root)
-        return null;
-    const metaRaw = asRecord(root._meta);
-    const providersRaw = asRecord(root.providers);
-    if (!metaRaw || !providersRaw)
-        return null;
-    const generatedAt = Number(metaRaw.generatedAt);
-    if (!Number.isFinite(generatedAt) || generatedAt <= 0)
-        return null;
-    const providers = {};
-    for (const providerId of Object.keys(providersRaw)) {
-        const modelsRaw = asRecord(providersRaw[providerId]);
-        if (!modelsRaw)
-            continue;
-        const models = {};
-        for (const modelId of Object.keys(modelsRaw)) {
-            const modelRaw = asRecord(modelsRaw[modelId]);
-            if (!modelRaw)
-                continue;
-            const buckets = {};
-            const input = modelRaw.input;
-            const output = modelRaw.output;
-            const cacheRead = modelRaw.cache_read;
-            const cacheWrite = modelRaw.cache_write;
-            const reasoning = modelRaw.reasoning;
-            if (typeof input === "number" && Number.isFinite(input))
-                buckets.input = input;
-            if (typeof output === "number" && Number.isFinite(output))
-                buckets.output = output;
-            if (typeof cacheRead === "number" && Number.isFinite(cacheRead))
-                buckets.cache_read = cacheRead;
-            if (typeof cacheWrite === "number" && Number.isFinite(cacheWrite)) {
-                buckets.cache_write = cacheWrite;
-            }
-            if (typeof reasoning === "number" && Number.isFinite(reasoning))
-                buckets.reasoning = reasoning;
-            if (Object.keys(buckets).length > 0) {
-                models[modelId] = buckets;
-            }
-        }
-        if (Object.keys(models).length > 0) {
-            providers[providerId] = sortRecordByKeys(models);
-        }
-    }
-    const providerList = Object.keys(providers).sort((a, b) => a.localeCompare(b));
-    return {
-        _meta: {
-            source: typeof metaRaw.source === "string" && metaRaw.source ? metaRaw.source : SOURCE_URL,
-            generatedAt: Math.trunc(generatedAt),
-            providers: providerList,
-            units: typeof metaRaw.units === "string" && metaRaw.units ? metaRaw.units : "USD per 1M tokens",
-        },
-        providers: sortRecordByKeys(providers),
-    };
-}
-function loadBundledSnapshotSync(override) {
-    if (override) {
-        return normalizeSnapshot(override) ?? EMPTY_SNAPSHOT;
-    }
-    try {
-        const url = new URL("../data/modelsdev-pricing.min.json", import.meta.url);
-        const raw = readFileSync(url, "utf-8");
-        return normalizeSnapshot(JSON.parse(raw)) ?? EMPTY_SNAPSHOT;
-    }
-    catch {
-        return EMPTY_SNAPSHOT;
-    }
-}
-export function getRuntimePricingSnapshotPath(runtimeDirs) {
-    const dirs = runtimeDirs ?? getOpencodeRuntimeDirs();
-    return join(dirs.cacheDir, "opencode-quota", RUNTIME_SNAPSHOT_FILENAME);
-}
-export function getRuntimePricingRefreshStatePath(runtimeDirs) {
-    const dirs = runtimeDirs ?? getOpencodeRuntimeDirs();
-    return join(dirs.cacheDir, "opencode-quota", RUNTIME_REFRESH_STATE_FILENAME);
-}
-function loadRuntimeSnapshotSync(runtimeDirs) {
-    const path = getRuntimePricingSnapshotPath(runtimeDirs);
-    try {
-        const raw = readFileSync(path, "utf-8");
-        return normalizeSnapshot(JSON.parse(raw));
-    }
-    catch {
-        return null;
-    }
-}
-function hasSnapshotData(snapshot) {
-    return snapshot._meta.generatedAt > 0;
-}
-function chooseSnapshot(params) {
-    const bundled = loadBundledSnapshotSync(params?.bootstrapSnapshotOverride);
-    const runtime = loadRuntimeSnapshotSync(params?.runtimeDirs);
-    const selection = params?.selection ?? SNAPSHOT_SELECTION;
-    if (selection === "bundled") {
-        if (hasSnapshotData(bundled)) {
-            return { snapshot: bundled, source: "bundled" };
-        }
-        return { snapshot: EMPTY_SNAPSHOT, source: "empty" };
-    }
-    if (selection === "runtime") {
-        if (runtime) {
-            return { snapshot: runtime, source: "runtime" };
-        }
-        if (hasSnapshotData(bundled)) {
-            return { snapshot: bundled, source: "bundled" };
-        }
-        return { snapshot: EMPTY_SNAPSHOT, source: "empty" };
-    }
-    if (runtime && runtime._meta.generatedAt >= bundled._meta.generatedAt) {
-        return { snapshot: runtime, source: "runtime" };
-    }
-    if (hasSnapshotData(bundled)) {
-        return { snapshot: bundled, source: "bundled" };
-    }
-    return { snapshot: EMPTY_SNAPSHOT, source: "empty" };
-}
-function setSnapshot(snapshot, source) {
-    SNAPSHOT = snapshot;
-    SNAPSHOT_SOURCE = source;
-    MODEL_INDEX = null;
-}
-function applySnapshotSelection(params) {
-    const selected = chooseSnapshot(params);
-    setSnapshot(selected.snapshot, selected.source);
-    return selected;
-}
-function ensureLoaded() {
-    if (SNAPSHOT)
-        return SNAPSHOT;
-    const selected = applySnapshotSelection();
-    return selected.snapshot;
-}
-function ensureModelIndex() {
-    if (MODEL_INDEX)
-        return MODEL_INDEX;
-    const snap = ensureLoaded();
-    const idx = new Map();
-    for (const providerId of Object.keys(snap.providers)) {
-        const models = snap.providers[providerId] ?? {};
-        for (const modelId of Object.keys(models)) {
-            const existing = idx.get(modelId);
-            if (existing)
-                existing.push(providerId);
-            else
-                idx.set(modelId, [providerId]);
-        }
-    }
-    MODEL_INDEX = idx;
-    return idx;
-}
-function normalizeRefreshState(raw) {
-    const obj = asRecord(raw);
-    if (!obj)
-        return null;
-    const version = Number(obj.version);
-    const updatedAt = Number(obj.updatedAt);
-    if (version !== 1 || !Number.isFinite(updatedAt) || updatedAt <= 0)
-        return null;
-    const out = {
-        version: 1,
-        updatedAt: Math.trunc(updatedAt),
-    };
-    const lastAttemptAt = Number(obj.lastAttemptAt);
-    const lastSuccessAt = Number(obj.lastSuccessAt);
-    const lastFailureAt = Number(obj.lastFailureAt);
-    if (Number.isFinite(lastAttemptAt) && lastAttemptAt > 0)
-        out.lastAttemptAt = Math.trunc(lastAttemptAt);
-    if (Number.isFinite(lastSuccessAt) && lastSuccessAt > 0)
-        out.lastSuccessAt = Math.trunc(lastSuccessAt);
-    if (Number.isFinite(lastFailureAt) && lastFailureAt > 0)
-        out.lastFailureAt = Math.trunc(lastFailureAt);
-    if (typeof obj.lastResult === "string") {
-        const allowed = new Set([
-            "success",
-            "not_modified",
-            "skipped_fresh",
-            "skipped_throttled",
-            "failed",
-        ]);
-        if (allowed.has(obj.lastResult)) {
-            out.lastResult = obj.lastResult;
-        }
-    }
-    if (typeof obj.lastError === "string" && obj.lastError)
-        out.lastError = obj.lastError;
-    if (typeof obj.etag === "string" && obj.etag)
-        out.etag = obj.etag;
-    if (typeof obj.lastModified === "string" && obj.lastModified)
-        out.lastModified = obj.lastModified;
-    return out;
-}
-async function readRefreshState(path) {
-    try {
-        const raw = await readFile(path, "utf-8");
-        return normalizeRefreshState(JSON.parse(raw));
-    }
-    catch {
-        return null;
-    }
-}
-export async function readPricingRefreshState(runtimeDirs) {
-    return await readRefreshState(getRuntimePricingRefreshStatePath(runtimeDirs));
-}
-function makeDefaultRefreshState(nowMs) {
-    return {
-        version: 1,
-        updatedAt: nowMs,
-    };
-}
-function pickCostBuckets(rawCost) {
-    const obj = asRecord(rawCost);
-    if (!obj)
-        return null;
+/** The finite prices among `keys`; null when there are none. */
+function pickCosts(raw, keys) {
+    const record = asRecord(raw);
     const picked = {};
-    for (const key of COST_KEYS) {
-        const value = obj[key];
-        if (typeof value === "number" && Number.isFinite(value)) {
+    for (const key of keys) {
+        const value = record?.[key];
+        if (typeof value === "number" && Number.isFinite(value))
             picked[key] = value;
-        }
     }
     return Object.keys(picked).length > 0 ? picked : null;
 }
-function buildSnapshotFromApi(apiRaw, providerIDs, generatedAt) {
-    const api = asRecord(apiRaw) ?? {};
+function withProviders(meta, providers) {
+    const sorted = sortByKey(providers);
+    return { _meta: { ...meta, providers: Object.keys(sorted) }, providers: sorted };
+}
+/** A snapshot of the providers with at least one priced model. */
+function makeSnapshot(meta, modelsByProvider, costOf) {
     const providers = {};
-    for (const providerID of providerIDs) {
-        const providerNode = asRecord(api[providerID]);
-        const models = asRecord(providerNode?.models);
-        if (!models)
-            continue;
-        const pricedModels = {};
-        for (const modelID of Object.keys(models)) {
-            const modelNode = asRecord(models[modelID]);
-            const cost = pickCostBuckets(modelNode?.cost);
-            if (cost) {
-                pricedModels[modelID] = cost;
+    for (const [providerId, modelsRaw] of modelsByProvider) {
+        const models = {};
+        for (const [modelId, model] of Object.entries(asRecord(modelsRaw) ?? {})) {
+            const cost = costOf(model);
+            if (cost)
+                models[modelId] = cost;
+        }
+        if (Object.keys(models).length > 0)
+            providers[providerId] = sortByKey(models);
+    }
+    return withProviders(meta, providers);
+}
+/** A saved snapshot (bundled or runtime); null when it has no valid date. */
+function normalizeSnapshot(raw) {
+    const meta = asRecord(asRecord(raw)?._meta);
+    const providers = asRecord(asRecord(raw)?.providers);
+    const generatedAt = Number(meta?.generatedAt);
+    if (!meta || !providers || !Number.isFinite(generatedAt) || generatedAt <= 0)
+        return null;
+    return makeSnapshot({
+        source: typeof meta.source === "string" && meta.source ? meta.source : SOURCE_URL,
+        generatedAt: Math.trunc(generatedAt),
+        units: typeof meta.units === "string" && meta.units ? meta.units : UNITS,
+    }, Object.entries(providers), (model) => pickCosts(model, SNAPSHOT_COST_KEYS));
+}
+function buildSnapshotFromApi(apiRaw, generatedAt) {
+    const api = asRecord(apiRaw) ?? {};
+    return makeSnapshot({ source: SOURCE_URL, generatedAt, units: UNITS }, DEFAULT_MODELSDEV_PROVIDERS.map((providerID) => [
+        providerID,
+        asRecord(api[providerID])?.models,
+    ]), (model) => pickCosts(asRecord(model)?.cost, API_COST_KEYS));
+}
+/**
+ * models.dev drops retired models from its list. Keep their last known price so
+ * older usage still gets a cost. `current` wins, then `previous` in the order given.
+ * Callers list the user's runtime snapshot before the bundled one: its prices come
+ * from the user's own last download, while the bundled file's date only says when
+ * the file was rewritten, not when a kept model's price was last seen.
+ */
+function keepRetiredModels(current, previous) {
+    const providers = { ...current.providers };
+    for (const providerID of DEFAULT_MODELSDEV_PROVIDERS) {
+        const models = { ...providers[providerID] };
+        for (const snapshot of previous) {
+            for (const [modelID, cost] of Object.entries(snapshot?.providers[providerID] ?? {})) {
+                models[modelID] ??= cost;
             }
         }
-        if (Object.keys(pricedModels).length > 0) {
-            providers[providerID] = sortRecordByKeys(pricedModels);
-        }
+        if (Object.keys(models).length > 0)
+            providers[providerID] = sortByKey(models);
     }
-    const providerList = Object.keys(providers).sort((a, b) => a.localeCompare(b));
+    return withProviders(current._meta, providers);
+}
+function readSnapshotFile(path) {
+    try {
+        return normalizeSnapshot(JSON.parse(readFileSync(path, "utf-8")));
+    }
+    catch {
+        return null;
+    }
+}
+function loadBundledSnapshot() {
+    const bundled = readSnapshotFile(new URL("../data/modelsdev-pricing.min.json", import.meta.url));
+    return bundled ?? EMPTY_SNAPSHOT;
+}
+/** Where downloads go: OpenCode's cache folder. */
+function runtimePaths() {
+    const dir = join(getOpencodeRuntimeDirs().cacheDir, "opencode-quota");
     return {
-        _meta: {
-            generatedAt,
-            providers: providerList,
-            source: SOURCE_URL,
-            units: "USD per 1M tokens",
-        },
-        providers: sortRecordByKeys(providers),
+        snapshot: join(dir, "modelsdev-pricing.runtime.min.json"),
+        refreshState: join(dir, "modelsdev-pricing.refresh-state.json"),
     };
 }
-function countPricedModels(snapshot) {
-    let total = 0;
-    for (const models of Object.values(snapshot.providers)) {
-        total += Object.keys(models).length;
+/** "bundled" pins the shipped file, "runtime" prefers the downloaded one, "auto" takes the newer. */
+function chooseList(selection) {
+    const bundled = loadBundledSnapshot();
+    const runtime = selection === "bundled" ? null : readSnapshotFile(runtimePaths().snapshot);
+    if (runtime &&
+        (selection === "runtime" || runtime._meta.generatedAt >= bundled._meta.generatedAt)) {
+        // A runtime snapshot saved by an older version may lack models that models.dev stopped
+        // listing; the bundled file fills them until its next refresh.
+        return { selection, snapshot: keepRetiredModels(runtime, [bundled]), source: "runtime" };
     }
-    return total;
+    const source = bundled === EMPTY_SNAPSHOT ? "empty" : "bundled";
+    return { selection, snapshot: bundled, source };
 }
-function getErrorMessage(error) {
-    return error instanceof Error ? error.message : String(error);
+/** The list the settings choose, read again when the choice changes. */
+function activeList() {
+    const { source } = pricingSettings();
+    if (LOADED?.selection !== source)
+        LOADED = chooseList(source);
+    return LOADED;
 }
-async function fetchModelsDevSnapshot(params) {
+/** Days after which the list counts as stale; not a positive number means 7 days. */
+function maxAgeMs() {
+    const days = pricingSettings().autoRefreshDays;
+    return Number.isFinite(days) && days > 0
+        ? Math.floor(days * MS_PER_DAY)
+        : DEFAULT_SETTINGS.autoRefreshDays * MS_PER_DAY;
+}
+function listHealth(generatedAt, nowMs) {
+    const ageMs = Math.max(0, nowMs - generatedAt);
+    const maxAge = maxAgeMs();
+    return { ageMs, maxAgeMs: maxAge, stale: ageMs > maxAge };
+}
+function normalizeRefreshState(raw) {
+    const record = asRecord(raw);
+    const updatedAt = Number(record?.updatedAt);
+    if (!record || Number(record.version) !== 1 || !Number.isFinite(updatedAt) || updatedAt <= 0) {
+        return null;
+    }
+    const state = { version: 1, updatedAt: Math.trunc(updatedAt) };
+    for (const key of ["lastAttemptAt", "lastSuccessAt", "lastFailureAt"]) {
+        const at = Number(record[key]);
+        if (Number.isFinite(at) && at > 0)
+            state[key] = Math.trunc(at);
+    }
+    if (typeof record.lastResult === "string" && REFRESH_RESULTS.has(record.lastResult)) {
+        state.lastResult = record.lastResult;
+    }
+    for (const key of ["lastError", "etag", "lastModified"]) {
+        const text = record[key];
+        if (typeof text === "string" && text)
+            state[key] = text;
+    }
+    return state;
+}
+async function readRefreshState(path) {
+    try {
+        return normalizeRefreshState(JSON.parse(await readFile(path, "utf-8")));
+    }
+    catch {
+        return null;
+    }
+}
+async function fetchModelsDev(state) {
     const headers = new Headers();
-    if (params.state.etag)
-        headers.set("If-None-Match", params.state.etag);
-    if (params.state.lastModified)
-        headers.set("If-Modified-Since", params.state.lastModified);
+    if (state.etag)
+        headers.set("If-None-Match", state.etag);
+    if (state.lastModified)
+        headers.set("If-Modified-Since", state.lastModified);
     return await fetchWithTimeout(SOURCE_URL, {
         request: { headers },
-        timeoutMs: params.timeoutMs,
-        fetchFn: params.fetchFn,
+        timeoutMs: REFRESH_TIMEOUT_MS,
         consume: async (response) => {
-            const responseMetadata = {
-                etag: response.headers.get("etag") ?? undefined,
-                lastModified: response.headers.get("last-modified") ?? undefined,
-            };
-            if (response.status === 304) {
-                return { kind: "not_modified", ...responseMetadata };
-            }
+            const etag = response.headers.get("etag") ?? undefined;
+            const lastModified = response.headers.get("last-modified") ?? undefined;
+            if (response.status === 304)
+                return { kind: "not_modified", etag, lastModified };
             if (!response.ok) {
                 throw new Error(`Failed to fetch ${SOURCE_URL}: ${response.status} ${response.statusText}`);
             }
-            return {
-                kind: "success",
-                api: await response.json(),
-                ...responseMetadata,
-            };
+            return { kind: "success", api: await response.json(), etag, lastModified };
         },
     });
 }
-export async function maybeRefreshPricingSnapshot(opts = {}) {
-    if (REFRESH_IN_FLIGHT)
-        return REFRESH_IN_FLIGHT;
-    REFRESH_IN_FLIGHT = (async () => {
-        const nowMs = opts.nowMs ?? Date.now();
-        const policy = getPricingRefreshPolicy();
-        const maxAgeMs = opts.maxAgeMs ?? policy.maxAgeMs;
-        const minAttemptIntervalMs = opts.minAttemptIntervalMs ?? policy.minAttemptIntervalMs;
-        const timeoutMs = opts.timeoutMs ?? policy.timeoutMs;
-        const runtimeDirs = opts.runtimeDirs;
-        const snapshotPath = getRuntimePricingSnapshotPath(runtimeDirs);
-        const statePath = getRuntimePricingRefreshStatePath(runtimeDirs);
-        const force = opts.force === true;
-        const selection = opts.snapshotSelection ?? SNAPSHOT_SELECTION;
-        const allowRefreshWhenSelectionBundled = opts.allowRefreshWhenSelectionBundled === true;
-        const previousState = (await readRefreshState(statePath)) ?? makeDefaultRefreshState(nowMs);
-        const runtimeSnapshotBeforeRefresh = loadRuntimeSnapshotSync(runtimeDirs);
-        applySnapshotSelection({
-            runtimeDirs,
-            bootstrapSnapshotOverride: opts.bootstrapSnapshotOverride,
-            selection,
-        });
-        if (selection === "bundled" && !allowRefreshWhenSelectionBundled) {
-            return {
-                attempted: false,
-                updated: false,
-                reason: "selection_bundled",
-                state: {
-                    ...previousState,
-                    updatedAt: nowMs,
-                },
-            };
-        }
-        if (!force && PROCESS_REFRESH_CHECKED) {
-            return {
-                attempted: false,
-                updated: false,
-                reason: "already_checked_this_process",
-                state: previousState,
-            };
-        }
-        PROCESS_REFRESH_CHECKED = true;
-        const health = getPricingSnapshotHealth({ nowMs, maxAgeMs });
-        if (!force && !policy.enabled) {
-            return {
-                attempted: false,
-                updated: false,
-                reason: "disabled",
-                state: {
-                    ...previousState,
-                    updatedAt: nowMs,
-                    lastResult: "skipped_fresh",
-                },
-            };
-        }
-        if (!force && !health.stale) {
-            return {
-                attempted: false,
-                updated: false,
-                reason: "fresh",
-                state: {
-                    ...previousState,
-                    updatedAt: nowMs,
-                    lastResult: "skipped_fresh",
-                },
-            };
-        }
-        if (!force &&
-            previousState.lastAttemptAt &&
-            nowMs - previousState.lastAttemptAt < minAttemptIntervalMs) {
-            return {
-                attempted: false,
-                updated: false,
-                reason: "throttled",
-                state: {
-                    ...previousState,
-                    updatedAt: nowMs,
-                    lastResult: "skipped_throttled",
-                },
-            };
-        }
-        const attemptingState = {
-            ...previousState,
-            version: 1,
-            updatedAt: nowMs,
-            lastAttemptAt: nowMs,
-        };
-        try {
-            const fetchResult = await fetchModelsDevSnapshot({
-                timeoutMs,
-                state: attemptingState,
-                fetchFn: opts.fetchFn,
-            });
-            if (fetchResult.kind === "not_modified") {
-                const baseSnapshot = runtimeSnapshotBeforeRefresh ?? ensureLoaded();
-                const refreshedSnapshot = {
-                    _meta: {
-                        ...baseSnapshot._meta,
-                        generatedAt: nowMs,
-                    },
-                    providers: baseSnapshot.providers,
-                };
-                await writeJsonAtomic(snapshotPath, refreshedSnapshot, { trailingNewline: true });
-                applySnapshotSelection({
-                    runtimeDirs,
-                    bootstrapSnapshotOverride: opts.bootstrapSnapshotOverride,
-                    selection,
-                });
-                const nextState = {
-                    ...attemptingState,
-                    updatedAt: nowMs,
-                    lastSuccessAt: nowMs,
-                    lastResult: "not_modified",
-                    lastError: undefined,
-                    etag: fetchResult.etag ?? attemptingState.etag,
-                    lastModified: fetchResult.lastModified ?? attemptingState.lastModified,
-                };
-                try {
-                    await writeJsonAtomic(statePath, nextState, { trailingNewline: true });
-                }
-                catch {
-                    // best effort; keep refreshed in-memory/runtime snapshot active
-                }
-                return {
-                    attempted: true,
-                    updated: true,
-                    state: nextState,
-                };
-            }
-            const snapshot = buildSnapshotFromApi(fetchResult.api, opts.providerAllowlist ?? DEFAULT_MODELSDEV_PROVIDERS, nowMs);
-            if (countPricedModels(snapshot) === 0) {
-                throw new Error("Refusing to persist empty pricing snapshot from models.dev");
-            }
-            await writeJsonAtomic(snapshotPath, snapshot, { trailingNewline: true });
-            applySnapshotSelection({
-                runtimeDirs,
-                bootstrapSnapshotOverride: opts.bootstrapSnapshotOverride,
-                selection,
-            });
-            const nextState = {
-                ...attemptingState,
-                updatedAt: nowMs,
-                lastSuccessAt: nowMs,
-                lastResult: "success",
-                lastError: undefined,
-                etag: fetchResult.etag ?? attemptingState.etag,
-                lastModified: fetchResult.lastModified ?? attemptingState.lastModified,
-            };
-            try {
-                await writeJsonAtomic(statePath, nextState, { trailingNewline: true });
-            }
-            catch {
-                // best effort; snapshot has already been updated
-            }
-            return {
-                attempted: true,
-                updated: true,
-                state: nextState,
-            };
-        }
-        catch (error) {
-            const errorMessage = getErrorMessage(error);
-            const nextState = {
-                ...attemptingState,
-                updatedAt: nowMs,
-                lastFailureAt: nowMs,
-                lastResult: "failed",
-                lastError: errorMessage,
-            };
-            try {
-                await writeJsonAtomic(statePath, nextState, { trailingNewline: true });
-            }
-            catch {
-                // best effort; report original fetch/refresh error
-            }
-            return {
-                attempted: true,
-                updated: false,
-                error: errorMessage,
-                state: nextState,
-            };
-        }
-    })().finally(() => {
-        REFRESH_IN_FLIGHT = null;
-    });
-    return REFRESH_IN_FLIGHT;
-}
-export function setPricingSnapshotSelection(selection) {
-    if (SNAPSHOT_SELECTION === selection)
-        return;
-    SNAPSHOT_SELECTION = selection;
-    SNAPSHOT = null;
-    MODEL_INDEX = null;
-}
-export function getPricingSnapshotSelection() {
-    return SNAPSHOT_SELECTION;
-}
-export function getPricingSnapshotMeta() {
-    return ensureLoaded()._meta;
-}
-export function getPricingSnapshotSource() {
-    ensureLoaded();
-    return SNAPSHOT_SOURCE;
-}
-export function getPricingSnapshotHealth(opts) {
-    const generatedAt = getPricingSnapshotMeta().generatedAt;
-    const nowMs = opts?.nowMs ?? Date.now();
-    const maxAgeMs = opts?.maxAgeMs ?? DEFAULT_PRICING_SNAPSHOT_MAX_AGE_MS;
-    const ageMs = Math.max(0, nowMs - generatedAt);
-    return {
-        generatedAt,
-        ageMs,
-        maxAgeMs,
-        stale: ageMs > maxAgeMs,
+/**
+ * One refresh at a time: a call while one runs gets that one's result. A forced call never takes
+ * an automatic one's result: it waits for that one to end, then downloads.
+ */
+async function refreshOnce(force) {
+    while (force && REFRESH_IN_FLIGHT && !REFRESH_IN_FLIGHT.force) {
+        await REFRESH_IN_FLIGHT.result.catch(() => undefined);
+    }
+    REFRESH_IN_FLIGHT ??= {
+        force,
+        result: refresh(force).finally(() => {
+            REFRESH_IN_FLIGHT = null;
+        }),
     };
-}
-export function hasProvider(providerId) {
-    return !!ensureLoaded().providers[providerId];
-}
-export function isModelsDevProviderId(providerId) {
-    return hasProvider(providerId);
-}
-export function hasModel(providerId, modelId) {
-    const p = ensureLoaded().providers[providerId];
-    if (!p)
-        return false;
-    return !!p[modelId];
+    return REFRESH_IN_FLIGHT.result;
 }
 /**
- * Infer the snapshot provider that owns a modelId.
- * Returns null when model is not found or is ambiguous across providers.
+ * Reads the lists again (a download by another process counts), then downloads new models.dev
+ * prices when the list in use is stale: once per process, at most every 6 hours across processes
+ * (the refresh state file remembers the last attempt), never with the settings on the bundled
+ * list. `force` downloads whatever the age, also for the bundled list. A failure keeps the list
+ * in use.
  */
-export function inferProviderForModelId(modelId) {
-    const providers = listProvidersForModelId(modelId);
-    if (!providers || providers.length !== 1)
+async function refresh(force) {
+    const nowMs = Date.now();
+    const selection = pricingSettings().source;
+    const paths = runtimePaths();
+    const previousState = (await readRefreshState(paths.refreshState)) ?? {
+        version: 1,
+        updatedAt: nowMs,
+    };
+    const runtimeBefore = readSnapshotFile(paths.snapshot);
+    const bundled = loadBundledSnapshot();
+    const list = chooseList(selection);
+    LOADED = list;
+    if (selection === "bundled" && !force)
+        return { updated: false, reason: "selection_bundled" };
+    if (!force && PROCESS_REFRESH_CHECKED) {
+        return { updated: false, reason: "already_checked_this_process" };
+    }
+    PROCESS_REFRESH_CHECKED = true;
+    if (!force && !listHealth(list.snapshot._meta.generatedAt, nowMs).stale) {
+        return { updated: false, reason: "fresh" };
+    }
+    const lastAttemptAt = previousState.lastAttemptAt;
+    if (!force && lastAttemptAt && nowMs - lastAttemptAt < REFRESH_MIN_ATTEMPT_INTERVAL_MS) {
+        return { updated: false, reason: "throttled" };
+    }
+    const attempting = {
+        ...previousState,
+        version: 1,
+        updatedAt: nowMs,
+        lastAttemptAt: nowMs,
+    };
+    let next;
+    try {
+        const fetched = await fetchModelsDev(attempting);
+        let snapshot;
+        if (fetched.kind === "not_modified") {
+            // The same prices, confirmed now; also heals snapshots saved before retired models were kept.
+            const base = runtimeBefore ?? list.snapshot;
+            const confirmed = { _meta: { ...base._meta, generatedAt: nowMs }, providers: base.providers };
+            snapshot = keepRetiredModels(confirmed, [bundled]);
+        }
+        else {
+            const fresh = buildSnapshotFromApi(fetched.api, nowMs);
+            if (Object.keys(fresh.providers).length === 0) {
+                throw new Error("Refusing to persist empty pricing snapshot from models.dev");
+            }
+            snapshot = keepRetiredModels(fresh, [runtimeBefore, bundled]);
+        }
+        await writeJsonAtomic(paths.snapshot, snapshot, { trailingNewline: true });
+        LOADED = chooseList(selection);
+        next = {
+            ...attempting,
+            lastSuccessAt: nowMs,
+            lastResult: fetched.kind,
+            lastError: undefined,
+            etag: fetched.etag ?? attempting.etag,
+            lastModified: fetched.lastModified ?? attempting.lastModified,
+        };
+    }
+    catch (error) {
+        const lastError = error instanceof Error ? error.message : String(error);
+        next = { ...attempting, lastFailureAt: nowMs, lastResult: "failed", lastError };
+    }
+    // Best effort: the list in use and the result stay right without the state file.
+    await writeJsonAtomic(paths.refreshState, next, { trailingNewline: true }).catch(() => { });
+    return next.lastResult === "failed"
+        ? { updated: false, error: next.lastError }
+        : { updated: true };
+}
+/**
+ * Starts a models.dev download when the list is due for one (see `refresh`) and waits for it at
+ * most 0.75 s; a slower download goes on in the background. The wait's timer ends with the wait,
+ * so it never keeps the process running.
+ */
+export async function refreshPricesIfDue() {
+    const refreshed = refreshOnce(false).catch(() => undefined);
+    let timer;
+    const waited = new Promise((resolve) => {
+        timer = setTimeout(resolve, REFRESH_WAIT_MS);
+    });
+    await Promise.race([refreshed, waited]);
+    clearTimeout(timer);
+}
+/**
+ * Downloads the price list from models.dev now, whatever its age. With the settings on the
+ * bundled list, the download is kept but lookups keep using the bundled one.
+ */
+export async function downloadPrices() {
+    const { source } = pricingSettings();
+    const result = await refreshOnce(true);
+    if (!result.updated) {
+        const reason = result.error ?? result.reason ?? "unknown reason";
+        return { ok: false, message: `Couldn't download new prices: ${reason}.` };
+    }
+    if (source === "bundled") {
+        return {
+            ok: true,
+            message: "Downloaded new prices. Usage keeps the built-in prices: the pricing source setting is bundled.",
+        };
+    }
+    return { ok: true, message: "Downloaded new prices from models.dev." };
+}
+/** The list lookups use now: the settings' choice, the list it gave and its header. */
+export function activePriceList() {
+    const { selection, source, snapshot } = activeList();
+    return { selection, source, meta: snapshot._meta };
+}
+/** The ids of the list shipped in this package (read once). */
+function bundledIds() {
+    if (!BUNDLED_IDS) {
+        const { providers } = loadBundledSnapshot();
+        BUNDLED_IDS = {
+            bundledProviderIds: new Set(Object.keys(providers)),
+            bundledModelIds: new Set(Object.values(providers).flatMap((models) => Object.keys(models))),
+        };
+    }
+    return BUNDLED_IDS;
+}
+export async function describePriceList() {
+    const active = activePriceList();
+    const paths = runtimePaths();
+    return {
+        ...active,
+        health: listHealth(active.meta.generatedAt, Date.now()),
+        paths,
+        refreshState: await readRefreshState(paths.refreshState),
+        ...bundledIds(),
+    };
+}
+/** A model's prices; own keys only, so "constructor" or "__proto__" is never a model. */
+export function lookupCost(providerId, modelId) {
+    const { providers } = activeList().snapshot;
+    if (!Object.hasOwn(providers, providerId))
         return null;
-    return providers[0] ?? null;
+    const models = providers[providerId];
+    return Object.hasOwn(models, modelId) ? models[modelId] : null;
 }
-export function getProviderModelCount(providerId) {
-    return Object.keys(ensureLoaded().providers[providerId] || {}).length;
+export function hasProvider(providerId) {
+    return Object.hasOwn(activeList().snapshot.providers, providerId);
 }
-export function listProviders() {
-    return Object.keys(ensureLoaded().providers);
-}
-export function listModelsForProvider(providerId) {
-    return Object.keys(ensureLoaded().providers[providerId] ?? {});
+export function hasModel(providerId, modelId) {
+    return lookupCost(providerId, modelId) !== null;
 }
 export function listProvidersForModelId(modelId) {
-    const providers = ensureModelIndex().get(modelId) ?? [];
-    return [...providers].sort((a, b) => a.localeCompare(b));
-}
-export function lookupCost(providerId, modelId) {
-    const p = ensureLoaded().providers[providerId];
-    if (!p)
-        return null;
-    const c = p[modelId];
-    if (!c)
-        return null;
-    return c;
-}
-export function hasCost(providerId, modelId) {
-    return lookupCost(providerId, modelId) != null;
+    const { providers } = activeList().snapshot;
+    return Object.keys(providers)
+        .filter((providerId) => Object.hasOwn(providers[providerId] ?? {}, modelId))
+        .sort((a, b) => a.localeCompare(b));
 }
 export function __resetPricingSnapshotForTests() {
-    SNAPSHOT = null;
-    SNAPSHOT_SOURCE = "bundled";
-    SNAPSHOT_SELECTION = "auto";
-    CONFIGURED_PRICING_SNAPSHOT_MAX_AGE_MS = DEFAULT_PRICING_SNAPSHOT_MAX_AGE_MS;
-    MODEL_INDEX = null;
+    SETTINGS_BINDINGS.length = 0;
+    LOADED = null;
     REFRESH_IN_FLIGHT = null;
     PROCESS_REFRESH_CHECKED = false;
 }

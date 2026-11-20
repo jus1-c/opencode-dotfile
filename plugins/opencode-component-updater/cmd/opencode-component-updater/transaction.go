@@ -175,6 +175,7 @@ func applyStagedPlan(ctx context.Context, value paths, settings config, plan upg
 	if err := saveJournal(value, journal); err != nil {
 		return nil, err
 	}
+	archives := []int{}
 	for index := range journal.Components {
 		componentJournal := &journal.Components[index]
 		if !componentJournal.Committed {
@@ -182,20 +183,31 @@ func applyStagedPlan(ctx context.Context, value paths, settings config, plan upg
 			_ = os.RemoveAll(componentJournal.Stage)
 			continue
 		}
-		if report != nil {
-			report(progress{Phase: "archive", Component: componentJournal.ID, Detail: "compressing backup", Current: index, Total: len(journal.Components)})
-		}
-		if err := archiveComponentBackup(value, journal.RunID, componentJournal); err != nil {
+		archives = append(archives, index)
+	}
+	journal.Phase = "archiving"
+	if err := saveJournal(value, journal); err != nil {
+		return failures, err
+	}
+	safe := newSafeReporter(report, len(archives))
+	for _, index := range archives {
+		safe.emit(progress{Phase: "archive", Component: journal.Components[index].ID, Detail: "compressing backup"})
+	}
+	// Each backup has its own directory and archive name, so compression can run
+	// concurrently. Nothing writes the journal here; a crash mid-archive replays
+	// this phase idempotently from the archiving phase.
+	archiveErrs := runBounded(ctx, settings.Defaults.ArchiveConcurrency, archives, func(_ context.Context, _ int, index int) error {
+		return archiveComponentBackup(value, journal.RunID, &journal.Components[index])
+	})
+	for position, index := range archives {
+		if err := archiveErrs[position]; err != nil {
 			return failures, err
 		}
-		componentJournal.Archived = true
-		journal.Phase = "archiving"
-		if err := saveJournal(value, journal); err != nil {
-			return failures, err
-		}
-		if report != nil {
-			report(progress{Phase: "archive", Component: componentJournal.ID, Detail: "complete", Current: index + 1, Total: len(journal.Components)})
-		}
+		journal.Components[index].Archived = true
+		safe.done(progress{Phase: "archive", Component: journal.Components[index].ID, Detail: "complete"})
+	}
+	if err := saveJournal(value, journal); err != nil {
+		return failures, err
 	}
 	if err := finalizeCommittedTransaction(value, &journal); err != nil {
 		return failures, err

@@ -1,9 +1,7 @@
 /**
- * Ollama Cloud provider wrapper.
- *
- * Queries the Ollama Cloud usage API and reports session/weekly quota plus
- * provider-reported per-model request counts.
+ * Ollama Cloud (https://docs.ollama.com/api/balance): included credits (credit plans) or session
+ * and weekly limits (legacy plans), and purchased credits. Each key stored in OpenCode is queried
+ * as its own account; an env or config key is used alone.
  */
 import type { QuotaProvider } from "../lib/entries.js";
 export declare const ollamaCloudProvider: QuotaProvider;
-//# sourceMappingURL=ollama-cloud.d.ts.map

@@ -73,8 +73,8 @@ def update():
             (stage / "bin").mkdir()
             (stage / "bin/rtk").write_bytes(binary.read())
             (stage / "bin/rtk").chmod(0o755)
-    (stage / "plugin.ts").write_bytes((TARGET / "plugin.ts").read_bytes())
-    manifest = {"schemaVersion": 2, "planSha256": os.environ["OPENCODE_UPDATER_PLAN_SHA256"], "paths": ["bin", "plugin.ts"]}
+    (stage / "server.ts").write_bytes((TARGET / "server.ts").read_bytes())
+    manifest = {"schemaVersion": 2, "planSha256": os.environ["OPENCODE_UPDATER_PLAN_SHA256"], "paths": ["bin", "server.ts"]}
     Path(os.environ["OPENCODE_UPDATER_MANIFEST"]).write_text(json.dumps(manifest) + "\n")
 
 
@@ -83,7 +83,7 @@ def healthcheck():
     version = subprocess.check_output([stage / "bin/rtk", "--version"], text=True).split()[1]
     if version != os.environ["OPENCODE_UPDATER_LATEST"]:
         raise SystemExit("staged RTK binary does not match planned version")
-    if (stage / "plugin.ts").read_bytes() != (TARGET / "plugin.ts").read_bytes():
+    if (stage / "server.ts").read_bytes() != (TARGET / "server.ts").read_bytes():
         raise SystemExit("staged RTK adapter changed")
 
 

@@ -1,15 +1,13 @@
 import { existsSync } from "fs";
-import { join } from "path";
-import { getOpencodeRuntimeDirCandidates } from "./opencode-runtime-paths.js";
+import { getOpenCodeDbPath } from "./opencode-db-path.js";
 import { openOpenCodeSqliteReadOnly } from "./opencode-sqlite.js";
-import { pickFirstExistingPath } from "./path-pick.js";
 /**
  * Error thrown when a session is not found.
  *
- * With OpenCode >=1.2, sessions/messages live in SQLite (`opencode.db`).
- * This is thrown by iterAssistantMessagesForSession when the database is
- * missing/unreadable, the session id is invalid, or the session row does
- * not exist.
+ * OpenCode 2 stores sessions and messages in SQLite (`opencode.db`) under the
+ * `session_v2` and `session_message` tables. This is thrown by
+ * iterAssistantMessagesForSession when the database is missing/unreadable, the
+ * session id is invalid, or the session row does not exist.
  */
 export class SessionNotFoundError extends Error {
     sessionID;
@@ -21,34 +19,6 @@ export class SessionNotFoundError extends Error {
         this.name = "SessionNotFoundError";
     }
 }
-export function getOpenCodeDataDirCandidates() {
-    // OpenCode stores data under `${Global.Path.data}` which is `join(xdgData, "opencode")`.
-    // We return candidate opencode data dirs in priority order.
-    return getOpencodeRuntimeDirCandidates().dataDirs;
-}
-export function getOpenCodeDataDir() {
-    return pickFirstExistingPath(getOpenCodeDataDirCandidates());
-}
-export function getOpenCodeDbPathCandidates() {
-    return getOpenCodeDataDirCandidates().map((d) => join(d, "opencode.db"));
-}
-export function getOpenCodeDbPath() {
-    return pickFirstExistingPath(getOpenCodeDbPathCandidates());
-}
-function asRecord(value) {
-    return value && typeof value === "object" ? value : null;
-}
-function safeJsonParse(raw) {
-    try {
-        return JSON.parse(raw);
-    }
-    catch {
-        return null;
-    }
-}
-// Stay comfortably below SQLite's default host-parameter cap once optional
-// time filters are included in the query.
-const SQLITE_MAX_MESSAGE_QUERY_ARGS = 900;
 function normalizeNumber(n) {
     return typeof n === "number" && Number.isFinite(n) ? n : undefined;
 }
@@ -62,81 +32,69 @@ function mapRowToOpenCodeMessage(row) {
         return null;
     if (typeof row.time_created !== "number")
         return null;
-    const payload = asRecord(safeJsonParse(row.data));
-    if (!payload)
-        return null;
-    const payloadTime = asRecord(payload.time);
-    const role = normalizeString(payload.role) ?? "unknown";
+    const input = normalizeNumber(row.tokens_input);
+    const output = normalizeNumber(row.tokens_output);
+    const reasoning = normalizeNumber(row.tokens_reasoning);
+    const cacheRead = normalizeNumber(row.tokens_cache_read);
+    const cacheWrite = normalizeNumber(row.tokens_cache_write);
+    const errorType = normalizeString(row.error_type);
+    const hasTokens = [input, output, reasoning, cacheRead, cacheWrite].some((value) => value !== undefined);
     return {
         id: row.id,
         sessionID: row.session_id,
-        role,
-        providerID: normalizeString(payload.providerID),
-        modelID: normalizeString(payload.modelID),
-        tokens: payload.tokens,
-        cost: normalizeNumber(payload.cost),
+        role: normalizeString(row.role) ?? "unknown",
+        providerID: normalizeString(row.provider_id),
+        modelID: normalizeString(row.model_id),
+        tokens: hasTokens
+            ? {
+                input: input ?? 0,
+                output: output ?? 0,
+                ...(reasoning === undefined ? {} : { reasoning }),
+                cache: { read: cacheRead ?? 0, write: cacheWrite ?? 0 },
+            }
+            : undefined,
+        ...(row.has_usage_metadata === undefined
+            ? {}
+            : { hasUsageMetadata: row.has_usage_metadata === 1 }),
+        ...(errorType === undefined ? {} : { errorType }),
+        cost: normalizeNumber(row.cost),
         time: {
             created: row.time_created,
-            completed: normalizeNumber(payloadTime?.completed),
+            completed: normalizeNumber(row.time_completed),
         },
-        agent: normalizeString(payload.agent),
-        mode: normalizeString(payload.mode),
     };
 }
 function openDbOrNull() {
     const dbPath = getOpenCodeDbPath();
-    if (!dbPath)
-        return null;
-    if (!existsSync(dbPath))
+    if (dbPath === ":memory:" || !existsSync(dbPath))
         return null;
     return {
         dbPath,
         open: () => openOpenCodeSqliteReadOnly(dbPath),
     };
 }
-function validateSessionIdOrThrow(sessionID) {
-    if (!sessionID.startsWith("ses_")) {
-        throw new SessionNotFoundError(sessionID, "(invalid session ID format)");
-    }
+function guardedJsonScalar(path, column = "data") {
+    return `CASE WHEN json_valid(${column}) THEN json_extract(${column}, '${path}') END`;
 }
-function normalizeSessionIdsOrThrow(sessionIDs) {
-    const unique = [];
-    const seen = new Set();
-    for (const sessionID of sessionIDs) {
-        validateSessionIdOrThrow(sessionID);
-        if (seen.has(sessionID))
-            continue;
-        seen.add(sessionID);
-        unique.push(sessionID);
-    }
-    return unique;
-}
-function chunkArray(items, chunkSize) {
-    const chunks = [];
-    for (let i = 0; i < items.length; i += chunkSize) {
-        chunks.push(items.slice(i, i + chunkSize));
-    }
-    return chunks;
-}
+const PROJECTED_MESSAGE_COLUMNS = [
+    "id",
+    "session_id",
+    "time_created",
+    "type AS role",
+    `${guardedJsonScalar("$.model.providerID")} AS provider_id`,
+    `${guardedJsonScalar("$.model.id")} AS model_id`,
+    `${guardedJsonScalar("$.tokens.input")} AS tokens_input`,
+    `${guardedJsonScalar("$.tokens.output")} AS tokens_output`,
+    `${guardedJsonScalar("$.tokens.reasoning")} AS tokens_reasoning`,
+    `${guardedJsonScalar("$.tokens.cache.read")} AS tokens_cache_read`,
+    `${guardedJsonScalar("$.tokens.cache.write")} AS tokens_cache_write`,
+    `${guardedJsonScalar("$.cost")} AS cost`,
+    `${guardedJsonScalar("$.time.completed")} AS time_completed`,
+].join(", ");
+const ASSISTANT_FILTER = `type = 'assistant'`;
 function buildMessageQuery(params) {
-    if (params.sessionID && params.sessionIDs?.length) {
-        throw new Error("buildMessageQuery received both sessionID and sessionIDs");
-    }
     const where = [];
     const args = [];
-    if (params.sessionID) {
-        where.push(`session_id = ?`);
-        args.push(params.sessionID);
-    }
-    else if (params.sessionIDs) {
-        if (params.sessionIDs.length === 0) {
-            where.push(`1 = 0`);
-        }
-        else {
-            where.push(`session_id IN (${params.sessionIDs.map(() => "?").join(", ")})`);
-            args.push(...params.sessionIDs);
-        }
-    }
     if (typeof params.sinceMs === "number") {
         where.push(`time_created >= ?`);
         args.push(params.sinceMs);
@@ -145,7 +103,8 @@ function buildMessageQuery(params) {
         where.push(`time_created <= ?`);
         args.push(params.untilMs);
     }
-    const sql = `SELECT id, session_id, time_created, time_updated, data FROM "message"` +
+    where.push(ASSISTANT_FILTER);
+    const sql = `SELECT ${PROJECTED_MESSAGE_COLUMNS} FROM "session_message"` +
         (where.length ? ` WHERE ${where.join(" AND ")}` : "") +
         ` ORDER BY time_created ASC, id ASC`;
     return { sql, args };
@@ -180,18 +139,12 @@ function completedAt(message) {
 function mapCompletedAssistantMessages(rows) {
     return mapAssistantMessages(rows).filter((message) => completedAt(message) !== null);
 }
-function compareCompletedMessageOrder(a, b) {
-    const aCompleted = completedAt(a) ?? Number.MAX_SAFE_INTEGER;
-    const bCompleted = completedAt(b) ?? Number.MAX_SAFE_INTEGER;
-    if (aCompleted !== bCompleted)
-        return aCompleted - bCompleted;
-    return a.id.localeCompare(b.id);
-}
 function buildCompletedAssistantQuery(params) {
-    const completedExpression = `CAST(json_extract(data, '$.time.completed') AS REAL)`;
+    const completedScalar = guardedJsonScalar("$.time.completed");
+    const completedExpression = `CAST(${completedScalar} AS REAL)`;
     const where = [
-        `json_extract(data, '$.role') = 'assistant'`,
-        `json_type(data, '$.time.completed') IN ('integer', 'real')`,
+        ASSISTANT_FILTER,
+        `CASE WHEN json_valid(data) THEN json_type(data, '$.time.completed') END IN ('integer', 'real')`,
         `${completedExpression} > 0`,
     ];
     const args = [];
@@ -204,18 +157,55 @@ function buildCompletedAssistantQuery(params) {
         args.push(params.completedUntilMs);
     }
     return {
-        sql: `SELECT id, session_id, time_created, time_updated, data FROM "message"` +
+        sql: `SELECT ${PROJECTED_MESSAGE_COLUMNS} FROM "session_message"` +
             ` WHERE ${where.join(" AND ")}` +
             ` ORDER BY ${completedExpression} ASC, id ASC`,
         args,
     };
 }
-function compareMessageOrder(a, b) {
-    const aCreated = typeof a.time?.created === "number" ? a.time.created : Number.MAX_SAFE_INTEGER;
-    const bCreated = typeof b.time?.created === "number" ? b.time.created : Number.MAX_SAFE_INTEGER;
-    if (aCreated !== bCreated)
-        return aCreated - bCreated;
-    return a.id.localeCompare(b.id);
+function forkCopyFingerprint(message, completed) {
+    const tokens = message.tokens;
+    return JSON.stringify([
+        message.time?.created,
+        completed,
+        message.providerID,
+        message.modelID,
+        tokens?.input,
+        tokens?.output,
+        tokens?.reasoning,
+        tokens?.cache.read,
+        tokens?.cache.write,
+        message.cost,
+    ]);
+}
+/**
+ * OpenCode copies a parent's finished messages into each fork with new ids but
+ * identical times, model, tokens, and cost. Count each finished fingerprint as
+ * many times as the session that has it most often, and drop the extra copies.
+ * Unfinished rows are always kept.
+ */
+function dropForkCopies(messages) {
+    const countBySessionFingerprint = new Map();
+    const keptCountByFingerprint = new Map();
+    const out = [];
+    for (const message of messages) {
+        const completed = completedAt(message);
+        if (completed === null) {
+            out.push(message);
+            continue;
+        }
+        const fingerprint = forkCopyFingerprint(message, completed);
+        const sessionFingerprintKey = JSON.stringify([message.sessionID, fingerprint]);
+        const sessionCount = (countBySessionFingerprint.get(sessionFingerprintKey) ?? 0) + 1;
+        countBySessionFingerprint.set(sessionFingerprintKey, sessionCount);
+        const keptCount = keptCountByFingerprint.get(fingerprint) ?? 0;
+        if (sessionCount <= keptCount) {
+            continue;
+        }
+        keptCountByFingerprint.set(fingerprint, sessionCount);
+        out.push(message);
+    }
+    return out;
 }
 export async function getOpenCodeDbStats() {
     const db = openDbOrNull();
@@ -229,20 +219,12 @@ export async function getOpenCodeDbStats() {
     }
     const conn = await db.open();
     try {
-        const sessionRow = conn.get(`SELECT count(*) as c FROM "session"`);
-        const messageRow = conn.get(`SELECT count(*) as c FROM "message"`);
+        const sessionRow = conn.get(`SELECT count(*) as c FROM "session_v2"`);
+        const messageRow = conn.get(`SELECT count(*) as c FROM "session_message"`);
         let assistantCount = 0;
         if (await hasJsonExtract(conn)) {
-            const a = conn.get(`SELECT count(*) as c FROM "message" WHERE json_extract(data, '$.role') = 'assistant'`);
+            const a = conn.get(`SELECT count(*) as c FROM "session_message" WHERE type = 'assistant'`);
             assistantCount = typeof a?.c === "number" ? a.c : 0;
-        }
-        else {
-            const rows = conn.all(`SELECT data FROM "message"`);
-            for (const r of rows) {
-                const payload = asRecord(safeJsonParse(r.data));
-                if (payload?.role === "assistant")
-                    assistantCount += 1;
-            }
         }
         return {
             dbPath: db.dbPath,
@@ -261,9 +243,11 @@ export async function iterAssistantMessages(params) {
         return [];
     const conn = await db.open();
     try {
+        if (!(await hasJsonExtract(conn)))
+            return [];
         const q = buildMessageQuery({ sinceMs: params.sinceMs, untilMs: params.untilMs });
         const rows = conn.all(q.sql, q.args);
-        return mapAssistantMessages(rows);
+        return dropForkCopies(mapAssistantMessages(rows));
     }
     finally {
         conn.close();
@@ -283,81 +267,97 @@ export async function iterCompletedAssistantMessages(params) {
     try {
         if (await hasJsonExtract(conn)) {
             const query = buildCompletedAssistantQuery(params);
-            return mapCompletedAssistantMessages(conn.all(query.sql, query.args));
+            return dropForkCopies(mapCompletedAssistantMessages(conn.all(query.sql, query.args)));
         }
-        const rows = conn.all(`SELECT id, session_id, time_created, time_updated, data FROM "message"`);
-        return mapCompletedAssistantMessages(rows)
-            .filter((message) => {
-            const atMs = completedAt(message);
-            if (atMs === null)
-                return false;
-            if (typeof params.completedSinceMs === "number" && atMs < params.completedSinceMs) {
-                return false;
-            }
-            if (typeof params.completedUntilMs === "number" && atMs > params.completedUntilMs) {
-                return false;
-            }
-            return true;
-        })
-            .sort(compareCompletedMessageOrder);
-    }
-    finally {
-        conn.close();
-    }
-}
-/**
- * Read assistant messages for a specific session only.
- */
-export async function iterAssistantMessagesForSession(params) {
-    const { sessionID, sinceMs, untilMs } = params;
-    validateSessionIdOrThrow(sessionID);
-    const db = openDbOrNull();
-    if (!db) {
-        throw new SessionNotFoundError(sessionID, getOpenCodeDbPath());
-    }
-    const conn = await db.open();
-    try {
-        const exists = conn.get(`SELECT 1 as ok FROM "session" WHERE id = ? LIMIT 1`, [
-            sessionID,
-        ]);
-        if (!exists) {
-            throw new SessionNotFoundError(sessionID, db.dbPath);
-        }
-        const q = buildMessageQuery({ sessionID, sinceMs, untilMs });
-        const rows = conn.all(q.sql, q.args);
-        return mapAssistantMessages(rows);
-    }
-    finally {
-        conn.close();
-    }
-}
-/**
- * Read assistant messages for a specific set of sessions.
- */
-export async function iterAssistantMessagesForSessions(params) {
-    const sessionIDs = normalizeSessionIdsOrThrow(params.sessionIDs);
-    if (sessionIDs.length === 0)
         return [];
-    const db = openDbOrNull();
-    if (!db) {
-        throw new SessionNotFoundError(sessionIDs[0], getOpenCodeDbPath());
     }
+    finally {
+        conn.close();
+    }
+}
+const USAGE_MESSAGE_COLUMNS = [
+    "message.id AS id",
+    "message.session_id AS session_id",
+    "message.time_created AS time_created",
+    "message.type AS role",
+    // A failed compaction names no model: its usage stays unpriced.
+    `${guardedJsonScalar("$.model.providerID", "message.data")} AS provider_id`,
+    `${guardedJsonScalar("$.model.id", "message.data")} AS model_id`,
+    `${guardedJsonScalar("$.tokens.input", "message.data")} AS tokens_input`,
+    `${guardedJsonScalar("$.tokens.output", "message.data")} AS tokens_output`,
+    `${guardedJsonScalar("$.tokens.reasoning", "message.data")} AS tokens_reasoning`,
+    `${guardedJsonScalar("$.tokens.cache.read", "message.data")} AS tokens_cache_read`,
+    `${guardedJsonScalar("$.tokens.cache.write", "message.data")} AS tokens_cache_write`,
+    `${guardedJsonScalar("$.time.completed", "message.data")} AS time_completed`,
+    `(CASE WHEN json_valid(message.data) THEN json_type(message.data, '$.tokens') END = 'object') AS has_usage_metadata`,
+    `${guardedJsonScalar("$.error.type", "message.data")} AS error_type`,
+].join(", ");
+const USAGE_MESSAGE_FILTERS = [
+    // Assistant messages, and compactions that recorded usage (a running one has none yet).
+    `(message.type = 'assistant' OR (message.type = 'compaction'` +
+        ` AND ${guardedJsonScalar("$.tokens", "message.data")} IS NOT NULL))`,
+    // A fork starts with copies of its parent's rows, all older than the fork; only the parent
+    // counts them. OpenCode's own usage stats use the same rule.
+    `(session.fork_session_id IS NULL OR message.time_created >= session.time_created)`,
+];
+function readUsagePage(conn, filter, after, pageSize) {
+    const where = [...USAGE_MESSAGE_FILTERS];
+    const args = [];
+    if (filter.sessionID !== undefined) {
+        where.push("message.session_id = ?");
+        args.push(filter.sessionID);
+    }
+    if (typeof filter.sinceMs === "number") {
+        where.push("message.time_created >= ?");
+        args.push(filter.sinceMs);
+    }
+    if (typeof filter.untilMs === "number") {
+        where.push("message.time_created <= ?");
+        args.push(filter.untilMs);
+    }
+    if (after) {
+        // The rows after the last one read, in (time_created, id) order. The first condition
+        // alone lets SQLite start from the creation-time index.
+        where.push("message.time_created >= ? AND (message.time_created > ? OR message.id > ?)");
+        args.push(after.timeCreated, after.timeCreated, after.id);
+    }
+    return conn.all(`SELECT ${USAGE_MESSAGE_COLUMNS} FROM "session_message" AS message` +
+        ` LEFT JOIN "session_v2" AS session ON session.id = message.session_id` +
+        ` WHERE ${where.join(" AND ")}` +
+        ` ORDER BY message.time_created ASC, message.id ASC LIMIT ?`, [...args, pageSize]);
+}
+/**
+ * Reads the rows that used tokens, at most `pageSize` at a time so the caller can let other
+ * work run between pages: assistant messages and compactions that recorded usage, by creation
+ * time, without the copies a fork starts with. `role` is the row type ("assistant" or
+ * "compaction"). With `sessionIDs`, reads only those sessions, one after another.
+ */
+export async function* readUsageMessagePages(params) {
+    const db = openDbOrNull();
+    if (!db)
+        return;
     const conn = await db.open();
     try {
-        const reservedArgs = (typeof params.sinceMs === "number" ? 1 : 0) + (typeof params.untilMs === "number" ? 1 : 0);
-        const maxSessionIdsPerQuery = Math.max(1, SQLITE_MAX_MESSAGE_QUERY_ARGS - reservedArgs);
-        const messages = [];
-        for (const sessionIdChunk of chunkArray(sessionIDs, maxSessionIdsPerQuery)) {
-            const q = buildMessageQuery({
-                sessionIDs: sessionIdChunk,
-                sinceMs: params.sinceMs,
-                untilMs: params.untilMs,
-            });
-            const rows = conn.all(q.sql, q.args);
-            messages.push(...mapAssistantMessages(rows));
+        if (!(await hasJsonExtract(conn)))
+            return;
+        const { sinceMs, untilMs, pageSize } = params;
+        const filters = params.sessionIDs === undefined
+            ? [{ sinceMs, untilMs }]
+            : params.sessionIDs.map((sessionID) => ({ sinceMs, untilMs, sessionID }));
+        for (const filter of filters) {
+            let after = null;
+            let pageWasFull = true;
+            while (pageWasFull) {
+                const rows = readUsagePage(conn, filter, after, pageSize);
+                const messages = rows.flatMap((row) => mapRowToOpenCodeMessage(row) ?? []);
+                if (messages.length > 0)
+                    yield messages;
+                const last = rows.at(-1);
+                if (last)
+                    after = { timeCreated: last.time_created, id: last.id };
+                pageWasFull = rows.length === pageSize;
+            }
         }
-        messages.sort(compareMessageOrder);
-        return messages;
     }
     finally {
         conn.close();
@@ -370,7 +370,7 @@ export async function readAllSessionsIndex() {
         return idx;
     const conn = await db.open();
     try {
-        const rows = conn.all(`SELECT id, title, parent_id, time_created, time_updated FROM "session" ORDER BY time_created ASC, id ASC`);
+        const rows = conn.all(`SELECT id, title, parent_id, time_created, time_updated FROM "session_v2" ORDER BY time_created ASC, id ASC`);
         for (const row of rows) {
             if (!row || typeof row.id !== "string" || !row.id.startsWith("ses_"))
                 continue;
@@ -389,5 +389,52 @@ export async function readAllSessionsIndex() {
     finally {
         conn.close();
     }
+}
+function compareSessionCreatedAt(a, b) {
+    const aCreated = typeof a.time?.created === "number" && Number.isFinite(a.time.created)
+        ? a.time.created
+        : Number.MAX_SAFE_INTEGER;
+    const bCreated = typeof b.time?.created === "number" && Number.isFinite(b.time.created)
+        ? b.time.created
+        : Number.MAX_SAFE_INTEGER;
+    if (aCreated !== bCreated)
+        return aCreated - bCreated;
+    return a.id.localeCompare(b.id);
+}
+/** The ids of a session and all its subagent sessions, depth first, children oldest first. */
+export async function resolveSessionTree(rootSessionID) {
+    if (!rootSessionID.startsWith("ses_")) {
+        throw new SessionNotFoundError(rootSessionID, "(invalid session ID format)");
+    }
+    const sessionsIdx = await readAllSessionsIndex();
+    const root = sessionsIdx[rootSessionID];
+    if (!root) {
+        throw new SessionNotFoundError(rootSessionID, getOpenCodeDbPath());
+    }
+    const childrenByParentID = new Map();
+    for (const session of Object.values(sessionsIdx)) {
+        if (!session.parentID)
+            continue;
+        const children = childrenByParentID.get(session.parentID);
+        if (children) {
+            children.push(session);
+        }
+        else {
+            childrenByParentID.set(session.parentID, [session]);
+        }
+    }
+    for (const children of childrenByParentID.values()) {
+        children.sort(compareSessionCreatedAt);
+    }
+    const tree = [];
+    const visit = (session) => {
+        if (tree.includes(session.id))
+            return;
+        tree.push(session.id);
+        for (const child of childrenByParentID.get(session.id) ?? [])
+            visit(child);
+    };
+    visit(root);
+    return tree;
 }
 //# sourceMappingURL=opencode-storage.js.map

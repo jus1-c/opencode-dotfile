@@ -7,7 +7,7 @@ import subprocess
 import sys
 import urllib.parse
 
-UV = os.path.expanduser("~/.local/bin/uv")
+UV = "uv"
 
 
 def fail(message):
@@ -93,7 +93,7 @@ def update(config, target):
     if count != 1:
         fail("expected one primary Git requirement")
     (stage / "requirements.in").write_text(requirements)
-    python = config["python"]
+    python = output(UV, "python", "find", config["python"])
     run(
         UV,
         "pip",
@@ -166,7 +166,7 @@ def healthcheck(config, target):
                 fail(f"staged shebang contains temporary path: {path.name}")
 
 
-CONFIG = {'distribution': 'mem-forensics-mcp-server', 'python': 'python3.14', 'modules': ['mem_forensics_mcp_server', 'volatility3', 'yara', 'yara_x'], 'preserve_tree': '.venv/lib/python3.14/site-packages/.cache/volatility3'}
+CONFIG = {'distribution': 'mem-forensics-mcp-server', 'python': '3.14', 'modules': ['mem_forensics_mcp_server', 'volatility3', 'yara', 'yara_x'], 'preserve_tree': '.venv/lib/python3.14/site-packages/.cache/volatility3'}
 
 
 def main():

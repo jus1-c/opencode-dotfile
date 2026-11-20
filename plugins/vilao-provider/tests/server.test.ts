@@ -4,7 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { VilaoProviderPlugin, fetchCatalog } from "../src/server.js";
+import { VilaoProviderPlugin, fetchCatalog, toProviderModel } from "../src/server.js";
+
+test("exposes OpenAI-compatible reasoning variants on every Vilao model", () => {
+  const model = toProviderModel({ id: "opt/model", name: "Model" });
+
+  assert.equal(model.api.npm, "@ai-sdk/openai-compatible");
+  assert.equal(model.capabilities.reasoning, true);
+  assert.deepEqual(Object.keys(model.variants ?? {}), ["low", "medium", "high", "xhigh", "max"]);
+  assert.deepEqual(model.variants?.max, { reasoningEffort: "max" });
+});
 
 test("sends the PAT only to the Vilao key-list endpoint", async () => {
   const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
@@ -72,8 +81,20 @@ test("auto-fetches current subscriptions without reviving deleted override model
     const plugin = await VilaoProviderPlugin({ client: {} } as Parameters<typeof VilaoProviderPlugin>[0]);
     const config = {} as Parameters<NonNullable<typeof plugin.config>>[0];
     await plugin.config?.(config);
+    assert.equal(config.provider?.vilao?.npm, "@ai-sdk/openai-compatible");
     assert.deepEqual(Object.keys(config.provider?.vilao?.models ?? {}), ["live/model"]);
     assert.equal(config.provider?.vilao?.models?.["live/model"]?.name, "Live custom");
+    assert.equal(config.provider?.vilao?.models?.["live/model"]?.reasoning, true);
+    assert.deepEqual(
+      Object.keys(config.provider?.vilao?.models?.["live/model"]?.variants ?? {}),
+      ["low", "medium", "high", "xhigh", "max"],
+    );
+    assert.deepEqual(config.provider?.vilao?.models?.["live/model"]?.variants?.high, {
+      reasoningEffort: "high",
+    });
+    assert.deepEqual(config.provider?.vilao?.models?.["live/model"]?.limit, {
+      context: 400_000, output: 32_000,
+    });
   } finally {
     globalThis.fetch = originalFetch;
     if (originalData === undefined) delete process.env.XDG_DATA_HOME;

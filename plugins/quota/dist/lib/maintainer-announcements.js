@@ -1,15 +1,9 @@
-import { getQuotaProviderShape, normalizeQuotaProviderId, } from "./provider-metadata.js";
+import { getCanonicalQuotaProviderId, normalizeQuotaProviderId, } from "./provider-metadata.js";
 export const BUNDLED_MAINTAINER_ANNOUNCEMENTS = [
     {
-        id: "opencode-ecosystem-listing-support",
-        message: "Support OpenCode Quota's ecosystem listing: review the issue and add a thumbs-up.",
-        url: "https://github.com/anomalyco/opencode/issues/38281",
-        startsAt: "2026-07-22T00:00:00.000Z",
-        endsAt: "2026-08-22T00:00:00.000Z",
-    },
-    {
-        id: "google-gemini-cli-deprecated",
-        message: "Gemini CLI quota support in OpenCode Quota is deprecated, with removal planned for v5.0.0. Existing v4 configurations continue to work. Google's official Antigravity CLI replaces the individual Gemini CLI experience. Google AI Studio or Vertex AI are the supported choices for third-party access. OpenCode Quota's Google integrations are independent and are not endorsed by Google.",
+        id: "google-gemini-cli-org-only",
+        message: "Gemini CLI quota support stays. It only works with Gemini Code Assist Standard or Enterprise (organization) accounts because Google ended personal accounts on 2026-06-18. Personal Google users should use Google AGY.",
+        endsAt: "2027-01-01T00:00:00.000Z",
         providerIds: ["google-gemini-cli"],
     },
 ];
@@ -24,12 +18,12 @@ function normalizedProviderIds(providerIds) {
     const out = [];
     const seen = new Set();
     for (const providerId of providerIds) {
-        const shape = getQuotaProviderShape(normalizeQuotaProviderId(providerId));
-        if (!shape || seen.has(shape.id)) {
+        const canonicalId = getCanonicalQuotaProviderId(normalizeQuotaProviderId(providerId));
+        if (!canonicalId || seen.has(canonicalId)) {
             continue;
         }
-        seen.add(shape.id);
-        out.push(shape.id);
+        seen.add(canonicalId);
+        out.push(canonicalId);
     }
     return out;
 }
@@ -47,7 +41,7 @@ function isHttpsUrl(value) {
 function getEndsAtSortValue(announcement) {
     return parseTimestamp(announcement.endsAt) ?? Number.POSITIVE_INFINITY;
 }
-export function evaluateMaintainerAnnouncements(params) {
+function evaluateMaintainerAnnouncements(params) {
     const nowMs = params?.nowMs ?? Date.now();
     const enabledProviders = params?.enabledProviders ?? "auto";
     // "auto" is unresolved provider scope here; provider-targeted announcements require
@@ -98,9 +92,6 @@ export function evaluateMaintainerAnnouncements(params) {
         return a.announcement.id.localeCompare(b.announcement.id);
     });
 }
-export function getActiveMaintainerAnnouncements(params) {
-    return evaluateMaintainerAnnouncements(params).filter((evaluation) => evaluation.active);
-}
 export function getMaintainerAnnouncementsSummary(params) {
     const announcements = params?.announcements ?? BUNDLED_MAINTAINER_ANNOUNCEMENTS;
     const evaluations = evaluateMaintainerAnnouncements({ ...params, announcements });
@@ -116,13 +107,5 @@ export function getMaintainerAnnouncementsSummary(params) {
         activeAnnouncements,
         evaluations,
     };
-}
-export function formatMaintainerAnnouncementHomeCountLine(activeCount) {
-    if (activeCount <= 0)
-        return "";
-    if (activeCount === 1) {
-        return "Notice: Maintainer announcement available. Run /quota_announcements.";
-    }
-    return `Notice: ${activeCount} maintainer announcements available. Run /quota_announcements.`;
 }
 //# sourceMappingURL=maintainer-announcements.js.map

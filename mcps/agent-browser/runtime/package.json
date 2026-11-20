@@ -1,0 +1,7 @@
+{
+  "name": "opencode-agent-browser-runtime",
+  "private": true,
+  "dependencies": {
+    "agent-browser": "0.43.0"
+  }
+}

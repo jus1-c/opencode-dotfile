@@ -55,8 +55,14 @@ func validateManifest(item component, componentPlan plannedComponent, stage stri
 	if err != nil {
 		return stageManifest{}, fmt.Errorf("protected paths: %w", err)
 	}
-	if len(allowed) == 0 {
+	if len(allowed) == 0 && item.Source.Type == "" {
 		return stageManifest{}, errors.New("component has no allowed update paths")
+	}
+	if len(allowed) == 0 {
+		allowed = paths
+	}
+	if item.Source.Type == "script" {
+		protected = append(protected, "component-updater")
 	}
 	for _, path := range paths {
 		if !withinAny(path, allowed) {
@@ -75,7 +81,7 @@ func validateManifest(item component, componentPlan plannedComponent, stage stri
 		if info, err := os.Lstat(current); err == nil && info.Mode()&os.ModeSymlink != 0 {
 			return stageManifest{}, fmt.Errorf("target path is symbolic: %s", path)
 		} else if err == nil {
-			if err := assertSafeTree(componentPlan.Target, current); err != nil {
+			if err := assertSafeTree(componentPlan.Target, current, true); err != nil {
 				return stageManifest{}, fmt.Errorf("target path %s: %w", path, err)
 			}
 		} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -87,7 +93,7 @@ func validateManifest(item component, componentPlan plannedComponent, stage stri
 		if err != nil {
 			return stageManifest{}, err
 		}
-		if err := assertSafeTree(stage, staged); err != nil {
+		if err := assertSafeTree(stage, staged, componentPlan.ResultSource == "backup"); err != nil {
 			return stageManifest{}, fmt.Errorf("staged path %s: %w", path, err)
 		}
 	}
@@ -200,7 +206,7 @@ func assertNoSymlinkParents(root, path string) error {
 	return nil
 }
 
-func assertSafeTree(root, path string) error {
+func assertSafeTree(root, path string, allowInternalLinks bool) error {
 	if err := assertNoSymlinkParents(root, path); err != nil {
 		return err
 	}
@@ -213,12 +219,15 @@ func assertSafeTree(root, path string) error {
 			return err
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("symbolic entry: %s", current)
+			if !allowInternalLinks {
+				return fmt.Errorf("symbolic entry: %s", current)
+			}
+			return nil
 		}
 		if !info.IsDir() && !info.Mode().IsRegular() {
 			return fmt.Errorf("unsupported entry: %s", current)
 		}
-		if info.Mode().IsRegular() && hasExternalHardlink(info) {
+		if !allowInternalLinks && info.Mode().IsRegular() && hasExternalHardlink(info) {
 			return fmt.Errorf("hardlinked file: %s", current)
 		}
 		return nil

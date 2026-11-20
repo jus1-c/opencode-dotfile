@@ -5,9 +5,10 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 
-UV = os.path.expanduser("~/.local/bin/uv")
+UV = "uv"
 
 
 def fail(message):
@@ -84,6 +85,30 @@ def reject_links(root):
         fail("staged tree contains symbolic links: " + ", ".join(links))
 
 
+def compile_requirements(stage, python):
+    command = [
+        UV, "pip", "compile", "--quiet", "--python", python,
+        "--generate-hashes", "--output-file", "requirements.lock", "requirements.in",
+    ]
+    # shortcut: upstream markitdown needs an azure prerelease; declare it so
+    # --prerelease explicit keeps every other package on stable releases.
+    with tempfile.TemporaryDirectory() as directory:
+        constraint = Path(directory) / "constraints.txt"
+        constraint.write_text("azure-ai-contentunderstanding>=1.2.0b1\n")
+        first = subprocess.run(
+            [str(value) for value in [*command, "--prerelease", "explicit", "--constraint", str(constraint)]],
+            cwd=stage, capture_output=True, text=True,
+        )
+    if first.returncode == 0:
+        return
+    second = subprocess.run(
+        [str(value) for value in [*command, "--prerelease", "allow"]],
+        cwd=stage, capture_output=True, text=True,
+    )
+    if second.returncode != 0:
+        fail(f"dependency resolution failed: {(second.stdout + second.stderr)[-800:]}")
+
+
 def update(config, target):
     stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
     pattern, current, _ = requirement(target, config["distribution"])
@@ -93,20 +118,8 @@ def update(config, target):
     if count != 1:
         fail("expected one primary Git requirement")
     (stage / "requirements.in").write_text(requirements)
-    python = config["python"]
-    run(
-        UV,
-        "pip",
-        "compile",
-        "--quiet",
-        "--python",
-        python,
-        "--generate-hashes",
-        "--output-file",
-        "requirements.lock",
-        "requirements.in",
-        cwd=stage,
-    )
+    python = output(UV, "python", "find", config["python"])
+    compile_requirements(stage, python)
     run(python, "-m", "venv", "--copies", stage / ".venv")
     (stage / ".venv/lib64").unlink(missing_ok=True)
     run(
@@ -161,7 +174,7 @@ def healthcheck(config, target):
                 fail(f"staged shebang contains temporary path: {path.name}")
 
 
-CONFIG = {'distribution': 'markitdown-mcp', 'python': 'python3.10', 'modules': ['markitdown_mcp', 'markitdown']}
+CONFIG = {'distribution': 'markitdown-mcp', 'python': '3.10', 'modules': ['markitdown_mcp', 'markitdown']}
 
 
 def main():

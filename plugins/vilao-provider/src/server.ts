@@ -101,7 +101,16 @@ async function refreshCatalog(input: {
   }
 }
 
-function toProviderModel(model: VilaoModelConfig): Model {
+const REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+
+function reasoningVariants(): Record<string, Record<string, unknown>> {
+  return Object.fromEntries(REASONING_EFFORTS.map((effort) => [
+    effort,
+    { reasoningEffort: effort },
+  ]));
+}
+
+export function toProviderModel(model: VilaoModelConfig): Model {
   const vision = model.modalities?.input.includes("image") ?? false;
   return {
     id: model.id,
@@ -116,7 +125,7 @@ function toProviderModel(model: VilaoModelConfig): Model {
     limit: model.limit ?? { context: 400_000, output: 32_000 },
     capabilities: {
       temperature: true,
-      reasoning: model.reasoning ?? false,
+      reasoning: model.reasoning ?? true,
       attachment: vision,
       toolcall: model.tool_call ?? false,
       input: { text: true, audio: false, image: vision, video: false, pdf: false },
@@ -124,7 +133,7 @@ function toProviderModel(model: VilaoModelConfig): Model {
       interleaved: false,
     },
     release_date: "",
-    variants: {},
+    variants: reasoningVariants(),
   };
 }
 
@@ -209,7 +218,15 @@ export const VilaoProviderPlugin: Plugin = async ({ client }) => ({
 
     config.provider ??= {};
     const existing = asRecord(config.provider[PROVIDER_ID]);
-    const models = applyOverrides(catalog.models, await readOverrides());
+    const models = Object.fromEntries(Object.entries(applyOverrides(catalog.models, await readOverrides())).map(([id, model]) => {
+      const providerModel = toProviderModel(model);
+      return [id, {
+        ...model,
+        reasoning: providerModel.capabilities.reasoning,
+        limit: providerModel.limit,
+        variants: providerModel.variants,
+      }];
+    }));
     config.provider[PROVIDER_ID] = {
       ...existing,
       name: clean(existing.name) ?? DISPLAY_NAME,

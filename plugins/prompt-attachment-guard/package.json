@@ -1,0 +1,8 @@
+{
+  "name": "opencode-prompt-attachment-guard",
+  "version": "0.1.0",
+  "description": "Drops oversized @file attachments before resolution and leaves them as plain text, avoiding the OpenCode prompt 500",
+  "type": "module",
+  "main": "server.js",
+  "private": true
+}

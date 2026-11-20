@@ -1,0 +1,445 @@
+/** Alibaba's Token Plan and Coding Plan, from the official `bl` CLI; separate providers keep their row ids apart. */
+import { createHash } from "node:crypto";
+import { WINDOWS } from "../core/windows.js";
+import { ALIBABA_TOKEN_PLAN_ARGS, alibabaCredentialHalves, CODING_PLAN_SPAWN_KINDS, isAlibabaTokenPlanSupportedPlatform, NO_QUOTA_DATA_HINT, NO_WINDOW_DATA_HINT, parseAlibabaCodingPlanUsageJson, parseAlibabaTokenPlanUsageJson, queryAlibabaReply, queryAlibabaTokenPlanSeats, resolveAlibabaIdentity, USAGE_SPAWN_KINDS, } from "../lib/alibaba.js";
+import { isCanonicalProviderAvailable } from "../lib/provider-availability.js";
+import { normalizeQuotaProviderId } from "../lib/provider-metadata.js";
+import { modelProviderMatchesRuntimeId } from "../lib/provider-model-matching.js";
+import { accountingDecimalFromNumber } from "./accounting-decimal.js";
+import { resolvedCredentialPolicy } from "./cache-policies.js";
+import { failedAccount, FIVE_HOUR, keySlug, MONTHLY, WEEKLY, windowRows, } from "./contract.js";
+import { statusDetailsFromRecord } from "./result-helpers.js";
+function failureResult(error, debug) {
+    return { ok: false, kind: error.kind, message: error.message, facts: error.facts, debug };
+}
+const TOKEN_PLAN_LABEL = "Alibaba Token Plan";
+function withSuffix(label, suffix) {
+    return `${label} (${suffix})`;
+}
+const CREDIT_UNIT = { kind: "count", unit: "credit" };
+/** Credits carry six decimals; a difference of two would otherwise show binary noise past them. */
+const CREDIT_DECIMALS = 6;
+function amountOf(value, unit) {
+    return { decimal: accountingDecimalFromNumber(value), unit };
+}
+function creditAmount(value) {
+    const factor = 10 ** CREDIT_DECIMALS;
+    return amountOf(Math.round(value * factor) / factor, CREDIT_UNIT);
+}
+/**
+ * A number of calendar months back, clamped to that month's last day: a cycle ends on the next
+ * month's corresponding day at 23:59:59 (UTC+8), or on that month's last day when it has none.
+ */
+function calendarMonthsBefore(resetMs, months) {
+    const reset = new Date(resetMs);
+    const monthIndex = reset.getUTCFullYear() * 12 + reset.getUTCMonth() - months;
+    const year = Math.floor(monthIndex / 12);
+    const month = monthIndex - year * 12;
+    const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+    const day = Math.min(reset.getUTCDate(), lastDay);
+    return Date.UTC(year, month, day, reset.getUTCHours(), reset.getUTCMinutes(), reset.getUTCSeconds(), reset.getUTCMilliseconds());
+}
+function windowStartIso(window, resetsAt) {
+    if (resetsAt === undefined)
+        return undefined;
+    const resetMs = Date.parse(resetsAt);
+    if (!Number.isFinite(resetMs))
+        return undefined;
+    const lengthMs = WINDOWS[window].lengthMs;
+    const startMs = lengthMs !== undefined ? resetMs - lengthMs : calendarMonthsBefore(resetMs, 1);
+    return new Date(startMs).toISOString();
+}
+const HOUR_MS = 60 * 60_000;
+const DAY_MS = 24 * HOUR_MS;
+/** The length of one unit the CLI's field names use; a month has no fixed length. */
+const TOKEN_PLAN_UNIT_MS = {
+    Hour: HOUR_MS,
+    Day: DAY_MS,
+    Week: 7 * DAY_MS,
+    Month: undefined,
+};
+/** The short label of one unit, after the count: `2d`, `3h`. */
+const TOKEN_PLAN_UNIT_SHORT = {
+    Hour: "h",
+    Day: "d",
+    Week: "w",
+    Month: "mo",
+};
+/** The CLI's windows that are exactly one of the repo's windows, and the slot for each. */
+const TOKEN_PLAN_SLOTS = [
+    ["per1Hour", { key: "hour", label: WINDOWS.hour.label, window: "hour" }],
+    ["per5Hour", FIVE_HOUR],
+    ["per1Day", { key: "day", label: WINDOWS.day.label, window: "day" }],
+    ["per1Week", WEEKLY],
+    ["per1Month", MONTHLY],
+];
+/**
+ * The slot for the CLI's window. A window that is exactly one of the repo's windows takes that
+ * window; any other window (`per2Day`, `per3Hour`) gets its own key from its count and unit, and
+ * no repo window, so it never borrows another window's length, label or reset notice. A count
+ * below 1 names no window.
+ */
+function tokenPlanSlot(window) {
+    const known = TOKEN_PLAN_SLOTS.find(([key]) => key === window.key)?.[1];
+    if (known)
+        return known;
+    if (!Number.isSafeInteger(window.count) || window.count < 1)
+        return undefined;
+    return {
+        key: `${window.count}_${window.unit.toLowerCase()}`,
+        label: `${window.count}${TOKEN_PLAN_UNIT_SHORT[window.unit]}`,
+    };
+}
+/** When the window began: its count of units before the reset. Undefined without a reset time,
+ * or when the start is not a real date. */
+function tokenPlanWindowStartIso(window) {
+    if (window.resetTimeIso === undefined)
+        return undefined;
+    const resetMs = Date.parse(window.resetTimeIso);
+    if (!Number.isFinite(resetMs))
+        return undefined;
+    const unitMs = TOKEN_PLAN_UNIT_MS[window.unit];
+    // The CLI reports when the window refreshes; a billing month started a calendar month
+    // before its reset.
+    const startMs = unitMs !== undefined
+        ? resetMs - window.count * unitMs
+        : calendarMonthsBefore(resetMs, window.count);
+    const start = new Date(startMs);
+    return Number.isFinite(start.getTime()) ? start.toISOString() : undefined;
+}
+/** One row for each window the CLI reported a usage ratio for, in the shared row shape. */
+function tokenPlanWindowRows(windows) {
+    return windows.flatMap((window) => {
+        const slot = tokenPlanSlot(window);
+        if (!slot || window.percentRemaining === undefined)
+            return [];
+        const startedAtIso = tokenPlanWindowStartIso(window);
+        return [
+            {
+                // The row key names the half of the plan; the slot's key names the window.
+                key: `personal.${slot.key}`,
+                label: slot.label,
+                type: "quota",
+                method: "local_cli",
+                authority: "provider_reported",
+                prominence: "primary",
+                ...(slot.window !== undefined ? { window: slot.window } : {}),
+                percentRemaining: window.percentRemaining,
+                ...(window.resetTimeIso !== undefined ? { resetsAt: window.resetTimeIso } : {}),
+                ...(startedAtIso !== undefined ? { windowStartedAt: startedAtIso } : {}),
+            },
+        ];
+    });
+}
+/** The windows the reply carried, the way the Coding Plan names them. */
+function tokenPlanWindowsText(windows) {
+    const names = tokenPlanWindowNames(windows);
+    return names.length > 0 ? names.join(",") : "(none)";
+}
+function tokenPlanWindowNames(windows) {
+    return windows.flatMap((window) => {
+        const slot = tokenPlanSlot(window);
+        return slot ? [slot.key] : [];
+    });
+}
+/**
+ * Why a window has no row, for `/quota_status`. Every window without a ratio: the reply carried
+ * no quota data. Some windows without one: those windows, by name, carried none.
+ */
+function tokenPlanNoDataDetails(windows, hasQuotaData) {
+    const withoutRatio = windows.filter((window) => window.percentRemaining === undefined);
+    // The CLI's own flag says whether a window carried a ratio; an older CLI sends none, and
+    // then the windows say it.
+    if (hasQuotaData === false || withoutRatio.length === windows.length) {
+        return [{ key: "window_hint", value: NO_QUOTA_DATA_HINT }];
+    }
+    const names = tokenPlanWindowNames(withoutRatio);
+    if (names.length === 0)
+        return [];
+    return [
+        { key: "window_hint", value: NO_WINDOW_DATA_HINT },
+        { key: "no_data_windows", value: names.join(",") },
+    ];
+}
+function seatRow(seat, key) {
+    // Only `percentRemaining` or `amount` satisfy `core/validate.ts`, and both need a surplus.
+    const hasValue = seat.percentRemaining !== undefined || seat.surplus !== undefined;
+    return {
+        key: `team.${key}`,
+        label: "Credits",
+        type: "quota",
+        method: "local_cli",
+        authority: "provider_reported",
+        prominence: "primary",
+        window: "month",
+        ...(seat.percentRemaining !== undefined ? { percentRemaining: seat.percentRemaining } : {}),
+        ...(seat.total !== undefined ? { limit: creditAmount(seat.total) } : {}),
+        ...(seat.surplus !== undefined ? { amount: creditAmount(seat.surplus) } : {}),
+        ...(seat.used !== undefined ? { used: creditAmount(seat.used) } : {}),
+        ...(seat.resetsAt !== undefined ? { resetsAt: seat.resetsAt } : {}),
+        // A seat's cycle is 30 days, not a calendar month, so the span needs the cycle's own start.
+        ...(seat.startedAt !== undefined ? { windowStartedAt: seat.startedAt } : {}),
+        ...(hasValue ? {} : { text: "no usage reported" }),
+    };
+}
+function seatKeys(seats) {
+    const namesBySlug = new Map();
+    for (const seat of seats) {
+        const slug = keySlug(seat.name);
+        if (!slug)
+            continue;
+        const owners = namesBySlug.get(slug) ?? new Set();
+        owners.add(seat.name);
+        namesBySlug.set(slug, owners);
+    }
+    return seats.map((seat) => {
+        const slug = keySlug(seat.name);
+        // A name digest is order-free; a plain slug is only safe while one name owns it.
+        if (slug && namesBySlug.get(slug)?.size === 1)
+            return slug;
+        const digest = createHash("sha256").update(seat.name).digest("hex").slice(0, 8);
+        return `${slug || "seat"}_${digest}`;
+    });
+}
+const CODING_PLAN_LABEL = "Alibaba Coding Plan";
+/** The quota is requests: the CLI counts requests, not credits or tokens. */
+const REQUEST_UNIT = { kind: "count", unit: "request" };
+const WINDOW_SLOTS = [
+    ["fiveHour", FIVE_HOUR],
+    ["weekly", WEEKLY],
+    ["monthly", MONTHLY],
+];
+function codingPlanWindowRows(usage) {
+    const slots = WINDOW_SLOTS.flatMap(([name, slot]) => {
+        const window = usage[name];
+        if (!window)
+            return [];
+        // The CLI reports when the window refreshes; a billing month's start is a calendar month back.
+        const startedAt = windowStartIso(slot.window, window.resetTimeIso);
+        return [
+            {
+                slot,
+                value: {
+                    percentRemaining: window.percentRemaining,
+                    used: amountOf(window.used, REQUEST_UNIT),
+                    limit: amountOf(window.limit, REQUEST_UNIT),
+                    ...(window.resetTimeIso !== undefined ? { resetTimeIso: window.resetTimeIso } : {}),
+                    ...(startedAt !== undefined ? { fixedWindow: { startedAtIso: startedAt } } : {}),
+                },
+            },
+        ];
+    });
+    return windowRows(slots, "local_cli");
+}
+function codingPlanWindowsText(usage) {
+    if (!usage)
+        return "(none)";
+    const keys = WINDOW_SLOTS.flatMap(([name, slot]) => (usage[name] ? [slot.key] : []));
+    return keys.length > 0 ? keys.join(",") : "(none)";
+}
+/** The setup keys, reported once by the first command; any failure but a missing executable means it exists. */
+function setupDetails(first) {
+    return statusDetailsFromRecord({
+        cli_available: !first.ok && first.kind === "executable_not_found" ? "false" : "true",
+        platform: process.platform,
+    });
+}
+function commandDebug(results) {
+    const [first] = results;
+    if (!first)
+        return [];
+    return [
+        ...setupDetails(first),
+        ...(first.ok ? [] : [{ key: "failure_kind", value: first.kind }]),
+        ...results.flatMap((result) => result.debug),
+    ];
+}
+async function runAlibabaCommand(command, options) {
+    if (command.read)
+        return await command.read(options);
+    const reply = await queryAlibabaReply({
+        args: command.args,
+        kinds: command.kinds,
+        ...options,
+    });
+    return reply.ok ? command.parse(reply.text) : failureResult(reply.error, []);
+}
+/**
+ * The account the readings belong to: the access key id, which does not rotate. The console
+ * token's mask is the fallback, but the CLI replaces that token when it expires.
+ */
+function alibabaAccountPrincipal(markers) {
+    if (markers.openapiAccessKeyId) {
+        return { credential: markers.openapiAccessKeyId, principalKind: "stable-id" };
+    }
+    if (markers.consoleMasked) {
+        return { credential: markers.consoleMasked, principalKind: "credential" };
+    }
+    return null;
+}
+function alibabaRequestTimeoutMs(ctx) {
+    return ctx.config?.requestTimeoutMsConfigured ? ctx.config.requestTimeoutMs : undefined;
+}
+function createAlibabaProvider(spec) {
+    const cachePolicy = resolvedCredentialPolicy(spec.id, async (ctx) => {
+        const markers = await resolveAlibabaIdentity({
+            requestTimeoutMs: alibabaRequestTimeoutMs(ctx),
+            runtime: { cwd: ctx.workspaceRoot },
+        });
+        // No credential at all: there is no account to key a slot on.
+        return markers ? alibabaAccountPrincipal(markers) : null;
+    });
+    return {
+        id: spec.id,
+        cachePolicy,
+        // Never probes PATH: availability comes from selection or the current runtime identity.
+        async isAvailable(ctx) {
+            if (!isAlibabaTokenPlanSupportedPlatform())
+                return false;
+            const selected = await isCanonicalProviderAvailable({
+                ctx,
+                providerId: spec.id,
+                fallbackOnError: false,
+            });
+            if (selected || ctx.config.currentProviderID === spec.id)
+                return true;
+            const currentModel = ctx.config.currentModel;
+            return !!currentModel && modelProviderMatchesRuntimeId(currentModel, spec.id);
+        },
+        matchesCurrentModel(model, context) {
+            if (context?.currentProviderID) {
+                // Every accepted spelling normalises to this id, so `-cn` and `alibaba` match too.
+                return normalizeQuotaProviderId(context.currentProviderID) === spec.id;
+            }
+            return modelProviderMatchesRuntimeId(model, spec.id);
+        },
+        async fetch(ctx) {
+            const runtime = { cwd: ctx.workspaceRoot };
+            const requestTimeoutMs = alibabaRequestTimeoutMs(ctx);
+            // Independent commands with different auth: run them all, and let each report its own failure.
+            const results = await Promise.all(spec.commands.map((command) => runAlibabaCommand(command, { runtime, requestTimeoutMs })));
+            // Read after the commands, so an account switched while they ran shows in the store's identity
+            // re-check, which reuses this read.
+            const markers = await resolveAlibabaIdentity({ requestTimeoutMs, runtime, fresh: true });
+            const debug = commandDebug(results);
+            const [first] = results;
+            if (!first)
+                return { attempted: false, accounts: [], debug };
+            if (!first.ok && first.kind === "unsupported_platform") {
+                return { attempted: false, accounts: [], debug };
+            }
+            // Gate here: an account with no rows and no errors is invisible to rows.ts, so nothing backs
+            // off a capability the user lacks. Suppress a failure, never data; the marker can lag behind.
+            const halves = alibabaCredentialHalves(markers);
+            const accounts = [];
+            for (const [index, result] of results.entries()) {
+                const command = spec.commands[index];
+                if (!command)
+                    continue;
+                if (!halves[command.half] && !(result.ok && result.accounts.length > 0))
+                    continue;
+                if (result.ok) {
+                    accounts.push(...result.accounts);
+                }
+                else {
+                    accounts.push(failedAccount(command.failureAccount ?? spec.label, result.message, result.facts));
+                }
+            }
+            // Every command answered and none had anything to show, such as the Coding Plan's `{}`: an
+            // answer, so it clears the last rows rather than reading as no data.
+            const empty = accounts.length === 0 && results.every((result) => result.ok);
+            return { attempted: true, accounts, debug, ...(empty ? { empty: true } : {}) };
+        },
+    };
+}
+const TOKEN_PLAN_COMMANDS = [
+    {
+        half: "console",
+        args: ALIBABA_TOKEN_PLAN_ARGS,
+        failureAccount: withSuffix(TOKEN_PLAN_LABEL, "personal"),
+        kinds: USAGE_SPAWN_KINDS,
+        parse(text) {
+            const result = parseAlibabaTokenPlanUsageJson(text);
+            if (!result.ok)
+                return failureResult(result.error, []);
+            const rows = tokenPlanWindowRows(result.windows);
+            return {
+                ok: true,
+                accounts: rows.length > 0
+                    ? [
+                        {
+                            name: withSuffix(TOKEN_PLAN_LABEL, "personal"),
+                            rows,
+                            errors: [],
+                        },
+                    ]
+                    : [],
+                debug: [
+                    ...statusDetailsFromRecord({ windows: tokenPlanWindowsText(result.windows) }),
+                    ...tokenPlanNoDataDetails(result.windows, result.hasQuotaData),
+                ],
+            };
+        },
+    },
+    {
+        half: "openapi",
+        failureAccount: `${TOKEN_PLAN_LABEL} (team)`,
+        async read(options) {
+            // The lib owns the seat argv, so the command and the pages it reads cannot drift apart.
+            const result = await queryAlibabaTokenPlanSeats(options);
+            if (!result.ok) {
+                return failureResult(result.error, [
+                    { key: "seat_failure_kind", value: result.error.kind },
+                ]);
+            }
+            const keys = seatKeys(result.seats);
+            return {
+                ok: true,
+                accounts: result.seats.map((seat, index) => ({
+                    name: withSuffix(TOKEN_PLAN_LABEL, seat.name),
+                    rows: [seatRow(seat, keys[index] ?? "seat")],
+                    errors: [],
+                })),
+                debug: result.seats.length > 0 ? [{ key: "seat_windows", value: "credits" }] : [],
+            };
+        },
+    },
+];
+export const alibabaTokenPlanProvider = createAlibabaProvider({
+    id: "alibaba-token-plan",
+    label: TOKEN_PLAN_LABEL,
+    commands: TOKEN_PLAN_COMMANDS,
+});
+const CODING_PLAN_COMMANDS = [
+    {
+        half: "console",
+        args: ["usage", "coding-plan", "--output", "json"],
+        failureAccount: CODING_PLAN_LABEL,
+        kinds: CODING_PLAN_SPAWN_KINDS,
+        parse(text) {
+            const result = parseAlibabaCodingPlanUsageJson(text);
+            if (!result.ok)
+                return failureResult(result.error, []);
+            // `{}` is the CLI's "this account has no Coding Plan": an absence, not an error.
+            return {
+                ok: true,
+                accounts: result.usage
+                    ? [
+                        {
+                            name: CODING_PLAN_LABEL,
+                            rows: codingPlanWindowRows(result.usage),
+                            errors: [],
+                        },
+                    ]
+                    : [],
+                debug: statusDetailsFromRecord({ windows: codingPlanWindowsText(result.usage) }),
+            };
+        },
+    },
+];
+export const alibabaCodingPlanProvider = createAlibabaProvider({
+    id: "alibaba-coding-plan",
+    label: CODING_PLAN_LABEL,
+    commands: CODING_PLAN_COMMANDS,
+});
+//# sourceMappingURL=alibaba.js.map

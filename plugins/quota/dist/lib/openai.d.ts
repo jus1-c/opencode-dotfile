@@ -1,51 +1,70 @@
 /**
  * OpenAI (ChatGPT) quota fetcher
  *
- * Uses OpenCode's auth.json native OpenCode OAuth entries and queries:
+ * Reads OpenCode's OpenAI OAuth logins and queries
  * https://chatgpt.com/backend-api/wham/usage
  */
-import type { AuthData, QuotaError } from "./types.js";
+import type { FixedWindowProjectionEvidence } from "./entries.js";
+import { type CredentialRow } from "./opencode-auth.js";
+import { type ResolvedAuthIdentity } from "./resolved-auth-identity.js";
+import type { QuotaError } from "./types.js";
+type OpenAIWindowKind = "hourly" | "weekly" | "monthly";
 type OpenAIWindowValue = {
     percentRemaining: number;
     resetTimeIso?: string;
+    fixedWindow?: FixedWindowProjectionEvidence;
 };
-export declare const DEFAULT_OPENAI_AUTH_CACHE_MAX_AGE_MS = 5000;
-export declare const OPENAI_AUTH_SOURCE_KEYS: readonly ["openai", "codex", "chatgpt", "opencode"];
-export type OpenAIAuthSourceKey = (typeof OPENAI_AUTH_SOURCE_KEYS)[number];
+type OpenAIWindows = Partial<Record<OpenAIWindowKind | "codeReview", OpenAIWindowValue>>;
+export declare const OPENAI_AUTH_SOURCE_KEYS: readonly ["openai", "codex", "chatgpt"];
+type OpenAIAuthSourceKey = (typeof OPENAI_AUTH_SOURCE_KEYS)[number];
+export type OpenAICredits = {
+    balance?: string;
+    unlimited?: boolean;
+};
 export type OpenAIResult = {
     success: true;
     label: string;
-    email?: string;
-    windows: {
-        hourly?: OpenAIWindowValue;
-        weekly?: OpenAIWindowValue;
-        monthly?: OpenAIWindowValue;
-        codeReview?: OpenAIWindowValue;
-    };
-    credits?: {
-        hasCredits: boolean;
-        unlimited: boolean;
-        balance: string | null;
-    };
-} | QuotaError | null;
-export type ResolvedOpenAIOAuth = {
-    state: "none";
+    windows: OpenAIWindows;
+    credits?: OpenAICredits;
+} | QuotaError;
+/** A stored OpenAI login: one OpenCode could not return, or one with an access token. */
+export type OpenAIOAuthLogin = {
+    state: "failed";
+    sourceKey: OpenAIAuthSourceKey;
+    error: string;
 } | {
     state: "configured";
     sourceKey: OpenAIAuthSourceKey;
     accessToken: string;
     refreshToken?: string;
     expiresAt?: number;
-    email?: string;
     accountId?: string;
 };
-export declare function resolveOpenAIOAuth(auth: AuthData | null | undefined): ResolvedOpenAIOAuth;
-export declare function hasOpenAIOAuth(auth: AuthData | null | undefined): boolean;
-export declare function hasOpenAIOAuthCached(params?: {
-    maxAgeMs?: number;
-}): Promise<boolean>;
-export declare function queryOpenAIQuota(options?: {
+type ResolvedOpenAIOAuth = {
+    state: "none";
+} | OpenAIOAuthLogin;
+/** One row's OpenAI sign-in: `none` for a row that is not an OAuth login or has no token. */
+export declare function resolveOpenAIOAuth(row: CredentialRow): ResolvedOpenAIOAuth;
+/**
+ * The login OpenCode reports as active, the first of `openai`, `codex`, `chatgpt` with a token
+ * or a resolve error (cached briefly).
+ */
+export declare function readOpenAIAuthCached(): Promise<ResolvedOpenAIOAuth>;
+/** A stored OpenAI login (OAuth or API key) with its OAuth sign-in, when it has one. */
+export type OpenAILogin = {
+    row: CredentialRow;
+    oauth?: OpenAIOAuthLogin;
+};
+/** Every stored OpenAI login, OAuth and API key; a failed one stays so it shows as an error. */
+export declare function readOpenAILogins(): Promise<OpenAILogin[]>;
+/**
+ * Who OpenAI is signed in as: each OAuth sign-in's account (or token), and each other login by
+ * its connection, since its rows do not depend on a secret. A failed login can't be told apart.
+ */
+export declare function openaiLoginsIdentity(logins: readonly OpenAILogin[]): Promise<ResolvedAuthIdentity | null>;
+export declare function queryOpenAIQuota(options: {
+    auth: OpenAIOAuthLogin;
     requestTimeoutMs?: number;
+    loginLabel?: string;
 }): Promise<OpenAIResult>;
 export {};
-//# sourceMappingURL=openai.d.ts.map

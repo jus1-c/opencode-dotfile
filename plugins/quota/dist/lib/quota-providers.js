@@ -1,17 +1,48 @@
 import { isIP } from "node:net";
+import { codePointLength, LABEL_MAX_CODE_POINTS } from "../core/validate.js";
+import { classifyWindow } from "../core/windows.js";
+import { daysInMonth } from "./calendar-date.js";
+import { isRecord } from "./json-guards.js";
 import { lookupCost } from "./modelsdev-pricing.js";
-import { getQuotaProviderShape } from "./provider-metadata.js";
-import { resolvePricingKey } from "./quota-stats.js";
+import { priceMessage } from "./pricing-key.js";
+import { getCanonicalQuotaProviderId } from "./provider-metadata.js";
+import { emptyTokenBuckets } from "./token-buckets.js";
 export const QUOTA_PROVIDER_REMOTE_FORMATS = ["quota-v1", "openrouter-key-v1", "json-v1"];
 export const QUOTA_PROVIDER_MODES = ["remote-api", "local-estimate"];
 export const QUOTA_PROVIDER_WINDOW_TYPES = ["utc-day", "rolling"];
 export const QUOTA_PROVIDERS_AGGREGATE_ID = "quota-providers";
-export const MAINTAINED_LOCAL_ESTIMATE_IDS = ["qwen-code", "alibaba-coding-plan"];
-export function isMaintainedQuotaProviderTuning(definition) {
-    return MAINTAINED_LOCAL_ESTIMATE_IDS.includes(definition.id);
+/**
+ * The built-in of this id reads the official CLI now, so a leftover tuning tunes nothing: it is
+ * ignored rather than left to collide with the built-in, which would void every other definition.
+ */
+export function isRetiredEstimateTuning(definition) {
+    return definition.mode === "local-estimate" && definition.id === "alibaba-coding-plan";
 }
+/**
+ * The custom definitions that run: not switched off. A switched-off definition is never fetched
+ * and its key is never sent.
+ */
 export function customQuotaProviderDefinitions(definitions) {
-    return definitions.filter((definition) => !isMaintainedQuotaProviderTuning(definition));
+    return definitions.filter((definition) => definition.enabled !== false && !isRetiredEstimateTuning(definition));
+}
+/** Hosts a plain-HTTP address may use without a warning: this computer only. */
+const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
+/**
+ * Where a remote custom provider sends its key, for the user to check before switching it on:
+ * the URL's origin and path (the scheme shows http or https), and where the key comes from.
+ * Never the key itself. `insecure` is true for plain HTTP to any host but localhost, 127.0.0.1
+ * or ::1. Null for a local estimate, which sends nothing.
+ */
+export function describeQuotaProviderRequest(definition) {
+    if (definition.mode !== "remote-api")
+        return null;
+    const url = new URL(definition.url);
+    const saved = `OpenCode's ${definition.providerId} key`;
+    return {
+        url: `${url.origin}${url.pathname}`,
+        key: definition.apiKeyEnv ? `${definition.apiKeyEnv}, else ${saved}` : saved,
+        insecure: url.protocol === "http:" && !LOCAL_HOSTNAMES.has(url.hostname),
+    };
 }
 export function resolveQuotaProviderSessionModelIdentity(params) {
     if (params.currentProviderID) {
@@ -25,6 +56,58 @@ export function resolveQuotaProviderSessionModelIdentity(params) {
     return {
         providerId: params.currentModel.slice(0, slashIndex),
         modelId: params.currentModel.slice(slashIndex + 1),
+    };
+}
+/** A short stable hash (32-bit FNV-1a, hex) that tells names apart in row keys. */
+function shortNameHash(text) {
+    let hash = 0x811c9dc5;
+    for (const char of text) {
+        hash ^= char.codePointAt(0) ?? 0;
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(16).padStart(8, "0");
+}
+const CUSTOM_ROW_KEY_MAX_LENGTH = 48;
+/**
+ * The row key a custom source's mapping or entry name gets: spaces become "_", and the name
+ * stays as it is when that leaves only letters, digits, "_" and "-" ("Daily limit" →
+ * "Daily_limit", "Daily-limit" → "Daily-limit"). Other characters are dropped and a short hash
+ * of the exact name is added, so names stay apart ("日次" → 8 hex digits).
+ */
+export function customRowKey(name) {
+    const spaced = name.trim().replace(/\s+/gu, "_");
+    const kept = spaced.replace(/[^A-Za-z0-9_-]/gu, "").slice(0, CUSTOM_ROW_KEY_MAX_LENGTH);
+    if (kept === spaced && /[A-Za-z0-9]/u.test(kept))
+        return kept;
+    const hash = shortNameHash(name.trim());
+    return /[A-Za-z0-9]/u.test(kept) ? `${kept}_${hash}` : hash;
+}
+/** ADR 0001: a custom `rate_limit` is a quota and `spend` is usage. */
+function customRowType(resultType) {
+    if (resultType === "rate_limit")
+        return "quota";
+    if (resultType === "spend")
+        return "usage";
+    return resultType;
+}
+/**
+ * One custom row. `key` is the part of its id after `custom.<definition id>.`; its label is the
+ * configured label without a trailing colon, or else its name; its window is the one its name
+ * or label names ("Daily" → day).
+ */
+export function customRow(params) {
+    const label = (params.label ?? "").replace(/:+$/u, "").trim();
+    const window = classifyWindow(params.name) ?? classifyWindow(label);
+    return {
+        key: params.key,
+        label: label || params.name,
+        type: customRowType(params.resultType),
+        method: params.method,
+        authority: params.method === "remote_api" ? "provider_reported" : "locally_derived",
+        prominence: "primary",
+        ...(window ? { window } : {}),
+        ...params.value,
+        ...(params.resetsAt ? { resetsAt: params.resetsAt } : {}),
     };
 }
 export function selectEligibleQuotaProviderDefinitions(params) {
@@ -45,9 +128,21 @@ export function selectEligibleQuotaProviderDefinitions(params) {
     return runtimeEligible.filter((definition) => definition.providerId === identity.providerId &&
         (definition.modelIds === undefined || definition.modelIds.includes(identity.modelId)));
 }
-const BASE_FIELDS = ["id", "providerId", "label", "mode", "modelIds"];
+const BASE_FIELDS = [
+    "id",
+    "providerId",
+    "label",
+    "mode",
+    "modelIds",
+    "enabled",
+    "minIntervalMs",
+];
 const REMOTE_FIELDS = [...BASE_FIELDS, "url", "format", "apiKeyEnv", "adapter"];
 const LOCAL_FIELDS = [...BASE_FIELDS, "windows", "pricingModelMap"];
+/** Every top-level field a definition can have, in either mode. */
+export const QUOTA_PROVIDER_FIELDS = [
+    ...new Set([...REMOTE_FIELDS, ...LOCAL_FIELDS]),
+];
 const WINDOW_FIELDS = [
     "id",
     "label",
@@ -65,22 +160,22 @@ const URL_WHITESPACE_OR_CONTROL_PATTERN = /[\s\p{Cc}]/u;
 const MODEL_FORBIDDEN_PATTERN = /[\s\p{Cc}#?]/u;
 const MAX_ID_LENGTH = 64;
 const MAX_PROVIDER_ID_LENGTH = 64;
-const MAX_LABEL_CODE_POINTS = 80;
 const MAX_ENV_NAME_LENGTH = 128;
 const MAX_WINDOWS = 16;
 const MAX_ROLLING_MINUTES = 366 * 24 * 60;
 const MAX_SAFE_REQUEST_LIMIT = 1_000_000_000;
 const MAX_USD_BUDGET = 1_000_000_000;
-export const JSON_V1_MAX_MAPPINGS = 16;
-export const JSON_V1_MAX_ADAPTER_DEPTH = 8;
-export const JSON_V1_MAX_ADAPTER_OBJECTS = 128;
-export const JSON_V1_MAX_ADAPTER_PROPERTIES = 384;
-export const JSON_V1_MAX_ADAPTER_ARRAY_ELEMENTS = 640;
-export const JSON_V1_MAX_PATH_SEGMENTS = 8;
-export const JSON_V1_MAX_PATH_SEGMENT_CODE_POINTS = 64;
-export const JSON_V1_MAX_STATIC_NAME_CODE_POINTS = 80;
-export const JSON_V1_MAX_STATIC_UNIT_CODE_POINTS = 32;
+const JSON_V1_MAX_MAPPINGS = 16;
+const JSON_V1_MAX_ADAPTER_DEPTH = 8;
+const JSON_V1_MAX_ADAPTER_OBJECTS = 128;
+const JSON_V1_MAX_ADAPTER_PROPERTIES = 384;
+const JSON_V1_MAX_ADAPTER_ARRAY_ELEMENTS = 640;
+const JSON_V1_MAX_PATH_SEGMENTS = 8;
+const JSON_V1_MAX_PATH_SEGMENT_CODE_POINTS = 64;
+const JSON_V1_MAX_STATIC_UNIT_CODE_POINTS = 32;
 export const JSON_V1_MAX_DISPLAY_CODE_POINTS = 160;
+/** Most items a reply's list may hold; each becomes its own row. */
+export const JSON_V1_MAX_ITEMS = 100;
 export const JSON_V1_MAX_NUMBER_MAGNITUDE = 1e15;
 const JSON_V1_FORBIDDEN_PATH_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
 const JSON_V1_DIVISORS = new Set([100, 1_000, 1_000_000]);
@@ -89,7 +184,7 @@ const JSON_V1_TIMESTAMP_ENCODINGS = new Set([
     "unix-seconds",
     "unix-milliseconds",
 ]);
-const JSON_V1_RESULT_TYPES = new Set([
+export const CUSTOM_RESULT_TYPES = new Set([
     "quota",
     "rate_limit",
     "usage",
@@ -100,9 +195,6 @@ const JSON_V1_RESULT_TYPES = new Set([
 ]);
 const JSON_V1_MIN_TIMESTAMP_MS = 0;
 const JSON_V1_MAX_TIMESTAMP_MS = 253_402_300_799_999;
-function isPlainObject(value) {
-    return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 function hasOwnKey(value, key) {
     return Object.hasOwn(value, key);
 }
@@ -124,15 +216,17 @@ function isPositiveInteger(value, max) {
 function isPositiveFinite(value, max) {
     return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= max;
 }
+/** The message for a label or name that is empty, too long or holds control characters. */
+const LABEL_LENGTH_MESSAGE = `expected 1-${LABEL_MAX_CODE_POINTS} printable Unicode code points after trimming`;
 function normalizeLabel(value, fallback) {
     if (value === undefined)
         return fallback ?? null;
     if (typeof value !== "string")
         return null;
     const normalized = value.trim();
-    const length = Array.from(normalized).length;
+    const length = codePointLength(normalized);
     if (length < 1 ||
-        length > MAX_LABEL_CODE_POINTS ||
+        length > LABEL_MAX_CODE_POINTS ||
         ASCII_OR_UNICODE_CONTROL_PATTERN.test(value)) {
         return null;
     }
@@ -180,21 +274,15 @@ function normalizeRemoteUrl(value) {
     return { value: parsed.toString() };
 }
 function cloneDefinition(definition) {
+    const modelIds = definition.modelIds ? { modelIds: [...definition.modelIds] } : {};
     if (definition.mode === "remote-api") {
         return definition.format === "json-v1"
-            ? {
-                ...definition,
-                ...(definition.modelIds ? { modelIds: [...definition.modelIds] } : {}),
-                adapter: structuredClone(definition.adapter),
-            }
-            : {
-                ...definition,
-                ...(definition.modelIds ? { modelIds: [...definition.modelIds] } : {}),
-            };
+            ? { ...definition, ...modelIds, adapter: structuredClone(definition.adapter) }
+            : { ...definition, ...modelIds };
     }
     return {
         ...definition,
-        ...(definition.modelIds ? { modelIds: [...definition.modelIds] } : {}),
+        ...modelIds,
         windows: definition.windows.map((window) => ({ ...window })),
         ...(definition.pricingModelMap ? { pricingModelMap: { ...definition.pricingModelMap } } : {}),
     };
@@ -259,7 +347,7 @@ function normalizeJsonV1StaticText(value, maxCodePoints) {
     if (typeof value !== "string" || JSON_V1_STATIC_DISPLAY_FORBIDDEN_PATTERN.test(value))
         return null;
     const normalized = value.trim();
-    const length = Array.from(normalized).length;
+    const length = codePointLength(normalized);
     return length >= 1 && length <= maxCodePoints ? normalized : null;
 }
 function validateJsonV1Path(value, key, issues) {
@@ -271,8 +359,8 @@ function validateJsonV1Path(value, key, issues) {
     for (let index = 0; index < value.length; index += 1) {
         const segment = value[index];
         if (typeof segment !== "string" ||
-            Array.from(segment).length < 1 ||
-            Array.from(segment).length > JSON_V1_MAX_PATH_SEGMENT_CODE_POINTS ||
+            codePointLength(segment) < 1 ||
+            codePointLength(segment) > JSON_V1_MAX_PATH_SEGMENT_CODE_POINTS ||
             ASCII_OR_UNICODE_CONTROL_PATTERN.test(segment) ||
             JSON_V1_FORBIDDEN_PATH_SEGMENTS.has(segment)) {
             adapterIssue(issues, `${key}[${index}]`, "expected a safe 1-64 code point property segment");
@@ -283,12 +371,6 @@ function validateJsonV1Path(value, key, issues) {
     return path.length === value.length ? path : undefined;
 }
 const JSON_V1_ISO_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/;
-function daysInMonth(year, month) {
-    if (month === 2) {
-        return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28;
-    }
-    return [4, 6, 9, 11].includes(month) ? 30 : 31;
-}
 export function normalizeJsonV1Timestamp(value, encoding) {
     let milliseconds;
     if (encoding === "iso-8601") {
@@ -338,7 +420,7 @@ export function normalizeJsonV1Timestamp(value, encoding) {
     return new Date(milliseconds).toISOString();
 }
 function validateJsonV1NumberSource(value, key, issues) {
-    if (!isPlainObject(value)) {
+    if (!isRecord(value)) {
         adapterIssue(issues, key, "expected a path or literal number source object");
         return undefined;
     }
@@ -377,7 +459,7 @@ function validateJsonV1NumberSource(value, key, issues) {
     return { literal: value.literal };
 }
 function validateJsonV1TextSource(value, key, issues) {
-    if (!isPlainObject(value)) {
+    if (!isRecord(value)) {
         adapterIssue(issues, key, "expected a path or literal text source object");
         return undefined;
     }
@@ -400,7 +482,7 @@ function validateJsonV1TextSource(value, key, issues) {
     return { literal };
 }
 function validateJsonV1TimestampSource(value, key, issues) {
-    if (!isPlainObject(value)) {
+    if (!isRecord(value)) {
         adapterIssue(issues, key, "expected a timestamp source object");
         return undefined;
     }
@@ -442,7 +524,7 @@ function requireLiteralNumber(source, key, issues, rule) {
     }
 }
 function validateJsonV1Metric(value, resultType, key, issues) {
-    if (!isPlainObject(value)) {
+    if (!isRecord(value)) {
         adapterIssue(issues, key, "expected a tagged metric object");
         return undefined;
     }
@@ -580,8 +662,8 @@ function validateJsonV1Metric(value, resultType, key, issues) {
             return undefined;
     }
 }
-function validateJsonV1Mapping(value, key, providerLabel, issues) {
-    if (!isPlainObject(value)) {
+function validateJsonV1Mapping(value, key, issues) {
+    if (!isRecord(value)) {
         adapterIssue(issues, key, "expected an object");
         return undefined;
     }
@@ -592,25 +674,21 @@ function validateJsonV1Mapping(value, key, providerLabel, issues) {
             adapterIssue(issues, `${key}.${field}`, "field is required");
     }
     const resultType = typeof value.resultType === "string" &&
-        JSON_V1_RESULT_TYPES.has(value.resultType)
+        CUSTOM_RESULT_TYPES.has(value.resultType)
         ? value.resultType
         : undefined;
     if (hasOwnKey(value, "resultType") && !resultType) {
         adapterIssue(issues, `${key}.resultType`, "expected a supported accounting result type");
     }
-    const name = normalizeJsonV1StaticText(value.name, JSON_V1_MAX_STATIC_NAME_CODE_POINTS);
+    const name = normalizeJsonV1StaticText(value.name, LABEL_MAX_CODE_POINTS);
     if (hasOwnKey(value, "name") && !name) {
-        adapterIssue(issues, `${key}.name`, `expected 1-${JSON_V1_MAX_STATIC_NAME_CODE_POINTS} printable Unicode code points after trimming`);
-    }
-    else if (name &&
-        Array.from(`${providerLabel} ${name}`).length > JSON_V1_MAX_DISPLAY_CODE_POINTS) {
-        adapterIssue(issues, `${key}.name`, `provider-prefixed name must not exceed ${JSON_V1_MAX_DISPLAY_CODE_POINTS} code points`);
+        adapterIssue(issues, `${key}.name`, LABEL_LENGTH_MESSAGE);
     }
     const label = value.label === undefined
         ? undefined
-        : normalizeJsonV1StaticText(value.label, JSON_V1_MAX_STATIC_NAME_CODE_POINTS);
+        : normalizeJsonV1StaticText(value.label, LABEL_MAX_CODE_POINTS);
     if (value.label !== undefined && !label) {
-        adapterIssue(issues, `${key}.label`, `expected 1-${JSON_V1_MAX_STATIC_NAME_CODE_POINTS} printable Unicode code points after trimming`);
+        adapterIssue(issues, `${key}.label`, LABEL_LENGTH_MESSAGE);
     }
     const unit = value.unit === undefined
         ? undefined
@@ -649,8 +727,8 @@ function validateJsonV1Mapping(value, key, providerLabel, issues) {
         metric,
     };
 }
-function validateJsonV1Adapter(value, key, providerLabel, issues) {
-    if (!isPlainObject(value)) {
+function validateJsonV1Adapter(value, key, issues) {
+    if (!isRecord(value)) {
         adapterIssue(issues, key, "expected an object");
         return undefined;
     }
@@ -671,10 +749,21 @@ function validateJsonV1Adapter(value, key, providerLabel, issues) {
         return undefined;
     }
     const mappings = [];
+    // Each mapping's rows are keyed by its name, so two names must not give one key.
+    const rowKeys = new Map();
     for (let index = 0; index < value.mappings.length; index += 1) {
-        const mapping = validateJsonV1Mapping(value.mappings[index], `${key}.mappings[${index}]`, providerLabel, issues);
-        if (mapping)
-            mappings.push(mapping);
+        const mapping = validateJsonV1Mapping(value.mappings[index], `${key}.mappings[${index}]`, issues);
+        if (!mapping)
+            continue;
+        mappings.push(mapping);
+        const rowKey = customRowKey(mapping.name);
+        const first = rowKeys.get(rowKey);
+        if (first === undefined) {
+            rowKeys.set(rowKey, index);
+        }
+        else {
+            adapterIssue(issues, `${key}.mappings[${index}].name`, `gives the same row id as ${key}.mappings[${first}].name`);
+        }
     }
     return issueStart === issues.length && mappings.length === value.mappings.length
         ? { ...(rowsPath ? { rowsPath } : {}), mappings }
@@ -731,16 +820,19 @@ function validateWindows(raw, providerKey, issues) {
     for (let index = 0; index < raw.length; index += 1) {
         const item = raw[index];
         const windowKey = `${providerKey}.windows[${index}]`;
-        if (!isPlainObject(item)) {
+        if (!isRecord(item)) {
             issues.push({ key: windowKey, message: "expected an object" });
             continue;
         }
-        for (const field of Object.keys(item).filter((field) => !WINDOW_FIELDS.includes(field))) {
+        // An unknown field is named by its position: its name is the caller's, never repeated.
+        Object.keys(item).forEach((field, position) => {
+            if (WINDOW_FIELDS.includes(field))
+                return;
             issues.push({
-                key: `${windowKey}.${field}`,
-                message: "unknown field; allowed fields are id, label, type, durationMinutes, requestLimit, usdBudget",
+                key: windowKey,
+                message: `field ${position + 1} is unknown; allowed fields are ${WINDOW_FIELDS.join(", ")}`,
             });
-        }
+        });
         for (const field of ["id", "type", "requestLimit"]) {
             if (!hasOwnKey(item, field)) {
                 issues.push({ key: `${windowKey}.${field}`, message: "field is required" });
@@ -769,7 +861,7 @@ function validateWindows(raw, providerKey, issues) {
         if (hasOwnKey(item, "label") && label === null) {
             issues.push({
                 key: `${windowKey}.label`,
-                message: "expected 1-80 printable Unicode code points after trimming",
+                message: LABEL_LENGTH_MESSAGE,
             });
         }
         const type = item.type;
@@ -829,66 +921,39 @@ function validateWindows(raw, providerKey, issues) {
     }
     return windows.length === raw.length ? windows : undefined;
 }
-function validateMaintainedWindows(id, windows, providerKey, issues) {
-    if (!windows || !MAINTAINED_LOCAL_ESTIMATE_IDS.includes(id))
-        return;
-    const expected = id === "qwen-code"
-        ? [
-            { id: "daily", type: "utc-day" },
-            { id: "rpm", type: "rolling", durationMinutes: 1 },
-        ]
-        : [
-            { id: "five-hour", type: "rolling", durationMinutes: 300 },
-            { id: "weekly", type: "rolling", durationMinutes: 10_080 },
-            { id: "monthly", type: "rolling", durationMinutes: 43_200 },
-        ];
-    if (windows.length !== expected.length ||
-        expected.some((item, index) => {
-            const window = windows[index];
-            return (!window ||
-                window.id !== item.id ||
-                window.type !== item.type ||
-                window.durationMinutes !== item.durationMinutes ||
-                window.usdBudget !== undefined);
-        })) {
-        issues.push({
-            key: `${providerKey}.windows`,
-            message: id === "qwen-code"
-                ? "qwen-code tuning requires ordered daily (utc-day) and rpm (1-minute rolling) request windows"
-                : "alibaba-coding-plan tuning requires ordered five-hour, weekly, and monthly rolling request windows",
-        });
-    }
-}
 function validatePricingModelMap(raw, providerKey, providerId, issues) {
     if (raw === undefined)
         return undefined;
-    if (!isPlainObject(raw) || Object.keys(raw).length === 0) {
+    if (!isRecord(raw) || Object.keys(raw).length === 0) {
         issues.push({
             key: `${providerKey}.pricingModelMap`,
             message: "expected a non-empty object of exact source model ids to models.dev provider/model ids",
         });
         return undefined;
     }
+    const key = `${providerKey}.pricingModelMap`;
+    const sourceModelIds = Object.keys(raw);
     const result = {};
-    for (const sourceModelId of Object.keys(raw).sort()) {
-        const key = `${providerKey}.pricingModelMap.${sourceModelId}`;
+    for (const sourceModelId of [...sourceModelIds].sort()) {
+        // An entry is named by its position: its source key is the caller's, never repeated.
+        const entry = `entry ${sourceModelIds.indexOf(sourceModelId) + 1}`;
         const target = raw[sourceModelId];
         if (sourceModelId.length === 0 || MODEL_FORBIDDEN_PATTERN.test(sourceModelId)) {
             issues.push({
                 key,
-                message: "source key must be an exact model id without whitespace or control characters",
+                message: `${entry}: source key must be an exact model id without whitespace or control characters`,
             });
             continue;
         }
         if (typeof target !== "string") {
-            issues.push({ key, message: "expected a models.dev provider/model string" });
+            issues.push({ key, message: `${entry}: expected a models.dev provider/model string` });
             continue;
         }
-        const automatic = resolvePricingKey({ providerID: providerId, modelID: sourceModelId });
-        if (automatic.ok) {
+        const automatic = priceMessage({ providerID: providerId, modelID: sourceModelId }, emptyTokenBuckets());
+        if (automatic.kind === "priced") {
             issues.push({
                 key,
-                message: `automatic models.dev matching already resolves to ${automatic.key.provider}/${automatic.key.model}`,
+                message: `${entry}: automatic models.dev matching already resolves to ${automatic.key.provider}/${automatic.key.model}`,
             });
             continue;
         }
@@ -898,7 +963,7 @@ function validatePricingModelMap(raw, providerKey, providerId, issues) {
         if (!targetProvider || !targetModel || !lookupCost(targetProvider, targetModel)) {
             issues.push({
                 key,
-                message: "target must be an exact priced models.dev provider/model id",
+                message: `${entry}: target must be an exact priced models.dev provider/model id`,
             });
             continue;
         }
@@ -919,7 +984,7 @@ export function validateQuotaProviders(value) {
     for (let index = 0; index < value.length; index += 1) {
         const raw = value[index];
         const providerKey = `quotaProviders[${index}]`;
-        if (!isPlainObject(raw)) {
+        if (!isRecord(raw)) {
             issues.push({ key: providerKey, message: "expected an object" });
             continue;
         }
@@ -929,15 +994,17 @@ export function validateQuotaProviders(value) {
             ? LOCAL_FIELDS
             : mode === "remote-api"
                 ? REMOTE_FIELDS
-                : [...new Set([...REMOTE_FIELDS, ...LOCAL_FIELDS])];
-        for (const field of Object.keys(raw)
-            .filter((field) => !allowedFields.includes(field))
-            .sort()) {
+                : QUOTA_PROVIDER_FIELDS;
+        // An unknown field is named by its position: its name is the caller's, never repeated.
+        const modeName = QUOTA_PROVIDER_MODES.find((known) => known === mode) ?? "quota provider";
+        Object.keys(raw).forEach((field, position) => {
+            if (allowedFields.includes(field))
+                return;
             issues.push({
-                key: `${providerKey}.${field}`,
-                message: `unknown field for ${typeof mode === "string" ? mode : "quota provider"} mode`,
+                key: providerKey,
+                message: `field ${position + 1} is unknown for ${modeName} mode; allowed fields are ${allowedFields.join(", ")}`,
             });
-        }
+        });
         for (const field of ["id", "mode"]) {
             if (!hasOwnKey(raw, field)) {
                 issues.push({ key: `${providerKey}.${field}`, message: "field is required" });
@@ -958,8 +1025,8 @@ export function validateQuotaProviders(value) {
                     message: `"${QUOTA_PROVIDERS_AGGREGATE_ID}" is reserved for the aggregate provider`,
                 });
             }
-            const builtIn = getQuotaProviderShape(id);
-            if (builtIn && !MAINTAINED_LOCAL_ESTIMATE_IDS.includes(id)) {
+            const builtIn = getCanonicalQuotaProviderId(id);
+            if (builtIn && !isRetiredEstimateTuning({ id, mode })) {
                 issues.push({
                     key: `${providerKey}.id`,
                     message: `collides with built-in quota provider id "${id}"`,
@@ -987,12 +1054,6 @@ export function validateQuotaProviders(value) {
                 message: "expected 1-64 lowercase provider-id characters",
             });
         }
-        else if (raw.providerId === id) {
-            issues.push({
-                key: `${providerKey}.providerId`,
-                message: "omit providerId when it is the same as id",
-            });
-        }
         else {
             providerId = raw.providerId;
         }
@@ -1000,7 +1061,7 @@ export function validateQuotaProviders(value) {
         if (hasOwnKey(raw, "label") && label === null) {
             issues.push({
                 key: `${providerKey}.label`,
-                message: "expected 1-80 printable Unicode code points after trimming",
+                message: LABEL_LENGTH_MESSAGE,
             });
         }
         if (typeof mode !== "string" || !QUOTA_PROVIDER_MODES.includes(mode)) {
@@ -1009,17 +1070,25 @@ export function validateQuotaProviders(value) {
                 message: 'expected "remote-api" or "local-estimate"',
             });
         }
-        const modelIds = validateModelIds({ raw, providerKey, providerId, issues });
-        const modelIdsValid = !hasOwnKey(raw, "modelIds") ||
-            (Array.isArray(raw.modelIds) && modelIds?.length === raw.modelIds.length);
-        if (idValid &&
-            MAINTAINED_LOCAL_ESTIMATE_IDS.includes(id) &&
-            mode !== "local-estimate") {
+        const modelIds = validateModelIds({ raw, providerKey, issues });
+        const enabled = raw.enabled;
+        if (hasOwnKey(raw, "enabled") && typeof enabled !== "boolean") {
+            issues.push({ key: `${providerKey}.enabled`, message: "expected true or false" });
+        }
+        const switchField = typeof enabled === "boolean" ? { enabled } : {};
+        const minIntervalMs = raw.minIntervalMs;
+        if (hasOwnKey(raw, "minIntervalMs") &&
+            !(typeof minIntervalMs === "number" &&
+                Number.isSafeInteger(minIntervalMs) &&
+                minIntervalMs > 0)) {
             issues.push({
-                key: `${providerKey}.mode`,
-                message: `${id} tuning must use local-estimate mode`,
+                key: `${providerKey}.minIntervalMs`,
+                message: "expected positive whole milliseconds (a safe integer)",
             });
         }
+        const intervalField = typeof minIntervalMs === "number" ? { minIntervalMs } : {};
+        const modelIdsValid = !hasOwnKey(raw, "modelIds") ||
+            (Array.isArray(raw.modelIds) && modelIds?.length === raw.modelIds.length);
         if (mode === "remote-api") {
             for (const field of ["url", "format"]) {
                 if (!hasOwnKey(raw, field)) {
@@ -1047,8 +1116,8 @@ export function validateQuotaProviders(value) {
                 if (!hasOwnKey(raw, "adapter")) {
                     issues.push({ key: `${providerKey}.adapter`, message: "field is required" });
                 }
-                else if (label) {
-                    adapter = validateJsonV1Adapter(raw.adapter, `${providerKey}.adapter`, label, issues);
+                else {
+                    adapter = validateJsonV1Adapter(raw.adapter, `${providerKey}.adapter`, issues);
                 }
             }
             else if (hasOwnKey(raw, "adapter")) {
@@ -1094,6 +1163,8 @@ export function validateQuotaProviders(value) {
                     url: normalizedUrl.value,
                     ...(apiKeyEnv !== undefined ? { apiKeyEnv: apiKeyEnv } : {}),
                     ...(modelIds ? { modelIds } : {}),
+                    ...switchField,
+                    ...intervalField,
                 };
                 definitions.push({
                     index,
@@ -1111,8 +1182,6 @@ export function validateQuotaProviders(value) {
                 issues.push({ key: `${providerKey}.windows`, message: "field is required" });
             }
             const windows = validateWindows(raw.windows, providerKey, issues);
-            if (idValid)
-                validateMaintainedWindows(id, windows, providerKey, issues);
             const pricingModelMap = providerId && hasOwnKey(raw, "pricingModelMap")
                 ? validatePricingModelMap(raw.pricingModelMap, providerKey, providerId, issues)
                 : undefined;
@@ -1127,6 +1196,8 @@ export function validateQuotaProviders(value) {
                         windows,
                         ...(modelIds ? { modelIds } : {}),
                         ...(pricingModelMap ? { pricingModelMap } : {}),
+                        ...switchField,
+                        ...intervalField,
                     },
                 });
             }
@@ -1160,8 +1231,5 @@ export function validateQuotaProviders(value) {
 }
 export function cloneQuotaProviders(definitions) {
     return definitions.map(cloneDefinition);
-}
-export function findQuotaProviderDefinition(definitions, id) {
-    return definitions.find((definition) => definition.id === id);
 }
 //# sourceMappingURL=quota-providers.js.map

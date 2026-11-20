@@ -1,961 +1,453 @@
 /**
- * OpenCode Quota Toast Plugin
- *
- * Shows a minimal quota status toast without LLM invocation.
- * Triggers on session.idle, session.compacted, and question tool completion.
- * Supports GitHub Copilot and Google (via opencode-antigravity-auth).
+ * OpenCode V2 server plugin: quota slash commands for Web and Desktop, a diagnostics tool, and
+ * the quota RPC that serves the quota snapshot, the Home notice line, active notices and reports
+ * to the TUI. It reads the server settings (settings.jsonc, converted from v5 once) and follows
+ * every change to them.
+ * It also writes the export file and the OpenTelemetry gauges from each snapshot. Inside
+ * OpenCode, logins are read only here, through OpenCode's integration API.
  */
-import { isMainThread } from "node:worker_threads";
-import { tool } from "@opencode-ai/plugin";
-import { DEFAULT_ALIBABA_AUTH_CACHE_MAX_AGE_MS, isAlibabaModelId, resolveAlibabaCodingPlanAuthCached, } from "./lib/alibaba-auth.js";
-import { getOrFetchWithCacheControl } from "./lib/cache.js";
-import { handled } from "./lib/command-handled.js";
-import { shouldRegisterServerSlashCommands } from "./lib/command-surfaces.js";
-import { createLoadConfigMeta } from "./lib/config.js";
-import { findGitWorktreeRoot, getEffectiveConfigRoot } from "./lib/config-file-utils.js";
-import { isCursorModelId, isCursorProviderId } from "./lib/cursor-pricing.js";
+import { Plugin } from "@opencode/plugin";
+import { quotaAgentTools } from "./agent-tools.js";
+import { snapshotFilePath } from "./core/persist.js";
+import { customRowPrefix, loadProviderSource, loadServerSettings, } from "./core/provider-source.js";
+import { safeErrorText } from "./core/redact.js";
+import { createSnapshotPublisher } from "./core/snapshot-publisher.js";
+import { createQuotaStore, withTimeout } from "./core/store.js";
+import { OLD_USAGE_COMMANDS } from "./core/usage-ranges.js";
+import { parseUsageArguments, sessionUsage, usageReport, withProviderNames, } from "./core/usage.js";
+import { findGitWorktreeRoot } from "./lib/config-file-utils.js";
 import { sanitizeDisplayText } from "./lib/display-sanitize.js";
-import { formatQuotaRows } from "./lib/format.js";
-import { BUNDLED_MAINTAINER_ANNOUNCEMENTS, formatMaintainerAnnouncementHomeCountLine, getMaintainerAnnouncementsSummary, } from "./lib/maintainer-announcements.js";
-import { maybeRefreshPricingSnapshot, setPricingSnapshotAutoRefresh, setPricingSnapshotSelection, } from "./lib/modelsdev-pricing.js";
+import { homeNoticeLine, listNotices } from "./lib/maintainer-home-notice.js";
+import { downloadPrices, refreshPricesIfDue } from "./lib/modelsdev-pricing.js";
+import { bindCredentialSource, createIntegrationCredentialSource, notifyCredentialsChanged, } from "./lib/opencode-auth.js";
 import { reconcileDetectedProvidersInGlobalConfig } from "./lib/opencode-config-providers.js";
-import { buildQuotaDialogCommandOutput, isQuotaDialogCommand, QUOTA_DIALOG_COMMANDS, } from "./lib/quota-dialog-commands.js";
-import { resolveQuotaFormatStyle } from "./lib/quota-format-style.js";
-import { customQuotaProviderDefinitions, QUOTA_PROVIDERS_AGGREGATE_ID, } from "./lib/quota-providers.js";
-import { collectQuotaRenderData } from "./lib/quota-render-data.js";
-import { createQuotaRuntimeRequestContext, resolveQuotaRuntimeContext, } from "./lib/quota-runtime-context.js";
-import { disposeQuotaTelemetryOwner } from "./lib/quota-telemetry.js";
-import { isQwenCodeModelId, resolveQwenLocalPlanCached } from "./lib/qwen-auth.js";
-import { inspectTuiConfig } from "./lib/tui-config-diagnostics.js";
-import { DEFAULT_CONFIG } from "./lib/types.js";
-import { getProviders } from "./providers/registry.js";
-function normalizeDefaultAgent(cfg) {
-    if (!cfg?.default_agent || !cfg.agent || cfg.default_agent in cfg.agent)
-        return;
-    const stripped = (value) => value.replace(/[\u200B\u200C\u200D\uFEFF]/g, "");
-    const target = stripped(cfg.default_agent);
-    const matches = Object.keys(cfg.agent).filter((key) => stripped(key) === target);
-    if (matches.length === 1) {
-        cfg.default_agent = matches[0];
+import { getQuotaProviderRuntimeIds } from "./lib/provider-metadata.js";
+import { statusReport } from "./lib/quota-dialog-commands.js";
+import { containsQuotaReport, formatQuotaReportMessage, QUOTA_REPORT_METADATA_KEY, quotaMessageText, removeQuotaReports, } from "./lib/quota-report-message.js";
+import { resolveQuotaResetRetryDelayMs } from "./lib/quota-retry-wait.js";
+import { QuotaRpc } from "./rpc.js";
+import { clientSettings, createLiveSettings, loadSettings, SETTINGS_SCHEMA, settingsPath, } from "./settings/index.js";
+import { DEFAULT_QUICK_LOOK_RANGE } from "./view/quick-look.js";
+import { usageText } from "./view/usage.js";
+const PROVIDER_NAMES_TIMEOUT_MS = 2_000;
+function hasQuotaReportText(part) {
+    return part.type === "text" && typeof part.text === "string" && containsQuotaReport(part.text);
+}
+/**
+ * Drops quota report messages, found by their metadata, and cuts reports out of the text of
+ * the remaining user messages. The cut covers compaction checkpoints, which hold copied
+ * message text without its metadata, and title requests, which get plain text only.
+ */
+function withoutQuotaReports(messages) {
+    return messages.flatMap((message) => {
+        if (message.role !== "user")
+            return [message];
+        if (message.metadata?.[QUOTA_REPORT_METADATA_KEY] !== undefined)
+            return [];
+        if (!message.content.some(hasQuotaReportText))
+            return [message];
+        const content = message.content.map((part) => hasQuotaReportText(part) ? { ...part, text: removeQuotaReports(part.text) } : part);
+        return [{ ...message, content }];
+    });
+}
+/**
+ * Runs an RPC handler and logs its failure in the OpenCode service before rethrowing it.
+ * The client gets only OpenCode's `rpc.internal` error, so the reason shows only here.
+ */
+async function logRpcFailure(method, handler) {
+    try {
+        return await handler();
+    }
+    catch (error) {
+        console.warn(`[opencode-quota] ${method} RPC failed: ${safeErrorText(error)}`);
+        throw error;
     }
 }
-const DEFERRED_QUOTA_REFRESH_DELAYS_MS = [3_000, 15_000, 60_000, 300_000];
-// =============================================================================
-// Plugin Implementation
-// =============================================================================
-/**
- * Main plugin export
- */
-export const QuotaToastPlugin = async ({ client, directory }) => {
-    const typedClient = client;
-    let opencodeConfig = null;
-    /**
-     * Inject tool output directly into the session without triggering an LLM response.
-     * This prevents models from summarizing/rewriting our carefully formatted reports.
-     */
-    async function injectRawOutput(sessionID, output, options = {}) {
-        normalizeDefaultAgent(opencodeConfig);
-        try {
-            await typedClient.session.prompt({
-                path: { id: sessionID },
-                body: {
-                    noReply: true,
-                    // ignored=true keeps this out of future model context while still
-                    // showing it to the user in the transcript.
-                    parts: [{ type: "text", text: sanitizeDisplayText(output), ignored: true }],
-                },
-            });
-        }
-        catch (err) {
-            // Log but don't fail by default - tool output can still be returned.
-            await typedClient.app.log({
-                body: {
-                    service: "quota-toast",
-                    level: "warn",
-                    message: "Failed to inject raw output",
-                    extra: { error: err instanceof Error ? err.message : String(err) },
-                },
-            });
-            if (options.rethrow) {
-                throw err;
-            }
-        }
-    }
-    // Keep init fast/non-blocking so TUI never hangs. We still want the first
-    // toast trigger to work reliably, so we refresh config on-demand.
-    let config = DEFAULT_CONFIG;
-    let configLoaded = false;
-    let configInFlight = null;
-    let providerConfigReconcileQueue = Promise.resolve();
-    let configMeta = createLoadConfigMeta();
-    let runtimeProviders = getProviders();
-    // Track last session token error for /quota_status diagnostics
-    let lastSessionTokenError;
-    const deferredQuotaRefreshes = new Map();
-    const detectedProviderIdsByToastCacheKey = new Map();
-    const maintainerAnnouncementToastFallback = {
-        pending: true,
-        inFlight: false,
-    };
-    function getDeferredQuotaRefreshDelayMs(attempts) {
-        const index = Math.min(Math.max(0, attempts), DEFERRED_QUOTA_REFRESH_DELAYS_MS.length - 1);
-        return DEFERRED_QUOTA_REFRESH_DELAYS_MS[index];
-    }
-    function clearDeferredQuotaRefresh(sessionID) {
-        const state = deferredQuotaRefreshes.get(sessionID);
-        if (state?.timer) {
-            clearTimeout(state.timer);
-        }
-        deferredQuotaRefreshes.delete(sessionID);
-    }
-    function clearDeferredQuotaRefreshTimer(state) {
-        if (!state.timer)
-            return;
-        clearTimeout(state.timer);
-        state.timer = null;
-    }
-    function scheduleDeferredQuotaRefresh(params) {
-        let state = deferredQuotaRefreshes.get(params.sessionID);
-        if (!state) {
-            state = {
-                sessionID: params.sessionID,
-                attempts: 0,
-                reason: params.reason,
-                queuedAtMs: Date.now(),
-                timer: null,
-                inFlight: false,
-            };
-            deferredQuotaRefreshes.set(params.sessionID, state);
-        }
-        else {
-            if (params.incrementAttempts) {
-                state.attempts += 1;
-            }
-            state.reason = params.reason;
-            clearDeferredQuotaRefreshTimer(state);
-        }
-        const delayMs = getDeferredQuotaRefreshDelayMs(state.attempts);
-        state.timer = setTimeout(() => {
-            void runDeferredQuotaRefresh(params.sessionID);
-        }, delayMs);
-        state.timer.unref?.();
-        void log("Deferred quota refresh scheduled", {
-            sessionID: params.sessionID,
-            reason: params.reason,
-            attempts: state.attempts,
-            delayMs,
-        });
-    }
-    async function runDeferredQuotaRefresh(sessionID) {
-        const state = deferredQuotaRefreshes.get(sessionID);
-        if (!state || state.inFlight)
-            return;
-        await showQuotaToast(sessionID, "deferred.retry", { deferredRetry: true });
-    }
-    function isProviderEnabled(providerId) {
-        return config.enabledProviders === "auto" || config.enabledProviders.includes(providerId);
-    }
-    async function shouldBypassToastCacheForLiveLocalUsage(params) {
-        if (isProviderEnabled(QUOTA_PROVIDERS_AGGREGATE_ID) &&
-            customQuotaProviderDefinitions(config.quotaProviders).some((definition) => definition.mode === "local-estimate")) {
-            return true;
-        }
-        const currentSession = params.sessionMeta ?? (await getSessionModelMeta(params.sessionID));
-        const currentModel = currentSession.modelID;
-        if (currentSession.providerID === "qwen-code" || isQwenCodeModelId(currentModel)) {
-            const plan = await resolveQwenLocalPlanCached();
-            return plan.state === "qwen_free" && isProviderEnabled("qwen-code");
-        }
-        if (currentSession.providerID === "alibaba-coding-plan" ||
-            currentSession.providerID === "alibaba" ||
-            isAlibabaModelId(currentModel)) {
-            const plan = await resolveAlibabaCodingPlanAuthCached({
-                maxAgeMs: DEFAULT_ALIBABA_AUTH_CACHE_MAX_AGE_MS,
-                fallbackTier: "lite",
-            });
-            return plan.state === "configured" && isProviderEnabled("alibaba-coding-plan");
-        }
-        if (isCursorProviderId(currentSession.providerID) || isCursorModelId(currentModel)) {
-            return isProviderEnabled("cursor");
-        }
-        return false;
-    }
-    function getPluginRuntimeRootHints() {
-        const cwd = directory || process.cwd();
-        const workspaceRoot = findGitWorktreeRoot(cwd) ?? cwd;
-        const configRoot = getEffectiveConfigRoot(workspaceRoot);
-        return {
-            workspaceRoot,
-            configRoot,
-            fallbackDirectory: cwd,
-        };
-    }
-    function registerDeterministicSlashCommands(cfg) {
-        cfg.command ??= {};
-        for (const spec of QUOTA_DIALOG_COMMANDS) {
-            cfg.command[spec.id] = {
-                template: `/${spec.slashName}`,
-                description: spec.description,
-            };
-        }
-    }
-    async function handleDeterministicSlashCommand(input) {
-        const command = input.command;
-        const result = await buildQuotaDialogCommandOutput({
-            command,
-            arguments: input.arguments,
-            client: typedClient,
-            roots: getPluginRuntimeRootHints(),
-            sessionID: input.sessionID,
-            resolveSessionMeta: (sessionID) => getSessionModelMeta(sessionID),
-            lastSessionTokenError,
-            setLastSessionTokenError: (error) => {
-                lastSessionTokenError = error;
-            },
-            log,
-        });
-        if (result.state === "output") {
-            await injectRawOutput(input.sessionID, result.output, { rethrow: true });
-        }
-        handled();
-    }
-    function triggerMaintainerAnnouncementToastFallback(trigger, detectedProviderIds) {
-        if (!maintainerAnnouncementToastFallback.pending ||
-            maintainerAnnouncementToastFallback.inFlight) {
-            return;
-        }
-        if (!config.enabled || !config.enableToast) {
-            maintainerAnnouncementToastFallback.pending = false;
-            return;
-        }
-        if (!config.maintainerAnnouncements.enabled || !config.maintainerAnnouncements.home) {
-            maintainerAnnouncementToastFallback.pending = false;
-            return;
-        }
-        maintainerAnnouncementToastFallback.inFlight = true;
-        void (async () => {
-            try {
-                const summary = getMaintainerAnnouncementsSummary({
-                    announcements: BUNDLED_MAINTAINER_ANNOUNCEMENTS,
-                    enabledProviders: detectedProviderIds,
-                });
-                if (summary.activeCount <= 0) {
-                    if (summary.futureCount <= 0) {
-                        maintainerAnnouncementToastFallback.pending = false;
-                    }
-                    return;
-                }
-                const tuiDiagnostics = await inspectTuiConfig({ roots: getPluginRuntimeRootHints() });
-                if (tuiDiagnostics.quotaPluginConfigured) {
-                    maintainerAnnouncementToastFallback.pending = false;
-                    return;
-                }
-                const message = formatMaintainerAnnouncementHomeCountLine(summary.activeCount);
-                if (!message) {
-                    return;
-                }
-                await typedClient.tui.showToast({
-                    body: {
-                        message: sanitizeDisplayText(message),
-                        variant: "info",
-                        duration: config.toastDurationMs,
-                    },
-                });
-                maintainerAnnouncementToastFallback.pending = false;
-                await log("Displayed maintainer announcement fallback toast", { trigger });
-            }
-            catch (err) {
-                await log("Failed to show maintainer announcement fallback toast", {
-                    trigger,
-                    error: err instanceof Error ? err.message : String(err),
-                });
-            }
-            finally {
-                maintainerAnnouncementToastFallback.inFlight = false;
-            }
-        })();
-    }
-    async function resolvePluginRuntimeContext(params = {}) {
-        if (!configLoaded) {
-            await refreshConfig();
-        }
-        return resolveQuotaRuntimeContext({
-            client: typedClient,
-            roots: getPluginRuntimeRootHints(),
-            config,
-            configMeta,
-            providers: runtimeProviders,
-            sessionID: params.sessionID,
-            sessionMeta: params.sessionMeta,
-            resolveSessionMeta: (sessionID) => getSessionModelMeta(sessionID),
-            includeSessionMeta: params.includeSessionMeta,
-        });
-    }
-    async function refreshConfig() {
-        if (configInFlight)
-            return configInFlight;
-        configInFlight = (async () => {
-            try {
-                const runtime = await resolveQuotaRuntimeContext({
-                    client: typedClient,
-                    roots: getPluginRuntimeRootHints(),
-                });
-                configMeta = runtime.configMeta;
-                config = runtime.config;
-                runtimeProviders = runtime.providers;
-                setPricingSnapshotAutoRefresh(config.pricingSnapshot.autoRefresh);
-                setPricingSnapshotSelection(config.pricingSnapshot.source);
-                configLoaded = true;
-                onFirstConfigLoaded();
-            }
-            catch {
-                // Leave configLoaded=false so we can retry on next trigger.
-                config = DEFAULT_CONFIG;
-                configMeta = createLoadConfigMeta();
-                runtimeProviders = getProviders();
-                setPricingSnapshotAutoRefresh(DEFAULT_CONFIG.pricingSnapshot.autoRefresh);
-                setPricingSnapshotSelection(DEFAULT_CONFIG.pricingSnapshot.source);
-            }
-            finally {
-                configInFlight = null;
-            }
-        })();
-        return configInFlight;
-    }
-    async function kickPricingRefresh(params) {
-        try {
-            const refreshPromise = maybeRefreshPricingSnapshot({
-                reason: params.reason,
-                snapshotSelection: config.pricingSnapshot.source,
-            });
-            const guardedRefreshPromise = refreshPromise.catch(() => undefined);
-            if (!params.maxWaitMs || params.maxWaitMs <= 0) {
-                void guardedRefreshPromise;
-                return;
-            }
-            await Promise.race([
-                guardedRefreshPromise,
-                new Promise((resolve) => {
-                    setTimeout(resolve, params.maxWaitMs);
-                }),
-            ]);
-        }
-        catch (error) {
-            await log("Pricing refresh failed", {
-                reason: params.reason,
-                error: error instanceof Error ? error.message : String(error),
-            });
-        }
-    }
-    // Deferred init: runs once after the first successful config load.
-    // Avoids HTTP calls during plugin construction, which can interfere with
-    // other plugins that are still being loaded (see #39).
-    let initDone = false;
-    function onFirstConfigLoaded() {
-        if (initDone)
-            return;
-        initDone = true;
-        if (config.enabled) {
-            void kickPricingRefresh({ reason: "init" });
-        }
-        void typedClient.app
-            .log({
-            body: {
-                service: "quota-toast",
-                level: "info",
-                message: "plugin initialized",
-                extra: {
-                    configLoaded,
-                    configSource: configMeta.source,
-                    configPaths: configMeta.paths,
-                    enabledProviders: config.enabledProviders,
-                    minIntervalMs: config.minIntervalMs,
-                    googleModels: config.googleModels,
-                    cursorPlan: config.cursorPlan,
-                    cursorIncludedApiUsd: config.cursorIncludedApiUsd,
-                    cursorBillingCycleStartDay: config.cursorBillingCycleStartDay,
-                    pricingSnapshotSource: config.pricingSnapshot.source,
-                    pricingSnapshotAutoRefresh: config.pricingSnapshot.autoRefresh,
-                    showOnIdle: config.showOnIdle,
-                    showOnQuestion: config.showOnQuestion,
-                    showOnCompact: config.showOnCompact,
-                    showOnBothFail: config.showOnBothFail,
-                },
-            },
-        })
-            .catch(() => { });
-    }
-    // If disabled in config, it'll be picked up on first trigger; we can't
-    // reliably read config synchronously without risking TUI startup.
-    /**
-     * Log a message (debug level)
-     */
-    async function log(message, extra) {
-        try {
-            await typedClient.app.log({
-                body: {
-                    service: "quota-toast",
-                    level: "debug",
-                    message,
-                    extra,
-                },
-            });
-        }
-        catch {
-            // Ignore logging errors
-        }
-    }
-    async function reconcileDetectedProviderConfig(providerIds) {
-        if (!directory || providerIds.length === 0)
-            return;
-        const reconcile = async () => {
-            try {
-                const result = await reconcileDetectedProvidersInGlobalConfig({
-                    configRootDir: getPluginRuntimeRootHints().configRoot,
-                    detectedProviderIds: providerIds,
-                });
-                if (result.changed) {
-                    await log("Added detected providers to global OpenCode config", {
-                        path: result.path,
-                        format: result.format,
-                        providers: result.addedProviderIds,
-                    });
-                }
-            }
-            catch (error) {
-                try {
-                    await typedClient.app.log({
-                        body: {
-                            service: "quota-toast",
-                            level: "warn",
-                            message: "Failed to add detected providers to global OpenCode config",
-                            extra: { error: error instanceof Error ? error.message : String(error) },
+/** The server plugin; `providers` replaces the registered providers (tests pass their own). */
+export function createQuotaServerPlugin(options = {}) {
+    return Plugin.define({
+        id: "@slkiser/opencode-quota.server",
+        async setup(ctx) {
+            const locationDirectory = ctx.location.directory;
+            const projectDir = findGitWorktreeRoot(locationDirectory) ?? locationDirectory;
+            // The providers ask OpenCode which providers it has through this small client.
+            const client = {
+                config: {
+                    providers: async () => ({
+                        data: {
+                            providers: (await ctx.provider.list()).data.map((provider) => ({ id: provider.id })),
                         },
-                    });
+                    }),
+                },
+            };
+            // The server holds the settings it read last; every reader takes them from here.
+            const liveSettings = await createLiveSettings({ projectDir });
+            // /quota_status reports the providers it detected. The slash commands and
+            // the tool add them to the global OpenCode config; the TUI palette (via RPC) never writes it.
+            const buildStatusOutput = async (sessionID, options) => {
+                const report = await statusReport(sourceHost, {
+                    origin: options.origin,
+                    opencode: ctx.app ? { version: ctx.app.version, channel: ctx.app.channel } : undefined,
+                    sessionModel: sessionID ? await sessionModel(sessionID) : undefined,
+                    conversion: liveSettings.conversion,
+                    nowMs: Date.now(),
+                });
+                const detected = report.json.providers
+                    .filter((provider) => provider.enabled && provider.available)
+                    .map((provider) => provider.id);
+                if (options.reconcileDetectedProviders && detected.length > 0) {
+                    try {
+                        // Only declare a provider through its own OpenCode id. A quota provider can be available
+                        // through another provider id (claude-code or claude-agent for anthropic); declaring the
+                        // canonical id would add a second, credential-less provider to the catalog.
+                        const runtime = new Set((await ctx.provider.list()).data.map((provider) => provider.id));
+                        await reconcileDetectedProvidersInGlobalConfig({
+                            directory: locationDirectory,
+                            detectedProviderIds: detected.filter((id) => runtime.has(id) ||
+                                !getQuotaProviderRuntimeIds(id).some((runtimeId) => runtimeId !== id && runtime.has(runtimeId))),
+                        });
+                    }
+                    catch (error) {
+                        console.warn("Failed to add detected providers to global OpenCode config", error);
+                    }
+                }
+                return report.text;
+            };
+            // The v6 quota store: last known rows, saved in the state dir, refreshed in the background.
+            // Building it reads nothing; the first snapshot or refresh call loads the file.
+            const sourceHost = {
+                client,
+                workspaceRoot: projectDir,
+                locationDirectory,
+                settings: liveSettings.current,
+                providers: options.providers,
+            };
+            const store = createQuotaStore({
+                source: (model) => loadProviderSource(sourceHost, model),
+                sessionModel: (sessionID) => sessionModel(sessionID),
+                file: snapshotFilePath(),
+            });
+            // The TUI reads the session model from its local store, which has nothing for an
+            // unknown session. The RPC handlers match that: a failed lookup means no model.
+            // With a session, a snapshot also names the providers serving its current model.
+            const sessionModel = async (sessionID) => {
+                if (!sessionID)
+                    return {};
+                try {
+                    const session = await ctx.session.get({ sessionID });
+                    return { id: session.model?.id, providerID: session.model?.providerID };
                 }
                 catch {
-                    // Automatic config repair is best-effort and must not break quota output.
+                    return {};
                 }
-            }
-        };
-        providerConfigReconcileQueue = providerConfigReconcileQueue.then(reconcile, reconcile);
-        await providerConfigReconcileQueue;
-    }
-    /**
-     * Check if session is a subagent session
-     */
-    async function isSubagentSession(sessionID) {
-        try {
-            const response = await typedClient.session.get({ path: { id: sessionID } });
-            // Subagent sessions have a parentID
-            return !!response.data?.parentID;
-        }
-        catch {
-            // If we can't determine, assume it's a primary session
-            return false;
-        }
-    }
-    /**
-     * Get the current model metadata from the active session.
-     *
-     * Only uses session-scoped model lookup. Does NOT fall back to
-     * client.config.get() because that returns the global/default model
-     * which can be stale across sessions.
-     */
-    async function getSessionModelMeta(sessionID) {
-        if (!sessionID)
-            return {};
-        try {
-            const sessionResp = await typedClient.session.get({ path: { id: sessionID } });
-            return {
-                modelID: sessionResp.data?.model?.id,
-                providerID: sessionResp.data?.model?.providerID,
             };
-        }
-        catch {
-            return {};
-        }
-    }
-    function formatDebugInfo(params) {
-        const availability = params.availability
-            ? params.availability.map((x) => `${x.id}=${x.ok ? "ok" : "no"}`).join(" ")
-            : "unknown";
-        const providers = params.enabledProviders === "auto"
-            ? "(auto)"
-            : params.enabledProviders.length > 0
-                ? params.enabledProviders.join(",")
-                : "(none)";
-        const modelPart = params.currentModel ? ` model=${params.currentModel}` : "";
-        const paths = configMeta.paths.length > 0 ? configMeta.paths.join(" | ") : "(none)";
-        return [
-            `Quota Toast Debug (opencode-quota)`,
-            `trigger=${params.trigger} reason=${params.reason}`,
-            `configSource=${configMeta.source} paths=${paths}`,
-            `enabled=${config.enabled} providers=${providers}${modelPart}`,
-            `available=${availability}`,
-        ].join("\n");
-    }
-    function buildToastCacheKey(params) {
-        const formatStyle = resolveQuotaFormatStyle(config.formatStyle);
-        const enabledProviders = config.enabledProviders === "auto" ? "auto" : config.enabledProviders.join(",");
-        const googleModels = config.googleModels.join(",");
-        const currentModel = config.onlyCurrentModel && params.sessionID ? (params.sessionMeta?.modelID ?? "") : "";
-        const currentProviderID = config.onlyCurrentModel && params.sessionID ? (params.sessionMeta?.providerID ?? "") : "";
-        return [
-            `sessionID=${params.sessionID}`,
-            `enabledProviders=${enabledProviders}`,
-            `formatStyle=${formatStyle}`,
-            `percentDisplayMode=${config.percentDisplayMode}`,
-            `layout=${JSON.stringify(config.layout)}`,
-            `showSessionTokens=${config.showSessionTokens ? "yes" : "no"}`,
-            `onlyCurrentModel=${config.onlyCurrentModel ? "yes" : "no"}`,
-            `currentModel=${currentModel}`,
-            `currentProviderID=${currentProviderID}`,
-            `anthropicBinaryPath=${config.anthropicBinaryPath}`,
-            `googleModels=${googleModels}`,
-            `cursorPlan=${config.cursorPlan}`,
-            `cursorIncludedApiUsd=${config.cursorIncludedApiUsd ?? ""}`,
-            `cursorBillingCycleStartDay=${config.cursorBillingCycleStartDay ?? ""}`,
-        ].join("|");
-    }
-    function isProviderFetchFailureOnly(errors) {
-        return (errors.length > 0 && errors.every((error) => error.message === "Failed to read quota data"));
-    }
-    async function fetchQuotaMessageResult(params) {
-        // Ensure we have loaded config at least once. If load fails, we keep trying
-        // on subsequent triggers and queue a deferred retry for toast paths.
-        if (!configLoaded) {
-            await refreshConfig();
-        }
-        if (!configLoaded) {
-            return {
-                message: config.debug
-                    ? formatDebugInfo({
-                        trigger: params.trigger,
-                        reason: "config load failed",
-                        enabledProviders: config.enabledProviders,
-                    })
-                    : null,
-                cacheRenderedMessage: false,
-                retryable: true,
-                retryReason: "config_load_failed",
-                hasQuotaRows: false,
-                detectedProviderIds: [],
+            const withSessionTokens = async (snapshot, sessionID) => {
+                if (!sessionID)
+                    return snapshot;
+                const sessionTokens = await sessionUsage(sessionID, liveSettings.current().settings.words.sessionTokens);
+                return sessionTokens ? { ...snapshot, sessionTokens } : snapshot;
             };
-        }
-        if (!config.enabled) {
-            return {
-                message: config.debug
-                    ? formatDebugInfo({ trigger: params.trigger, reason: "disabled", enabledProviders: [] })
-                    : null,
-                cacheRenderedMessage: false,
-                retryable: false,
-                hasQuotaRows: false,
-                detectedProviderIds: [],
-            };
-        }
-        if (config.enabledProviders !== "auto" && config.enabledProviders.length === 0) {
-            return {
-                message: config.debug
-                    ? formatDebugInfo({
-                        trigger: params.trigger,
-                        reason: "enabledProviders empty",
-                        enabledProviders: [],
-                    })
-                    : null,
-                cacheRenderedMessage: false,
-                retryable: false,
-                hasQuotaRows: false,
-                detectedProviderIds: [],
-            };
-        }
-        const runtime = await resolvePluginRuntimeContext({
-            sessionID: params.sessionID,
-            sessionMeta: params.sessionMeta,
-            includeSessionMeta: (config) => config.onlyCurrentModel,
-        });
-        const runtimeConfig = runtime.config;
-        const quotaRequestContext = createQuotaRuntimeRequestContext(runtime);
-        const quotaResult = await collectQuotaRenderData({
-            client: runtime.client,
-            resolveRuntimeProviderIds: runtime.resolveRuntimeProviderIds,
-            config: runtimeConfig,
-            configMeta: runtime.configMeta,
-            request: quotaRequestContext,
-            surfaceExplicitProviderIssues: true,
-            formatStyle: resolveQuotaFormatStyle(runtimeConfig.formatStyle),
-            bypassProviderCache: params.bypassProviderCache,
-            providers: runtime.providers,
-        });
-        const { selection, availability, active, attemptedAny, hasExplicitProviderIssues, data } = quotaResult;
-        if (selection?.isAutoMode) {
-            await reconcileDetectedProviderConfig(active.map((provider) => provider.id));
-        }
-        const detectedProviderIds = active.map((provider) => provider.id);
-        if (runtimeConfig.showSessionTokens && params.sessionID) {
-            lastSessionTokenError = quotaResult.sessionTokenError;
-        }
-        const currentModel = selection?.currentModel;
-        const errors = data?.errors ?? [];
-        const hasProviderQuotaRows = Boolean(data?.entries.length);
-        const hasQuotaRows = Boolean(hasProviderQuotaRows || data?.sessionTokens);
-        const providerFetchFailureOnly = attemptedAny && isProviderFetchFailureOnly(errors);
-        const retryableAvailabilityFailure = active.length === 0 && availability.some((item) => !item.ok && item.error === true);
-        if (active.length === 0 && !(hasExplicitProviderIssues && errors.length > 0)) {
-            const message = runtimeConfig.debug
-                ? formatDebugInfo({
-                    trigger: params.trigger,
-                    reason: "no enabled providers available",
-                    currentModel,
-                    enabledProviders: runtimeConfig.enabledProviders,
-                    availability: availability.map((item) => ({
-                        id: item.provider.id,
-                        ok: item.ok,
-                    })),
-                })
-                : null;
-            const retryableNoProviders = selection?.isAutoMode === true || retryableAvailabilityFailure;
-            return {
-                message,
-                cacheRenderedMessage: false,
-                retryable: retryableNoProviders,
-                retryReason: retryableNoProviders ? "no_available_providers" : undefined,
-                hasQuotaRows: false,
-                detectedProviderIds,
-            };
-        }
-        if (hasQuotaRows) {
-            const formatted = formatQuotaRows({
-                version: "1.0.0",
-                layout: runtimeConfig.layout,
-                entries: data?.entries ?? [],
-                errors: data?.errors ?? [],
-                style: resolveQuotaFormatStyle(runtimeConfig.formatStyle),
-                percentDisplayMode: runtimeConfig.percentDisplayMode,
-                resetTimeDecimals: runtimeConfig.resetTimeDecimals,
-                sessionTokens: data?.sessionTokens,
-            });
-            const retryableMaskedProviderFailure = !hasProviderQuotaRows && providerFetchFailureOnly;
-            if (!runtimeConfig.debug) {
+            // Every snapshot a client gets carries the server's words, the OpenCode provider of each
+            // custom definition, and the settings, and none of the server-only provider facts.
+            const forClients = (snapshot) => {
+                const loaded = liveSettings.current();
+                const { settings } = loaded;
+                const custom = settings.providers.custom;
                 return {
-                    message: formatted,
-                    cacheRenderedMessage: true,
-                    retryable: retryableMaskedProviderFailure,
-                    retryReason: retryableMaskedProviderFailure ? "provider_fetch_failed" : undefined,
-                    hasQuotaRows: true,
-                    detectedProviderIds,
+                    ...snapshot,
+                    providers: snapshot.providers.map(({ debug: _serverOnly, exportPart: _alsoServerOnly, ...provider }) => provider),
+                    words: settings.words,
+                    ...(custom.length > 0
+                        ? {
+                            customRowProviders: Object.fromEntries(custom.map((one) => [customRowPrefix(one.id), one.providerId])),
+                        }
+                        : {}),
+                    settings: clientSettings(loaded),
+                    ...(liveSettings.converted() ? { settingsConverted: true } : {}),
                 };
-            }
-            const debugFooter = `\n\n[debug] src=${configMeta.source} providers=${runtimeConfig.enabledProviders === "auto" ? "(auto)" : runtimeConfig.enabledProviders.join(",") || "(none)"} avail=${availability
-                .map((item) => `${item.provider.id}:${item.ok ? "ok" : "no"}`)
-                .join(" ")}`;
-            return {
-                message: formatted + debugFooter,
-                cacheRenderedMessage: false,
-                retryable: retryableMaskedProviderFailure,
-                retryReason: retryableMaskedProviderFailure ? "provider_fetch_failed" : undefined,
-                hasQuotaRows: true,
-                detectedProviderIds,
             };
-        }
-        // Show errors even without entries when:
-        // 1. showOnBothFail is enabled and at least one provider attempted (existing behavior)
-        // 2. OR we're in explicit mode and have "Not configured"/"Unavailable" errors (new behavior)
-        if ((runtimeConfig.showOnBothFail && attemptedAny && errors.length > 0) ||
-            hasExplicitProviderIssues) {
-            const errorLines = errors.map((error) => `${error.label}: ${error.message}`).join("\n");
-            const retryableFetchFailure = !hasExplicitProviderIssues && providerFetchFailureOnly;
-            const retryableFailure = retryableFetchFailure || retryableAvailabilityFailure;
-            const retryReason = retryableFetchFailure
-                ? "provider_fetch_failed"
-                : retryableAvailabilityFailure
-                    ? "no_available_providers"
-                    : undefined;
-            const message = !runtimeConfig.debug
-                ? errorLines || "Quota unavailable"
-                : (errorLines || "Quota unavailable") +
-                    "\n\n" +
-                    formatDebugInfo({
-                        trigger: params.trigger,
-                        reason: hasExplicitProviderIssues
-                            ? "providers missing/unavailable"
-                            : "all providers failed",
-                        currentModel,
-                        enabledProviders: runtimeConfig.enabledProviders,
-                        availability: availability.map((item) => ({
-                            id: item.provider.id,
-                            ok: item.ok,
-                        })),
+            // The usage report with the configured price list, after a due price download had its
+            // chance, and OpenCode's names for its providers, asked for alongside it. When OpenCode's
+            // provider list fails or takes longer than PROVIDER_NAMES_TIMEOUT_MS, the report has no
+            // names and shows the plugin's labels or the ids.
+            const loadUsageReport = async (query) => {
+                await refreshPricesIfDue();
+                const openCodeProviders = withTimeout(ctx.provider.list(), PROVIDER_NAMES_TIMEOUT_MS, `no answer within ${PROVIDER_NAMES_TIMEOUT_MS / 1000}s`).then(({ data }) => data, (error) => {
+                    console.warn(`[opencode-quota] provider names failed: ${safeErrorText(error)}`);
+                    return undefined;
+                });
+                const [report, providers] = await Promise.all([usageReport(query), openCodeProviders]);
+                return providers ? withProviderNames(report, providers) : report;
+            };
+            // A notice can target the users of some providers: the enabled and available ones,
+            // found without asking any provider for quota.
+            const noticeTargets = async () => (await loadProviderSource(sourceHost)).providers.map(({ id }) => id);
+            // Awaited so the plugin is active only once the RPC is registered: OpenCode waits for
+            // activation before it routes an RPC call, so the first TUI call cannot miss it.
+            const registration = await ctx.rpc.register(QuotaRpc, {
+                snapshot: (input) => logRpcFailure("snapshot", async () => {
+                    const snapshot = await store.snapshot({ sessionID: input.sessionID });
+                    return { snapshot: forClients(await withSessionTokens(snapshot, input.sessionID)) };
+                }),
+                refresh: (input) => logRpcFailure("refresh", async () => {
+                    const options = {
+                        reason: input.reason,
+                        providerIds: input.providerIds,
+                        sessionID: input.sessionID,
+                    };
+                    const snapshot = await store.refresh(options);
+                    return { snapshot: forClients(await withSessionTokens(snapshot, input.sessionID)) };
+                }),
+                notices: () => logRpcFailure("notices", async () => ({
+                    homeLine: await homeNoticeLine({ providerIds: await noticeTargets() }),
+                })),
+                noticeList: () => logRpcFailure("noticeList", async () => ({
+                    notices: await listNotices({ providerIds: await noticeTargets() }),
+                })),
+                status: (input) => logRpcFailure("status", async () => {
+                    const text = await buildStatusOutput(input.sessionID, {
+                        origin: "tui",
+                        reconcileDetectedProviders: false,
                     });
-            return {
-                message,
-                cacheRenderedMessage: false,
-                retryable: retryableFailure,
-                retryReason,
-                hasQuotaRows: false,
-                detectedProviderIds,
-            };
-        }
-        const retryableNoData = providerFetchFailureOnly ||
-            (selection?.isAutoMode === true && active.length > 0 && errors.length === 0);
-        return {
-            message: runtimeConfig.debug
-                ? formatDebugInfo({
-                    trigger: params.trigger,
-                    reason: "no entries",
-                    currentModel,
-                    enabledProviders: runtimeConfig.enabledProviders,
-                    availability: availability.map((item) => ({
-                        id: item.provider.id,
-                        ok: item.ok,
-                    })),
-                })
-                : null,
-            cacheRenderedMessage: false,
-            retryable: retryableNoData,
-            retryReason: providerFetchFailureOnly
-                ? "provider_fetch_failed"
-                : retryableNoData
-                    ? "no_reportable_data"
-                    : undefined,
-            hasQuotaRows: false,
-            detectedProviderIds,
-        };
-    }
-    async function reconcileDeferredQuotaRefresh(params) {
-        const existing = deferredQuotaRefreshes.get(params.sessionID);
-        if (!params.result.retryable) {
-            if (existing) {
-                clearDeferredQuotaRefresh(params.sessionID);
-                await log("Deferred quota refresh cleared", {
-                    sessionID: params.sessionID,
-                    trigger: params.trigger,
-                    reason: params.result.hasQuotaRows ? "quota_rows_available" : "not_retryable",
-                });
-            }
-            return;
-        }
-        if (!params.result.retryReason) {
-            return;
-        }
-        scheduleDeferredQuotaRefresh({
-            sessionID: params.sessionID,
-            reason: params.result.retryReason,
-            incrementAttempts: params.consumedDeferredRetry,
-        });
-    }
-    /**
-     * Show quota toast for a session
-     */
-    async function showQuotaToast(sessionID, trigger, options = {}) {
-        if (!configLoaded) {
-            await refreshConfig();
-        }
-        const pendingDeferred = deferredQuotaRefreshes.get(sessionID);
-        const consumedDeferredRetry = options.deferredRetry === true || Boolean(pendingDeferred);
-        if (pendingDeferred) {
-            if (pendingDeferred.inFlight && !options.deferredRetry) {
-                await log("Skipping duplicate deferred quota refresh", { sessionID, trigger });
-                return;
-            }
-            pendingDeferred.inFlight = true;
-            clearDeferredQuotaRefreshTimer(pendingDeferred);
-        }
-        try {
-            // Check if session is a subagent session
-            if (await isSubagentSession(sessionID)) {
-                if (consumedDeferredRetry) {
-                    clearDeferredQuotaRefresh(sessionID);
-                }
-                await log("Skipping toast for subagent session", { sessionID, trigger });
-                return;
-            }
-            // Get or fetch quota (with caching/throttling).
-            // If debug is enabled, bypass caching so the toast reflects current state.
-            const sessionMeta = await getSessionModelMeta(sessionID);
-            const bypassForLiveLocalUsage = await shouldBypassToastCacheForLiveLocalUsage({
-                sessionID,
-                sessionMeta,
+                    return { text: sanitizeDisplayText(text) };
+                }),
+                usage: (input) => logRpcFailure("usage", async () => {
+                    const { range, sessionID, subagents, from, to } = input;
+                    return { report: await loadUsageReport({ range, sessionID, subagents, from, to }) };
+                }),
+                downloadPrices: () => logRpcFailure("downloadPrices", downloadPrices),
+                // Read now, so a custom provider changed a moment ago shows as it is before a switch-on.
+                settings: () => logRpcFailure("settings", async () => clientSettings(await loadSettings({ projectDir }))),
+                // Answers once the new settings are in use. `customEnabled` is the user's switch in the
+                // quota window; no agent tool calls this.
+                saveSettings: (input) => logRpcFailure("saveSettings", async () => {
+                    const result = await liveSettings.save(input.patch, {
+                        allowFileOnly: false,
+                        customEnabled: input.customEnabled,
+                    });
+                    return { ok: result.ok, issues: result.issues };
+                }),
+                // As JSON, which has no undefined default (an unset color's) that OpenCode would refuse.
+                settingsSchema: () => logRpcFailure("settingsSchema", async () => ({
+                    rules: JSON.parse(JSON.stringify(SETTINGS_SCHEMA)),
+                    path: settingsPath(),
+                })),
             });
-            const bypassMessageCache = config.debug || consumedDeferredRetry || bypassForLiveLocalUsage;
-            const bypassProviderCache = consumedDeferredRetry || bypassForLiveLocalUsage;
-            const toastCacheKey = buildToastCacheKey({ sessionID, sessionMeta });
-            let fetchResult;
-            const fetchForToast = () => fetchQuotaMessageResult({
-                trigger,
-                sessionID,
-                sessionMeta,
-                bypassProviderCache,
+            // The export file and the gauges follow the snapshot; neither asks a provider again.
+            const publisher = createSnapshotPublisher({
+                loadSettings: () => loadServerSettings(sourceHost),
+                log: (message, error) => console.warn(`[opencode-quota] ${message}: ${safeErrorText(error)}`),
             });
-            const message = bypassMessageCache
-                ? await (async () => {
-                    fetchResult = await fetchForToast();
-                    return fetchResult.message;
-                })()
-                : await (async () => {
-                    const fetched = {};
-                    const cachedMessage = await getOrFetchWithCacheControl(toastCacheKey, async () => {
-                        const result = await fetchForToast();
-                        fetched.result = result;
-                        const cache = Boolean(result.message && result.cacheRenderedMessage && result.hasQuotaRows);
-                        return { message: result.message, cache };
-                    }, config.minIntervalMs);
-                    fetchResult = fetched.result;
-                    return cachedMessage;
+            const announce = (snapshot) => {
+                publisher.publish(snapshot);
+                void (async () => {
+                    try {
+                        await registration.events.emit("changed", { snapshot: forClients(snapshot) });
+                    }
+                    catch (error) {
+                        console.warn(`[opencode-quota] changed event failed: ${safeErrorText(error)}`);
+                    }
                 })();
-            if (fetchResult) {
-                detectedProviderIdsByToastCacheKey.set(toastCacheKey, [...fetchResult.detectedProviderIds]);
-                await reconcileDeferredQuotaRefresh({
-                    sessionID,
-                    result: fetchResult,
-                    consumedDeferredRetry,
-                    trigger,
-                });
-            }
-            if (options.deferredRetry && fetchResult && !fetchResult.hasQuotaRows) {
-                await log("Deferred quota refresh did not produce reportable data", {
-                    sessionID,
-                    trigger,
-                    retryable: fetchResult.retryable,
-                    retryReason: fetchResult.retryReason,
-                });
-                return;
-            }
-            if (!message) {
-                await log("No quota message to display", { trigger });
-                return;
-            }
-            if (!config.enableToast) {
-                await log("Toast disabled (enableToast=false)", { trigger });
-                return;
-            }
-            // Show toast
-            try {
-                await typedClient.tui.showToast({
-                    body: {
-                        message: sanitizeDisplayText(message),
-                        variant: "info",
-                        duration: config.toastDurationMs,
+            };
+            const unsubscribeStore = store.subscribe(announce);
+            // New settings (saved here, or settings.jsonc edited by hand, by an agent or by another
+            // OpenCode process) can change the providers, who each one is signed in as, the words and
+            // the prices. They supersede the store's running work: every client gets a snapshot built
+            // from them at once, then the new rows as more `changed` events. A check made with another
+            // time limit, interval or price list is out of date, so every provider is checked again.
+            const settingsWatch = await liveSettings.follow(async (change) => {
+                store.settingsChanged({ recheck: change.recheck });
+                if (change.oldCommands) {
+                    // The command list is built again from the settings now in use. An open TUI keeps its
+                    // "/" list until OpenCode restarts: OpenCode 2 sends this reload without the folder
+                    // (location) that the TUI refreshes its list for.
+                    await ctx.command.reload().catch((error) => {
+                        console.warn(`[opencode-quota] command reload failed: ${safeErrorText(error)}`);
+                    });
+                }
+            });
+            await ctx.tool.transform((editor) => {
+                const host = {
+                    openCodeProviderIds: async () => (await ctx.provider.list()).data.map(({ id }) => id),
+                    locationDirectory,
+                    settings: liveSettings,
+                };
+                for (const tool of quotaAgentTools(host))
+                    editor.add(tool);
+                editor.add({
+                    name: "quota_status",
+                    description: "Diagnostics for toast, TUI, pricing and local storage.",
+                    input: {
+                        type: "object",
+                        properties: {},
+                        additionalProperties: false,
+                    },
+                    async execute(_input, context) {
+                        const text = await buildStatusOutput(context.sessionID, {
+                            origin: "tool",
+                            reconcileDetectedProviders: true,
+                        });
+                        return { content: sanitizeDisplayText(text) };
                     },
                 });
-                triggerMaintainerAnnouncementToastFallback(trigger, fetchResult?.detectedProviderIds ??
-                    detectedProviderIdsByToastCacheKey.get(toastCacheKey) ??
-                    []);
-                await log("Displayed quota toast", { message, trigger });
-            }
-            catch (err) {
-                await log("Failed to show toast", {
-                    error: err instanceof Error ? err.message : String(err),
+            });
+            // Web and Desktop list these in their "/" menu and get the report as a chat message. The
+            // TUI shows /quota, /quota_usage and /quota_status in its quota window instead.
+            const postReport = async (sessionID, command, report) => {
+                // A message admitted while the AI works is delivered into that turn at its next
+                // step, and can make the AI take one more step. Wait until the session is idle.
+                await ctx.session.wait({ sessionID });
+                const metadata = { command, at: Date.now() };
+                // The report is posted as the user's message. resume: false admits it without
+                // starting a model turn, so it waits in the session inbox, where Web and Desktop
+                // show it. "steer" delivers it together with the user's next message; "queue"
+                // would later give it a model turn of its own.
+                await ctx.session.prompt({
+                    sessionID,
+                    text: formatQuotaReportMessage(sanitizeDisplayText(report)),
+                    metadata: { [QUOTA_REPORT_METADATA_KEY]: metadata },
+                    delivery: "steer",
+                    resume: false,
+                });
+            };
+            /** Posts the usage report `argumentsText` asks for, like "30d" or "between <date> <date>". */
+            const postUsage = async (sessionID, command, argumentsText) => {
+                const parsed = parseUsageArguments(argumentsText);
+                if (!parsed.ok) {
+                    await postReport(sessionID, command, parsed.error);
+                    return;
+                }
+                const { range, from, to } = parsed;
+                let text;
+                try {
+                    text = usageText(await loadUsageReport({ range, from, to, sessionID }), {
+                        mode: "cost",
+                        breakdown: "model",
+                    });
+                }
+                catch (error) {
+                    text = `Couldn't read the usage: ${error instanceof Error ? error.message : String(error)}`;
+                }
+                await postReport(sessionID, command, text);
+            };
+            await ctx.command.transform((editor) => {
+                editor.add({
+                    name: "quota",
+                    description: "Quick look: your quota limits and the last 7 days of usage.",
+                    async execute(invocation) {
+                        // /quota waits for the providers that are due a check; the rest show their last rows.
+                        const snapshot = forClients(await store.refresh({ reason: "poll", sessionID: invocation.sessionID }));
+                        // Without OpenCode's history the limits still show.
+                        const usage = await loadUsageReport({ range: DEFAULT_QUICK_LOOK_RANGE }).catch((error) => {
+                            console.warn(`[opencode-quota] /quota usage failed: ${safeErrorText(error)}`);
+                            return undefined;
+                        });
+                        const notices = await listNotices({ providerIds: await noticeTargets() });
+                        const report = quotaMessageText({ snapshot, usage, notices, nowMs: Date.now() });
+                        await postReport(invocation.sessionID, "quota", report);
+                    },
+                });
+                editor.add({
+                    name: "quota_status",
+                    description: "Diagnostics for quota, TUI, pricing, and local storage.",
+                    async execute(invocation) {
+                        const text = await buildStatusOutput(invocation.sessionID, {
+                            origin: "slash_command",
+                            reconcileDetectedProviders: true,
+                        });
+                        await postReport(invocation.sessionID, "quota_status", text);
+                    },
+                });
+                editor.add({
+                    name: "quota_usage",
+                    description: "Tokens and API cost: today (default), 24h, 7d, 30d, 90d, all, session (with its subagents), or between YYYY-MM-DD YYYY-MM-DD.",
+                    execute: (invocation) => postUsage(invocation.sessionID, "quota_usage", invocation.prompt.text),
+                });
+                // Read each time OpenCode builds the list, so `system.oldCommands` adds or removes them.
+                if (!liveSettings.current().settings.system.oldCommands)
+                    return;
+                for (const [name, range] of Object.entries(OLD_USAGE_COMMANDS)) {
+                    editor.add({
+                        name,
+                        description: range === "between"
+                            ? "Same as /quota_usage between YYYY-MM-DD YYYY-MM-DD."
+                            : `Same as /quota_usage ${range}.`,
+                        execute: (invocation) => postUsage(invocation.sessionID, name, `${range} ${invocation.prompt.text}`),
+                    });
+                }
+            });
+            // Keep quota reports out of every model request built from session history:
+            // normal turns, compaction summaries, and generate requests.
+            for (const hook of ["context", "compaction", "generate"]) {
+                await ctx.session.hook(hook, (event) => {
+                    event.messages = withoutQuotaReports(event.messages);
                 });
             }
-        }
-        finally {
-            const state = deferredQuotaRefreshes.get(sessionID);
-            if (state && state === pendingDeferred) {
-                state.inFlight = false;
-            }
-        }
-    }
-    // Return hook implementations
-    return {
-        dispose: async () => {
-            disposeQuotaTelemetryOwner(typedClient);
+            // OpenCode titles a new session from its first user message, which can be a report.
+            // With nothing else to title from, skip the title request and keep the default title.
+            await ctx.session.hook("title", (event) => {
+                if (!event.messages.some((message) => message.content.some(hasQuotaReportText)))
+                    return;
+                event.messages = withoutQuotaReports(event.messages);
+                const textLeft = event.messages.some((message) => message.content.some((part) => part.type === "text" && part.text.trim() !== ""));
+                if (!textLeft)
+                    event.result = "";
+            });
+            // With waitForQuotaReset on, a request that hit a provider limit is retried after the
+            // used-up quota window resets. Any failure keeps OpenCode's own retry decision.
+            await ctx.session.hook("retry", async (event) => {
+                try {
+                    const delay = await resolveQuotaResetRetryDelayMs({ store, loadSettings: () => loadServerSettings(sourceHost) }, event);
+                    if (delay !== undefined)
+                        event.decision = { retry: true, delay };
+                }
+                catch (error) {
+                    console.warn(`[opencode-quota] retry hook failed: ${safeErrorText(error)}`);
+                }
+            });
+            // Every login read in this process goes through this location's `ctx.integration`. Bound
+            // last, so a setup that fails part way leaves no binding behind. OpenCode routes tools,
+            // commands and RPC calls to the plugin only after setup, so no read comes earlier.
+            const unbindCredentialSource = bindCredentialSource(createIntegrationCredentialSource(ctx.integration));
+            // A login added, changed or switched in OpenCode drops cached logins and failed-login
+            // entries, so the next read asks OpenCode again, and makes the store check who each
+            // provider is signed in as. If the subscription fails, cached logins stay until they
+            // expire; the log says why. Model selections update the session's quota scope too.
+            // The cleanup's abort ends the subscription silently. OpenCode before 2.2 ignores `types`
+            // and sends every event, so the loop still checks each event's type.
+            const credentialEvents = new AbortController();
+            void (async () => {
+                for await (const event of ctx.event.subscribe({
+                    types: ["credential.updated", "credential.switched", "session.model.selected"],
+                    signal: credentialEvents.signal,
+                })) {
+                    if (event.type === "credential.updated" || event.type === "credential.switched") {
+                        notifyCredentialsChanged();
+                        store.invalidateIdentity();
+                    }
+                    if (event.type === "session.model.selected") {
+                        store.sessionModelChanged(event.data.sessionID);
+                    }
+                }
+            })().catch((error) => {
+                if (credentialEvents.signal.aborted)
+                    return;
+                console.warn(`[opencode-quota] credential event subscription stopped: ${safeErrorText(error)}`);
+            });
+            // Running fetches still read logins and prices, so the store is drained before the
+            // bindings go.
+            return async () => {
+                credentialEvents.abort();
+                settingsWatch.close();
+                unsubscribeStore();
+                publisher.dispose();
+                await store.dispose();
+                unbindCredentialSource();
+                liveSettings.dispose();
+            };
         },
-        config: async (input) => {
-            const cfg = input;
-            opencodeConfig = cfg;
-            if (shouldRegisterServerSlashCommands({ isMainThread, argv: process.argv })) {
-                registerDeterministicSlashCommands(cfg);
-            }
-            // Keep the config-time correction for #39. injectRawOutput repeats the
-            // same correction after later config hooks have run to handle #169.
-            normalizeDefaultAgent(cfg);
-        },
-        "command.execute.before": async (input) => {
-            if (!isQuotaDialogCommand(input.command))
-                return;
-            await handleDeterministicSlashCommand(input);
-        },
-        tool: {
-            quota_status: tool({
-                description: "Diagnostics for toast + TUI + pricing + local storage (includes unknown pricing report).",
-                args: {
-                    refreshGoogleTokens: tool.schema
-                        .boolean()
-                        .optional()
-                        .describe("If true, refresh Google Antigravity access tokens before reporting"),
-                    skewMs: tool.schema
-                        .number()
-                        .int()
-                        .min(0)
-                        .optional()
-                        .describe("Refresh tokens expiring within this window (ms). Default: 120000"),
-                    force: tool.schema
-                        .boolean()
-                        .optional()
-                        .describe("If true, refresh even if cached token looks valid"),
-                },
-                async execute(args, context) {
-                    const result = await buildQuotaDialogCommandOutput({
-                        command: "quota_status",
-                        arguments: JSON.stringify({
-                            refreshGoogleTokens: args.refreshGoogleTokens,
-                            skewMs: args.skewMs,
-                            force: args.force,
-                        }),
-                        client: typedClient,
-                        roots: getPluginRuntimeRootHints(),
-                        sessionID: context.sessionID,
-                        resolveSessionMeta: (sessionID) => getSessionModelMeta(sessionID),
-                        lastSessionTokenError,
-                        log,
-                        onDetectedProviderIds: reconcileDetectedProviderConfig,
-                    });
-                    if (result.state !== "output")
-                        return "";
-                    context.metadata({ title: "Quota Status" });
-                    await injectRawOutput(context.sessionID, result.output);
-                    return ""; // Empty return - output already injected with noReply
-                },
-            }),
-        },
-        // Event hook for session.idle and session.compacted
-        event: async ({ event }) => {
-            const sessionID = event.properties.sessionID;
-            if (!sessionID)
-                return;
-            if (event.type !== "session.idle" && event.type !== "session.compacted") {
-                return;
-            }
-            if (!configLoaded) {
-                await refreshConfig();
-            }
-            if (!config.enabled) {
-                clearDeferredQuotaRefresh(sessionID);
-                return;
-            }
-            if (event.type === "session.idle" && config.showOnIdle) {
-                await showQuotaToast(sessionID, "session.idle");
-            }
-            else if (event.type === "session.compacted" && config.showOnCompact) {
-                await showQuotaToast(sessionID, "session.compacted");
-            }
-        },
-        // Tool execute hook for question tool
-        "tool.execute.after": async (input, _output) => {
-            if (input.tool !== "question")
-                return;
-            if (!configLoaded) {
-                await refreshConfig();
-            }
-            if (!config.enabled) {
-                clearDeferredQuotaRefresh(input.sessionID);
-                return;
-            }
-            if (config.showOnQuestion) {
-                await showQuotaToast(input.sessionID, "question");
-            }
-        },
-    };
-};
+    });
+}
+export const QuotaToastPlugin = createQuotaServerPlugin();
+export default QuotaToastPlugin;
 //# sourceMappingURL=plugin.js.map

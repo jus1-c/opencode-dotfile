@@ -1,0 +1,194 @@
+import { columnsOf, padEndColumns, padStartColumns, sliceColumns } from "../../view/columns.js";
+import { checkedAgoText, fit } from "../../view/format.js";
+import { errorWords, rowFacts } from "../../view/row-facts.js";
+import { visibleGroups } from "../../view/select.js";
+import { barSegments, trimEnd, withPaceLevel, } from "../../view/text.js";
+/** Before a provider's name. */
+const HEADING_INDENT = " ";
+/** Before a row's label, an error and the line that says no provider was found. */
+const INDENT = "   ";
+/** Between the label, the bar and the percent. */
+const GAP = "  ";
+/** Before the reset and before the pace. */
+const WIDE_GAP = "   ";
+const LABEL_MAX = 24;
+/** The labels are cut to this before the reset and the pace move under the bar. */
+const LABEL_NARROW = 12;
+const BAR_MAX = 80;
+/** The bar each step down to a narrower grid needs; below the last, rows take two lines. */
+const BAR_ROOMY = 20;
+const BAR_SHORT = 14;
+const BAR_MIN = 8;
+const widest = (texts) => Math.max(0, ...texts.map(columnsOf));
+function resetWords(row, long) {
+    if (!row.reset)
+        return "";
+    return long ? `resets in ${row.reset}` : row.shortReset;
+}
+/** The widest grid that fits `width`, giving way in the order the file comment describes. */
+function gridFor(rows, width) {
+    const bars = rows.filter((row) => row.percent !== undefined);
+    const labelWidest = Math.min(LABEL_MAX, widest(rows.map((row) => row.name)));
+    if (bars.length === 0) {
+        // Only balances and other values: they line up at their right ends.
+        const barColumn = INDENT.length + labelWidest + GAP.length;
+        const values = widest(rows.map((row) => row.value));
+        const percent = Math.max(1, Math.min(values, width - barColumn));
+        return {
+            label: labelWidest,
+            bar: 0,
+            percent,
+            reset: 0,
+            pace: 0,
+            longReset: true,
+            narrow: false,
+            barColumn,
+        };
+    }
+    const percent = widest(bars.map((row) => row.value));
+    const pace = widest(bars.map((row) => row.pace?.words ?? ""));
+    const build = (longReset, label, narrow) => {
+        const reset = widest(bars.map((row) => resetWords(row, longReset)));
+        const barColumn = INDENT.length + label + GAP.length;
+        const tail = narrow
+            ? 0
+            : (reset > 0 ? WIDE_GAP.length + reset : 0) + (pace > 0 ? WIDE_GAP.length + pace : 0);
+        const fixed = barColumn + GAP.length + percent + tail;
+        const bar = Math.min(BAR_MAX, Math.max(1, width - fixed));
+        return { label, bar, percent, reset, pace, longReset, narrow, barColumn };
+    };
+    const roomy = build(true, labelWidest, false);
+    if (roomy.bar >= BAR_ROOMY)
+        return roomy;
+    const short = build(false, labelWidest, false);
+    if (short.bar >= BAR_SHORT)
+        return short;
+    const cut = build(false, Math.min(labelWidest, LABEL_NARROW), false);
+    if (cut.bar >= BAR_MIN)
+        return cut;
+    // A very narrow window cuts the labels further, down to 4 columns, to keep the bar.
+    const room = width - INDENT.length - 2 * GAP.length - percent - BAR_MIN;
+    return build(true, Math.min(labelWidest, LABEL_NARROW, Math.max(4, room)), true);
+}
+function rowLines(row, grid, width, shape, words) {
+    const { id, percent } = row;
+    const label = {
+        text: `${INDENT}${fit(row.name, grid.label)}${GAP}`,
+        role: "label",
+        percent,
+    };
+    if (percent === undefined) {
+        // A balance or other value ends where the percents end, so the amounts line up.
+        const end = grid.bar > 0 ? grid.bar + GAP.length + grid.percent : grid.percent;
+        const room = Math.max(1, Math.min(end, width - grid.barColumn));
+        const value = padStartColumns(fit(row.value, room).trimEnd(), room);
+        return [{ id, segments: [label, { text: value, role: "value" }] }];
+    }
+    const tag = (segments) => withPaceLevel(segments, row.paceLevel);
+    const bar = barSegments(shape, percent, grid.bar, row.evenLeft, words);
+    const percentSegment = {
+        text: `${GAP}${padStartColumns(row.value, grid.percent)}`,
+        role: "percent",
+        percent,
+    };
+    const pace = row.pace && {
+        text: row.pace.words,
+        role: row.pace.fast ? "warning" : "value",
+    };
+    const reset = resetWords(row, grid.longReset);
+    if (!grid.narrow) {
+        const segments = [label, ...bar, percentSegment];
+        if (grid.reset > 0) {
+            const text = `${WIDE_GAP}${padEndColumns(reset, grid.reset)}`;
+            segments.push({ text, role: "reset", percent });
+        }
+        if (pace)
+            segments.push({ ...pace, text: `${WIDE_GAP}${pace.text}` });
+        return [{ id, segments: tag(trimEnd(segments)) }];
+    }
+    const under = { text: " ".repeat(grid.barColumn), role: "label" };
+    const lines = [{ id, segments: tag([label, ...bar, percentSegment]) }];
+    const resetSegment = { text: reset, role: "reset", percent };
+    const together = grid.barColumn + columnsOf(reset) + 3 + columnsOf(pace?.text ?? "");
+    if (reset && pace && together <= width) {
+        const dot = { text: " · ", role: "reset", percent };
+        lines.push({ id, segments: tag([under, resetSegment, dot, pace]) });
+        return lines;
+    }
+    if (reset)
+        lines.push({ id, segments: tag([under, resetSegment]) });
+    if (pace)
+        lines.push({ id, segments: [under, pace] });
+    return lines;
+}
+/** `line` cut to `width` columns: the last guard that keeps every line inside the window. */
+function clipped(line, width) {
+    const segments = [];
+    let room = width;
+    for (const segment of line.segments) {
+        const text = sliceColumns(segment.text, Math.max(0, room));
+        if (text)
+            segments.push({ ...segment, text });
+        room -= columnsOf(text);
+    }
+    return { id: line.id, segments };
+}
+/** The provider's line: its name, its plan and `checked` ("checked 4 min ago"), when it has one. */
+function providerLine(group, checked) {
+    const indent = { text: HEADING_INDENT, role: "label" };
+    const name = { text: group.name, role: "provider", bold: true };
+    const account = group.account ? [{ text: `  ${group.account}`, role: "account" }] : [];
+    const age = checked ? [{ text: `${WIDE_GAP}${checked}`, role: "value" }] : [];
+    return { id: group.id, segments: [indent, name, ...account, ...age] };
+}
+export function limitsLines(input) {
+    const { snapshot, display, nowMs, width } = input;
+    // Every row: the supplementary ones too, and none hidden.
+    const words = { ...display.words, detail: "detailed" };
+    const settings = { ...display, sidebar: { ...display.sidebar, hidden: [] } };
+    const groups = visibleGroups(snapshot, settings, "sidebar", {
+        ...words,
+        onlyCurrentModel: false,
+    });
+    if (groups.length === 0) {
+        return [
+            {
+                id: "",
+                segments: [
+                    { text: `${INDENT}No quota providers found. The Plugin tab says why.`, role: "value" },
+                ],
+            },
+        ];
+    }
+    // Full names, exact times and every pace, whatever the settings; the even-use marker with
+    // `layout.evenUse`, like every other place.
+    const place = {
+        words,
+        nowMs,
+        names: "label",
+        percent: "words",
+        times: "exact",
+        evenUse: display.layout.evenUse,
+        pace: "all",
+    };
+    const facts = new Map(groups.map((group) => [group.id, group.rows.map((item) => rowFacts(item, group, place))]));
+    const grid = gridFor([...facts.values()].flat(), width);
+    // With bars off elsewhere, Limits keeps a thin line.
+    const shape = display.layout.bar === "none" ? "line" : display.layout.bar;
+    return groups.flatMap((group, index) => {
+        const lines = index > 0 ? [{ id: "", segments: [] }] : [];
+        const okAtMs = snapshot.providers.find((provider) => provider.providerId === group.providerId)?.okAtMs;
+        lines.push(providerLine(group, checkedAgoText(okAtMs, nowMs)));
+        const error = errorWords(group, nowMs);
+        if (error) {
+            lines.push({
+                id: group.id,
+                segments: [{ text: fit(`${INDENT}${error}`, width).trimEnd(), role: "error" }],
+            });
+        }
+        for (const row of facts.get(group.id) ?? [])
+            lines.push(...rowLines(row, grid, width, shape, words));
+        return lines.map((line) => clipped(line, width));
+    });
+}
+//# sourceMappingURL=limits.js.map

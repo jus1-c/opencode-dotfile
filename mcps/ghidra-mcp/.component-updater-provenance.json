@@ -1,10 +1,10 @@
 {
-  "ghidra_mcp_tag": "v6.0.0",
-  "ghidra_mcp_commit": "8cd2078e10b9ba28b188cb84ce5b9051a904b995",
-  "ghidra_version": "12.1.2",
-  "ghidra_sha256": "b62e81a0390618466c019c60d8c2f796ced2509c4c1aea4a37644a77272cf99d",
+  "ghidra_mcp_tag": "v7.0.0",
+  "ghidra_mcp_commit": "dev",
+  "ghidra_version": "12.1.4",
+  "ghidra_sha256": "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db",
   "jdk_major": 21,
   "jdk_version": "21.0.12.1",
   "maven_version": "3.9.9",
-  "last_updated": "2026-09-03T22:00:00Z"
+  "last_updated": "2026-10-24T20:45:52Z"
 }

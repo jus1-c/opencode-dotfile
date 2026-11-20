@@ -22,8 +22,29 @@ MVN_ARCHIVE = "https://archive.apache.org/dist/maven/maven-3"
 
 JDK_COMPAT = {
     "12.0": 21, "12.0.4": 21,
-    "12.1": 21, "12.1.2": 21, "12.1.3": 21,
+    "12.1": 21, "12.1.2": 21, "12.1.3": 21, "12.1.4": 21,
 }
+
+GHIDRA_JARS = [
+    ("Framework/Generic", "Generic"),
+    ("Framework/SoftwareModeling", "SoftwareModeling"),
+    ("Framework/Project", "Project"),
+    ("Framework/Docking", "Docking"),
+    ("Framework/Utility", "Utility"),
+    ("Framework/Gui", "Gui"),
+    ("Framework/FileSystem", "FileSystem"),
+    ("Framework/Graph", "Graph"),
+    ("Framework/DB", "DB"),
+    ("Framework/Emulation", "Emulation"),
+    ("Framework/Help", "Help"),
+    ("Debug/Debugger-api", "Debugger-api"),
+    ("Debug/Framework-TraceModeling", "Framework-TraceModeling"),
+    ("Debug/Debugger-rmi-trace", "Debugger-rmi-trace"),
+    ("Features/Base", "Base"),
+    ("Features/Decompiler", "Decompiler"),
+    ("Features/PDB", "PDB"),
+    ("Features/FunctionID", "FunctionID"),
+]
 
 
 def fail(msg):
@@ -149,6 +170,52 @@ def download_maven(version, dest):
     tar_path.unlink()
 
 
+def install_ghidra_jars(mvn_bin, ghidra_dir, version, env):
+    for rel, artifact in GHIDRA_JARS:
+        jar = ghidra_dir / "Ghidra" / rel / "lib" / f"{artifact}.jar"
+        if not jar.exists():
+            fail(f"Ghidra JAR not found: {jar}")
+        r = subprocess.run(
+            [str(mvn_bin), "-q", "install:install-file",
+             f"-Dfile={jar}", "-DgroupId=ghidra", f"-DartifactId={artifact}",
+             f"-Dversion={version}", "-Dpackaging=jar"],
+            capture_output=True, text=True, env=env,
+        )
+        if r.returncode != 0:
+            fail(f"mvn install:install-file failed for {artifact}: {(r.stdout + r.stderr)[-500:]}")
+
+
+def dereference_links(root):
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if not path.is_symlink():
+            continue
+        resolved = path.resolve()
+        path.unlink()
+        if resolved.is_dir():
+            shutil.copytree(resolved, path, symlinks=False)
+        else:
+            shutil.copy2(resolved, path)
+
+
+def rewrite_shebangs(venv, target_venv):
+    old = str(venv).encode()
+    new = str(target_venv).encode()
+    for path in (venv / "bin").iterdir():
+        if not path.is_file() or path.is_symlink():
+            continue
+        contents = path.read_bytes()
+        if contents.startswith(b"#!"):
+            path.write_bytes(contents.replace(old, new, 1))
+    # Editable installs record the stage path in a .pth; leaving it points the
+    # venv at a stage dir that is deleted after the swap (import fails).
+    stage_root = str(venv.parent.parent).encode()
+    target_root = str(target_venv.parent.parent).encode()
+    for pth in venv.glob("lib/python*/site-packages/*.pth"):
+        contents = pth.read_bytes()
+        if stage_root in contents:
+            pth.write_bytes(contents.replace(stage_root, target_root))
+
+
 def check():
     prov = current_provenance()
     current_tag = prov.get("ghidra_mcp_tag", "unknown")
@@ -237,21 +304,24 @@ def update():
         download_jdk(needed_jdk, staged_jdk)
     elif JAVA_HOME.exists():
         if not staged_jdk.exists():
-            shutil.copytree(JAVA_HOME, staged_jdk, symlinks=True)
+            shutil.copytree(JAVA_HOME, staged_jdk, symlinks=False)
     else:
         fail("No existing JDK and cannot determine required version")
 
     staged_maven = staged_runtime / "maven"
     if MAVEN_HOME.exists() and not staged_maven.exists():
-        shutil.copytree(MAVEN_HOME, staged_maven, symlinks=True)
+        shutil.copytree(MAVEN_HOME, staged_maven, symlinks=False)
 
     staged_venv = staged_runtime / ".venv"
     if not staged_venv.exists():
-        uv = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv")
-        r = run([uv, "venv", str(staged_venv)], java_home=staged_jdk, maven_home=staged_maven)
+        uv = shutil.which("uv") or "uv"
+        r = run([sys.executable, "-m", "venv", "--copies", str(staged_venv)],
+                java_home=staged_jdk, maven_home=staged_maven)
         if r.returncode != 0:
-            fail(f"uv venv failed: {r.stderr}")
-        r = run([uv, "pip", "install", "-e", ".", "--python", str(staged_venv / "bin/python")],
+            fail(f"venv creation failed: {r.stderr}")
+        (staged_venv / "lib64").unlink(missing_ok=True)
+        r = run([uv, "pip", "install", "--link-mode", "copy", "-e", ".",
+                 "--python", str(staged_venv / "bin/python")],
                 java_home=staged_jdk, maven_home=staged_maven, cwd=str(staged_source))
         if r.returncode != 0:
             fail(f"uv pip install failed: {r.stderr}")
@@ -260,6 +330,8 @@ def update():
     env["JAVA_HOME"] = str(staged_jdk)
     env["PATH"] = f"{staged_jdk}/bin:{staged_maven}/bin:{env.get('PATH', '')}"
     env["GHIDRA_INSTALL_DIR"] = str(staged_ghidra_dir)
+
+    install_ghidra_jars(staged_maven / "bin/mvn", staged_ghidra_dir, ghidra_version, env)
 
     r = subprocess.run(
         [str(staged_maven / "bin/mvn"), "clean", "package", "assembly:single", "-DskipTests", "-Pheadless"],
@@ -275,14 +347,16 @@ def update():
             current_mv = mm.group(1) if mm else None
         if mvn_ver and current_mv and mvn_ver != current_mv:
             download_maven(mvn_ver, staged_maven)
+            env["PATH"] = f"{staged_jdk}/bin:{staged_maven}/bin:{env.get('PATH', '')}"
+            install_ghidra_jars(staged_maven / "bin/mvn", staged_ghidra_dir, ghidra_version, env)
             r = subprocess.run(
                 [str(staged_maven / "bin/mvn"), "clean", "package", "assembly:single", "-DskipTests", "-Pheadless"],
                 capture_output=True, text=True, cwd=str(staged_source), env=env,
             )
             if r.returncode != 0:
-                fail(f"mvn build failed (after Maven update to {mvn_ver}): {r.stderr[-500:]}")
+                fail(f"mvn build failed (after Maven update to {mvn_ver}): {(r.stdout + r.stderr)[-800:]}")
         else:
-            fail(f"mvn build failed: {r.stderr[-500:]}")
+            fail(f"mvn build failed: {(r.stdout + r.stderr)[-800:]}")
 
     jar_src = staged_source / "target" / f"GhidraMCP-{latest_tag.lstrip('v')}.jar"
     if not jar_src.exists():
@@ -300,10 +374,6 @@ def update():
             shutil.copy2(src, dst)
             dst.chmod(0o755)
 
-    updater_src = Path(__file__)
-    shutil.copy2(updater_src, stage / "component-updater")
-    (stage / "component-updater").chmod(0o755)
-
     new_jdk_ver = None
     java_bin = staged_jdk / "bin/java"
     if java_bin.exists():
@@ -317,6 +387,12 @@ def update():
         mr = subprocess.run([str(mvn_bin), "--version"], capture_output=True, text=True, env=env)
         mm = re.search(r"Apache Maven (\d+\.\d+\.\d+)", mr.stdout)
         new_mvn_ver = mm.group(1) if mm else None
+
+    dereference_links(staged_runtime)
+    rewrite_shebangs(staged_venv, TARGET / "runtime" / ".venv")
+    links = [str(path.relative_to(stage)) for path in stage.rglob("*") if path.is_symlink()]
+    if links:
+        fail("staged tree contains symbolic links: " + ", ".join(links[:5]))
 
     provenance = {
         "ghidra_mcp_tag": latest_tag,
@@ -335,10 +411,12 @@ def update():
         "planSha256": plan_sha,
         "paths": [
             "source",
-            "runtime",
+            "runtime/jdk",
+            "runtime/maven",
+            "runtime/.venv",
+            "runtime/GhidraMCP.jar",
             "ghidra-releases",
             "bin",
-            "component-updater",
             ".component-updater-provenance.json",
         ],
     }

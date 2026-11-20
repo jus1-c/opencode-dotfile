@@ -1,113 +1,45 @@
 /**
- * Generic API key resolution from env vars, config files, and auth.json.
+ * One API key resolver for every API-key vendor.
  *
- * Used by provider-specific config modules (synthetic-config, chutes-config)
- * to resolve API keys with consistent priority and behavior.
+ * Order (first wins): environment variables, then the key OpenCode ends up with from the config
+ * files that count for the session's folder (`providers.<id>.settings.apiKey`, or the legacy
+ * `provider.<id>.options.apiKey`, with `{env:NAME}` templates), then OpenCode's stored logins.
+ * Each vendor's spec is its `apiKey` in `provider-registration.ts`.
  */
-/** A candidate config file path with its format */
-export interface ConfigCandidate {
-    path: string;
-    isJsonc: boolean;
-}
-/**
- * Get candidate paths for opencode.json/opencode.jsonc files.
- *
- * Order: local (cwd) first, then global (~/.config/opencode).
- * Within each location, .jsonc takes precedence over .json.
- */
-export declare function getOpencodeConfigCandidatePaths(): ConfigCandidate[];
-/**
- * Get trusted global-only candidate paths for opencode.json/opencode.jsonc files.
- *
- * Provider secrets must not be sourced from repo-local config because the
- * current workspace may be untrusted.
- */
-export declare function getGlobalOpencodeConfigCandidatePaths(): ConfigCandidate[];
-/**
- * Read and parse an opencode config file.
- *
- * @returns Parsed config with metadata, or null if file doesn't exist or is invalid
- */
-export declare function readOpencodeConfig(filePath: string, isJsonc: boolean): Promise<{
-    config: unknown;
-    path: string;
-    isJsonc: boolean;
-} | null>;
-/** Result of API key resolution */
-export interface ApiKeyResult<Source extends string> {
-    key: string;
-    source: Source;
-}
-/** Environment variable definition for key resolution */
-export interface EnvVarDef<Source extends string> {
-    name: string;
-    source: Source;
-}
-export declare function getFirstAuthEntryValue(auth: unknown, authKeys: readonly string[]): unknown;
-export declare function getFirstAuthEntryRecord(auth: unknown, authKeys: readonly string[]): Record<string, unknown> | null;
-export declare function extractProviderOptionsApiKey(config: unknown, params: {
+import { type CredentialRow } from "./opencode-auth.js";
+import { QUOTA_PROVIDER_REGISTRATION_SOURCE } from "./provider-registration.js";
+/** Where an API key may live for one vendor. */
+export interface ApiKeySpec {
+    /** Checked first, in order. Also the only names allowed in `{env:NAME}` config templates. */
+    envVars: readonly string[];
+    /** Provider ids read from the OpenCode config files, in order. */
     providerKeys: readonly string[];
-    allowedEnvVars?: readonly string[];
-}): string | null;
-export declare function extractAuthApiKeyEntry(auth: unknown, authKeys: readonly string[]): string | null;
-/** Configuration for resolving an API key from trusted env/config sources */
-export interface ResolveEnvAndConfigApiKeyConfig<Source extends string> {
-    /** Environment variables to check (in order) */
-    envVars: EnvVarDef<Source>[];
-    /** Extract API key from parsed config object. Returns null if not found. */
-    extractFromConfig: (config: unknown) => string | null;
-    /** Source label for opencode.json */
-    configJsonSource: Source;
-    /** Source label for opencode.jsonc */
-    configJsoncSource: Source;
-    /**
-     * Candidate config file paths to trust for provider-secret lookup.
-     *
-     * Defaults to trusted user/global OpenCode config paths only.
-     */
-    getConfigCandidates?: () => ConfigCandidate[];
-}
-/** Configuration for resolving an API key from multiple sources */
-export interface ResolveApiKeyConfig<Source extends string> extends ResolveEnvAndConfigApiKeyConfig<Source> {
-    /** Extract API key from auth.json data. Returns null if not found. */
-    extractFromAuth: (auth: unknown) => string | null;
-    /** Source label for auth.json */
-    authSource: Source;
-}
-/** Shared configuration for provider-specific API key resolution. */
-export interface ResolveProviderApiKeyBaseConfig<Source extends string> {
-    envVars: EnvVarDef<Source>[];
-    providerKeys: readonly string[];
-    allowedEnvVars?: readonly string[];
-    configJsonSource: Source;
-    configJsoncSource: Source;
-    getConfigCandidates?: () => ConfigCandidate[];
-}
-export interface StrictApiKeyAuthConfig<Source extends string> {
-    policy?: "strict-api-key";
-    readAuth: () => Promise<unknown | null>;
-    getAuthPaths?: () => string[];
+    /** OpenCode login integration ids, in order. Default: `providerKeys`. */
     authKeys?: readonly string[];
-    authSource: Source;
+    /** Read key logins only: the same integration can also hold an OAuth sign-in. */
+    keyLoginsOnly?: boolean;
 }
-export interface InvalidAwareApiKeyAuthConfig<AuthSource extends string> {
-    policy: "invalid-aware-api-key";
-    readAuth: (maxAgeMs: number) => Promise<unknown | null>;
-    getAuthPaths: () => string[];
+/** An API-key vendor; a broken stored login (wrong type, empty key, unreadable) is an error. */
+export interface ApiKeyLoginSpec extends ApiKeySpec {
     authKeys: readonly string[];
-    authSource: AuthSource;
+    /** Used in login errors, e.g. "Z.ai auth entry has invalid shape". */
     displayName: string;
-    defaultMaxAgeMs: number;
+    /** Replaces the "Unsupported <name> auth type" error (it would echo the stored type). */
+    unsupportedTypeError?: string;
+    /** A stored login that is not a usable API key is left out instead of shown as an error. */
+    skipBrokenLogins?: boolean;
 }
-/** Configuration for simple nullable API key resolution. */
-export interface ResolveProviderApiKeyConfig<Source extends string> extends ResolveProviderApiKeyBaseConfig<Source> {
-    auth?: StrictApiKeyAuthConfig<Source>;
+type ApiKeyVendorId = Extract<(typeof QUOTA_PROVIDER_REGISTRATION_SOURCE)[number], {
+    apiKey: object;
+}>["id"];
+/** Each API-key vendor's spec, from its `apiKey` in provider-registration.ts. */
+export declare const API_KEY_VENDORS: Readonly<Record<ApiKeyVendorId, ApiKeyLoginSpec>>;
+export type ApiKeySource = `env:${string}` | "opencode.json" | "opencode.jsonc" | "opencode.db";
+export interface ApiKeyResult {
+    key: string;
+    source: ApiKeySource;
 }
-/** Configuration for providers that surface malformed winning auth.json entries. */
-export interface ResolveInvalidAwareProviderApiKeyConfig<Source extends string, AuthSource extends Source> extends ResolveProviderApiKeyBaseConfig<Source> {
-    auth: InvalidAwareApiKeyAuthConfig<AuthSource>;
-}
-export type InvalidAwareAuthResult = {
+type ApiKeyLoginResult = {
     state: "none";
 } | {
     state: "configured";
@@ -116,93 +48,77 @@ export type InvalidAwareAuthResult = {
     state: "invalid";
     error: string;
 };
-export type InvalidAwareAuthDiagnostics<Source extends string, AuthSource extends Source> = {
+type DiagnosticPaths = {
+    checkedPaths: string[];
+    credentialDatabasePaths: string[];
+};
+export type ApiKeyLoginDiagnostics = ({
     state: "none";
     source: null;
-    checkedPaths: string[];
-    authPaths: string[];
-} | {
+} & DiagnosticPaths) | ({
     state: "configured";
-    source: Source;
-    checkedPaths: string[];
-    authPaths: string[];
-} | {
+    source: ApiKeySource;
+} & DiagnosticPaths) | ({
     state: "invalid";
-    source: AuthSource;
-    checkedPaths: string[];
-    authPaths: string[];
+    source: "opencode.db";
     error: string;
-};
-export interface ProviderApiKeyResolver<Source extends string> {
-    resolve: () => Promise<ApiKeyResult<Source> | null>;
-    has: () => Promise<boolean>;
-    diagnostics: () => Promise<{
-        configured: boolean;
-        source: Source | null;
-        checkedPaths: string[];
-        authPaths: string[];
-    }>;
-}
-export interface InvalidAwareProviderApiKeyResolver<Source extends string, AuthSource extends Source> {
-    parseAuth: (auth: unknown) => InvalidAwareAuthResult;
-    resolve: (params?: {
-        maxAgeMs?: number;
-    }) => Promise<InvalidAwareAuthResult>;
-    diagnostics: (params?: {
-        maxAgeMs?: number;
-    }) => Promise<InvalidAwareAuthDiagnostics<Source, AuthSource>>;
-}
-export interface ApiKeyCheckedPathsConfig {
-    /** Environment variable names to check */
-    envVarNames: string[];
-    /**
-     * Candidate config file paths to report for provider-secret lookup.
-     *
-     * Defaults to trusted user/global OpenCode config paths only.
-     */
-    getConfigCandidates?: () => ConfigCandidate[];
-}
-export declare function createProviderApiKeyResolver<Source extends string, AuthSource extends Source>(config: ResolveInvalidAwareProviderApiKeyConfig<Source, AuthSource>): InvalidAwareProviderApiKeyResolver<Source, AuthSource>;
-export declare function createProviderApiKeyResolver<Source extends string>(config: ResolveProviderApiKeyConfig<Source>): ProviderApiKeyResolver<Source>;
+} & DiagnosticPaths);
+/** The login of the first auth key, in order, that has one among `rows`. */
+export declare function firstLoginRow(rows: readonly CredentialRow[], authKeys: readonly string[]): CredentialRow | undefined;
 /**
- * Resolve an API key from trusted env vars and config files.
+ * Read one provider's settings the way OpenCode 2 normalizes its config.
  *
- * Priority (first wins):
- * 1. Environment variables (in order specified)
- * 2. Trusted user/global opencode.json/opencode.jsonc candidates
+ * A native `providers.<id>` entry replaces the legacy `provider.<id>` entry,
+ * whose `options` OpenCode 2 migrates into `settings` unless it drops the entry.
  */
-export declare function resolveApiKeyFromEnvAndConfig<Source extends string>(config: ResolveEnvAndConfigApiKeyConfig<Source>): Promise<ApiKeyResult<Source> | null>;
-export declare function getApiKeyCheckedPaths(config: ApiKeyCheckedPathsConfig): string[];
+export declare function getProviderConfigSettings(config: unknown, providerKey: string): Record<string, unknown> | null;
 /**
- * Resolve an API key from multiple sources with consistent priority.
- *
- * Priority (first wins):
- * 1. Environment variables (in order specified)
- * 2. Trusted user/global opencode.json/opencode.jsonc
- * 3. auth.json
- *
- * @returns API key and source, or null if not found
+ * Read one provider string setting from the OpenCode config files that count for `directory`:
+ * the value OpenCode ends up with, when it is a non-empty string.
  */
-export declare function resolveApiKey<Source extends string>(config: ResolveApiKeyConfig<Source>, readAuth: () => Promise<unknown | null>): Promise<ApiKeyResult<Source> | null>;
-export declare function resolveProviderApiKey<Source extends string>(config: ResolveProviderApiKeyConfig<Source>): Promise<ApiKeyResult<Source> | null>;
-/** Configuration for API key diagnostics */
-export interface DiagnosticsConfig<Source extends string> {
-    /** Environment variable names to check */
-    envVarNames: string[];
-    /** Resolver function to get the current key result */
-    resolve: () => Promise<ApiKeyResult<Source> | null>;
-    /** Candidate config file paths to report for provider-secret lookup. */
-    getConfigCandidates?: () => ConfigCandidate[];
-}
-/**
- * Get diagnostic info about API key configuration.
- *
- * Reports which sources were checked (env vars that exist, config files that exist)
- * and whether a key was found.
- */
-export declare function getApiKeyDiagnostics<Source extends string>(config: DiagnosticsConfig<Source>): Promise<{
-    configured: boolean;
-    source: Source | null;
-    checkedPaths: string[];
+export declare function readProviderConfigString(providerKey: string, settingKey: string, directory: string): Promise<string | undefined>;
+/** Environment variables, then the OpenCode config files that count for `directory`. */
+export declare function resolveApiKeyFromEnvAndConfig(spec: ApiKeySpec, directory: string): Promise<ApiKeyResult | null>;
+/** Env vars that are set and the OpenCode config files for `directory` that exist (no values). */
+export declare function getApiKeyCheckedPaths(spec: Pick<ApiKeySpec, "envVars">, directory: string): string[];
+export declare function resolveApiKey(spec: ApiKeySpec, directory: string): Promise<ApiKeyResult | null>;
+/** The vendor's stored login that decides: the active one of its first auth key (cached 5 s). */
+export declare function readApiKeyLoginRow(spec: ApiKeyLoginSpec): Promise<CredentialRow | undefined>;
+/** A stored login as an API key: `none` without one, `invalid` when it is not a usable key. */
+export declare function parseApiKeyLogin(spec: ApiKeyLoginSpec, row: CredentialRow | undefined): ApiKeyLoginResult;
+export declare function resolveApiKeyLoginWithDiagnostics(spec: ApiKeyLoginSpec, directory: string): Promise<{
+    auth: ApiKeyLoginResult;
+    diagnostics: ApiKeyLoginDiagnostics;
 }>;
-//# sourceMappingURL=api-key-resolver.d.ts.map
+export declare function resolveApiKeyLogin(spec: ApiKeyLoginSpec, directory: string): Promise<ApiKeyLoginResult>;
+export declare function getApiKeyLoginDiagnostics(spec: ApiKeyLoginSpec, directory: string): Promise<ApiKeyLoginDiagnostics>;
+export type KeyLogin = {
+    row: CredentialRow;
+    auth: Exclude<ApiKeyLoginResult, {
+        state: "none";
+    }>;
+};
+/**
+ * Every key login of the vendor stored in OpenCode, in OpenCode's order, with what each one
+ * holds. `selectRows` narrows the logins further, for example to drop alias duplicates.
+ */
+export declare function readKeyLogins(spec: ApiKeyLoginSpec, options?: {
+    selectRows?: (rows: CredentialRow[]) => CredentialRow[];
+}): Promise<KeyLogin[]>;
+/**
+ * The keys a vendor checks: the env or config key when one is set, else every stored login.
+ * `broken` is the error of the first stored login when it is not a usable key and no stored
+ * key login is listed (for example an OAuth login of a key-only vendor); vendors that skip
+ * broken logins never have one.
+ */
+export type VendorKeys = {
+    envOrConfig: ApiKeyResult | null;
+    logins: KeyLogin[];
+    broken: string | null;
+};
+export declare function readVendorKeys(spec: ApiKeyLoginSpec, directory: string, options?: {
+    selectRows?: (rows: CredentialRow[]) => CredentialRow[];
+}): Promise<VendorKeys>;
+/** True when the vendor has a key to check, or a broken login to show. */
+export declare function hasVendorKey(keys: VendorKeys): boolean;
+export {};

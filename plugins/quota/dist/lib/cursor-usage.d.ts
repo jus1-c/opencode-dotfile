@@ -1,17 +1,18 @@
-import type { TokenBuckets } from "./quota-stats.js";
-export interface CursorCycleWindow {
+import { type TokenBuckets } from "./token-buckets.js";
+interface CursorCycleWindow {
     sinceMs: number;
     untilMs: number;
     resetTimeIso: string;
     source: "configured_day" | "calendar_month";
 }
-export interface CursorUsageBucket {
+interface CursorUsageBucket {
     costUsd: number;
     tokens: TokenBuckets;
     messageCount: number;
 }
-export interface CursorUsageSummary {
+interface CursorUsageSummary {
     window: CursorCycleWindow;
+    observedAtMs: number;
     api: CursorUsageBucket;
     autoComposer: CursorUsageBucket;
     total: CursorUsageBucket;
@@ -20,7 +21,10 @@ export interface CursorUsageSummary {
         messageCount: number;
         tokens: TokenBuckets;
     }>;
+    /** Requests of known models without a price: prompts past Cursor's long-context threshold. */
+    unpricedRequestCount: number;
 }
+/** A configured start day (1-28) sets the cycle; otherwise the cycle is the calendar month. */
 export declare function computeCursorCycleWindow(params?: {
     nowMs?: number;
     billingCycleStartDay?: number;
@@ -29,4 +33,4 @@ export declare function getCurrentCursorUsageSummary(params?: {
     nowMs?: number;
     billingCycleStartDay?: number;
 }): Promise<CursorUsageSummary>;
-//# sourceMappingURL=cursor-usage.d.ts.map
+export {};

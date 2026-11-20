@@ -1,190 +1,228 @@
-/**
- * OpenCode Go dashboard scraper.
- *
- * Fetches the OpenCode Go workspace page and parses usage data from two
- * possible formats:
- * 1. SolidJS SSR hydration output (`$R[\d+]={...usagePercent...resetInSec...}`)
- * 2. HTML with `data-slot` attributes (newer format)
- *
- * The scraper tries SolidJS SSR first, then falls back to data-slot parsing.
- */
 import { sanitizeDisplayText } from "./display-sanitize.js";
-import { fetchWithTimeout } from "./http.js";
-const DASHBOARD_URL_PREFIX = "https://opencode.ai/workspace/";
-const DASHBOARD_URL_SUFFIX = "/go";
-const USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Gecko/20100101 Firefox/148.0";
-const SCRAPE_TIMEOUT_MS = 10_000;
-/**
- * Regex patterns matching the SolidJS SSR hydration output.
- * Field order may vary, so we try both orderings.
- */
-const SCRAPED_NUMBER_PATTERN = String.raw `(-?\d+(?:\.\d+)?)`;
-const RE_ROLLING_PCT_FIRST = new RegExp(String.raw `rollingUsage:\$R\[\d+\]=\{[^}]*usagePercent:${SCRAPED_NUMBER_PATTERN}[^}]*resetInSec:${SCRAPED_NUMBER_PATTERN}[^}]*\}`);
-const RE_ROLLING_RESET_FIRST = new RegExp(String.raw `rollingUsage:\$R\[\d+\]=\{[^}]*resetInSec:${SCRAPED_NUMBER_PATTERN}[^}]*usagePercent:${SCRAPED_NUMBER_PATTERN}[^}]*\}`);
-const RE_WEEKLY_PCT_FIRST = new RegExp(String.raw `weeklyUsage:\$R\[\d+\]=\{[^}]*usagePercent:${SCRAPED_NUMBER_PATTERN}[^}]*resetInSec:${SCRAPED_NUMBER_PATTERN}[^}]*\}`);
-const RE_WEEKLY_RESET_FIRST = new RegExp(String.raw `weeklyUsage:\$R\[\d+\]=\{[^}]*resetInSec:${SCRAPED_NUMBER_PATTERN}[^}]*usagePercent:${SCRAPED_NUMBER_PATTERN}[^}]*\}`);
-const RE_MONTHLY_PCT_FIRST = new RegExp(String.raw `monthlyUsage:\$R\[\d+\]=\{[^}]*usagePercent:${SCRAPED_NUMBER_PATTERN}[^}]*resetInSec:${SCRAPED_NUMBER_PATTERN}[^}]*\}`);
-const RE_MONTHLY_RESET_FIRST = new RegExp(String.raw `monthlyUsage:\$R\[\d+\]=\{[^}]*resetInSec:${SCRAPED_NUMBER_PATTERN}[^}]*usagePercent:${SCRAPED_NUMBER_PATTERN}[^}]*\}`);
-function parseWindowUsage(html, rePctFirst, reResetFirst) {
-    const pctFirstMatch = rePctFirst.exec(html);
-    if (pctFirstMatch) {
-        const usagePercent = Number(pctFirstMatch[1]);
-        const resetInSec = Number(pctFirstMatch[2]);
-        if (Number.isFinite(usagePercent) && Number.isFinite(resetInSec)) {
-            return { usagePercent, resetInSec };
-        }
-    }
-    const resetFirstMatch = reResetFirst.exec(html);
-    if (resetFirstMatch) {
-        const resetInSec = Number(resetFirstMatch[1]);
-        const usagePercent = Number(resetFirstMatch[2]);
-        if (Number.isFinite(usagePercent) && Number.isFinite(resetInSec)) {
-            return { usagePercent, resetInSec };
-        }
-    }
-    return null;
+import { failureFacts, requestJson } from "./http.js";
+import { asRecord } from "./json-guards.js";
+import { consoleBaseUrl, consoleHeaders, } from "./opencode-console-auth.js";
+const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
+const OPENCODE_GO_WINDOW_ORDER = ["rolling", "weekly", "monthly"];
+const CONSOLE_METER_KEYS = {
+    rolling: "fiveHour",
+    weekly: "week",
+    monthly: "month",
+};
+const OFFSET_ISO_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/;
+function sanitizeMessage(text, accessToken) {
+    const redacted = accessToken ? text.replaceAll(accessToken, "[redacted]") : text;
+    const sanitized = sanitizeDisplayText(redacted).replace(/\s+/g, " ").trim();
+    return (sanitized || "unknown").slice(0, 120);
 }
-/**
- * Parse human-readable time strings like "1 hour 56 minutes", "6 days 2 hours", "26 days 17 hours"
- * into seconds.
- */
-function parseHumanReadableTime(timeStr) {
-    const normalized = timeStr.toLowerCase().trim().replace(/\s+/g, " ");
-    if (["reset-now", "reset now", "now", "resets now"].includes(normalized)) {
-        return 0;
+function contractError(message) {
+    return { success: false, error: `Invalid OpenCode Go API response: ${message}` };
+}
+/** A real calendar date and time with `Z` or a `±HH:MM` offset. */
+function isValidOffsetIsoTimestamp(value) {
+    const match = OFFSET_ISO_TIMESTAMP.exec(value);
+    if (!match)
+        return false;
+    const [year, month, day, hour, minute, second, offsetHour, offsetMinute] = match
+        .slice(1)
+        .map((part) => Number(part ?? 0));
+    const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    const daysInMonth = [0, 31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    return (month >= 1 &&
+        month <= 12 &&
+        day >= 1 &&
+        day <= (daysInMonth[month] ?? 0) &&
+        hour <= 23 &&
+        minute <= 59 &&
+        second <= 59 &&
+        offsetHour <= 23 &&
+        offsetMinute <= 59);
+}
+/** All three windows in order; the first invalid window fails the whole response. */
+function normalizeWindows(normalize) {
+    const windows = {};
+    for (const windowKey of OPENCODE_GO_WINDOW_ORDER) {
+        const window = normalize(windowKey);
+        if ("success" in window)
+            return window;
+        windows[windowKey] = window;
     }
-    let totalSeconds = 0;
-    // Match patterns like "X days", "X hours", "X minutes", "X seconds"
-    const dayMatch = normalized.match(/(\d+(?:\.\d+)?)\s*days?/);
-    const hourMatch = normalized.match(/(\d+(?:\.\d+)?)\s*hours?/);
-    const minuteMatch = normalized.match(/(\d+(?:\.\d+)?)\s*minutes?/);
-    const secondMatch = normalized.match(/(\d+(?:\.\d+)?)\s*seconds?/);
-    const hasDuration = Boolean(dayMatch || hourMatch || minuteMatch || secondMatch);
-    if (dayMatch)
-        totalSeconds += Number(dayMatch[1]) * 86400;
-    if (hourMatch)
-        totalSeconds += Number(hourMatch[1]) * 3600;
-    if (minuteMatch)
-        totalSeconds += Number(minuteMatch[1]) * 60;
-    if (secondMatch)
-        totalSeconds += Number(secondMatch[1]);
-    return hasDuration ? totalSeconds : null;
-}
-/**
- * Parse the newer data-slot HTML format.
- * Returns a record of window names to their usage data.
- */
-function parseDataSlotFormat(html) {
-    const result = {};
-    const items = html.split(/data-slot="usage-item"/);
-    for (let i = 1; i < items.length; i++) {
-        const content = items[i];
-        // Extract the label (Rolling Usage, Weekly Usage, Monthly Usage)
-        const labelMatch = content.match(/data-slot="usage-label">([^<]+)</);
-        if (!labelMatch)
-            continue;
-        const label = labelMatch[1].trim().toLowerCase();
-        // Extract usage percentage - get the number after data-slot="usage-value">
-        const usageMatch = content.match(/data-slot="usage-value">[^0-9]*(\d+(?:\.\d+)?)/);
-        if (!usageMatch)
-            continue;
-        const usagePercent = Number(usageMatch[1]);
-        // Extract reset time - get content between reset-time/reset-now and </span>
-        const resetMatch = content.match(/data-slot="(reset-time|reset-now)">([\s\S]*?)<\/span>/);
-        if (!resetMatch)
-            continue;
-        // Clean up SolidJS comments and "Resets in" prefix
-        const resetContent = resetMatch[2]
-            .replace(/<!--\$-->/g, "")
-            .replace(/<!--\/-->/g, "")
-            .replace(/Resets?\s*in\s*/i, "")
-            .trim();
-        const resetInSec = resetMatch[1] === "reset-now" ? 0 : parseHumanReadableTime(resetContent);
-        if (!Number.isFinite(usagePercent) || resetInSec === null || !Number.isFinite(resetInSec))
-            continue;
-        // Map label to window key
-        let windowKey = null;
-        if (label.includes("rolling"))
-            windowKey = "rolling";
-        else if (label.includes("weekly"))
-            windowKey = "weekly";
-        else if (label.includes("monthly"))
-            windowKey = "monthly";
-        if (windowKey) {
-            result[windowKey] = { usagePercent, resetInSec };
-        }
-    }
-    return result;
-}
-function sanitizeMessage(text, maxLength = 120) {
-    const sanitized = sanitizeDisplayText(text).replace(/\s+/g, " ").trim();
-    return (sanitized || "unknown").slice(0, maxLength);
-}
-function normalizeWindowUsage(window, now) {
-    const usagePercent = Math.max(0, window.usagePercent);
-    const resetInSec = Math.max(0, window.resetInSec);
     return {
-        usagePercent,
-        resetInSec,
-        percentRemaining: 100 - usagePercent,
-        resetTimeIso: new Date(now + resetInSec * 1000).toISOString(),
+        success: true,
+        rolling: windows.rolling,
+        weekly: windows.weekly,
+        monthly: windows.monthly,
     };
 }
-export async function queryOpenCodeGoQuota(workspaceId, authCookie, options = {}) {
-    try {
-        const url = `${DASHBOARD_URL_PREFIX}${encodeURIComponent(workspaceId)}${DASHBOARD_URL_SUFFIX}`;
-        return await fetchWithTimeout(url, {
-            request: {
-                method: "GET",
-                headers: {
-                    "User-Agent": USER_AGENT,
-                    Accept: "text/html",
-                    Cookie: `auth=${authCookie}`,
-                },
-            },
-            timeoutMs: options.requestTimeoutMs ?? SCRAPE_TIMEOUT_MS,
-            consume: async (response) => {
-                if (!response.ok) {
-                    const text = await response.text();
-                    return {
-                        success: false,
-                        error: `OpenCode Go dashboard error ${response.status}: ${sanitizeMessage(text)}`,
-                    };
-                }
-                const html = await response.text();
-                // Try SolidJS SSR format first (more reliable when present)
-                let rolling = parseWindowUsage(html, RE_ROLLING_PCT_FIRST, RE_ROLLING_RESET_FIRST);
-                let weekly = parseWindowUsage(html, RE_WEEKLY_PCT_FIRST, RE_WEEKLY_RESET_FIRST);
-                let monthly = parseWindowUsage(html, RE_MONTHLY_PCT_FIRST, RE_MONTHLY_RESET_FIRST);
-                // Fall back to data-slot HTML format if SSR found nothing
-                if (!rolling && !weekly && !monthly) {
-                    const dataSlotResult = parseDataSlotFormat(html);
-                    rolling = dataSlotResult.rolling ?? null;
-                    weekly = dataSlotResult.weekly ?? null;
-                    monthly = dataSlotResult.monthly ?? null;
-                }
-                if (!rolling && !weekly && !monthly) {
-                    return {
-                        success: false,
-                        error: "Could not parse any known OpenCode Go dashboard usage windows (rollingUsage, weeklyUsage, monthlyUsage)",
-                    };
-                }
-                const now = Date.now();
-                return {
-                    success: true,
-                    ...(rolling ? { rolling: normalizeWindowUsage(rolling, now) } : {}),
-                    ...(weekly ? { weekly: normalizeWindowUsage(weekly, now) } : {}),
-                    ...(monthly ? { monthly: normalizeWindowUsage(monthly, now) } : {}),
-                };
-            },
-        });
+function normalizeWindow(windowKey, value, accessToken) {
+    const window = asRecord(value);
+    if (!window) {
+        return contractError(`${windowKey} window is missing or malformed`);
     }
-    catch (err) {
-        return {
-            success: false,
-            error: sanitizeMessage(err instanceof Error ? err.message : String(err)),
-        };
+    if (window.status !== "ok" && window.status !== "rate-limited") {
+        return contractError(`${windowKey} status is not ok: ${sanitizeMessage(String(window.status), accessToken)}`);
+    }
+    const percent = window.percent;
+    if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0 || percent > 100) {
+        return contractError(`${windowKey} percent must be a finite number from 0 to 100`);
+    }
+    const resetsAt = window.resetsAt;
+    if (typeof resetsAt !== "string" || !isValidOffsetIsoTimestamp(resetsAt)) {
+        return contractError(`${windowKey} resetsAt must be an offset-qualified ISO timestamp`);
+    }
+    const exhausted = window.status === "rate-limited";
+    return {
+        status: window.status,
+        usagePercent: exhausted ? 100 : percent,
+        percentRemaining: exhausted ? 0 : 100 - percent,
+        resetTimeIso: new Date(Date.parse(resetsAt)).toISOString(),
+    };
+}
+function isNotSubscribedResponse(status, text) {
+    if (status !== 403)
+        return false;
+    try {
+        const payload = asRecord(JSON.parse(text));
+        const error = asRecord(payload?.error);
+        return payload?.type === "error" && error?.type === "EntitlementError";
+    }
+    catch {
+        return false;
     }
 }
-export { parseWindowUsage as _parseWindowUsage, parseDataSlotFormat as _parseDataSlotFormat };
+export async function queryOpenCodeGoQuota(accessToken, options = {}) {
+    const reply = await requestJson(OPENCODE_GO_USAGE_URL, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+        secrets: [accessToken],
+        timeoutMs: options.requestTimeoutMs,
+    });
+    if (!reply.ok) {
+        const { failure } = reply;
+        if (failure.kind === "http" && failure.status !== undefined) {
+            if (isNotSubscribedResponse(failure.status, failure.detail)) {
+                return {
+                    success: false,
+                    error: "OpenCode Go not subscribed (403 EntitlementError)",
+                    facts: failureFacts(failure, "no_plan"),
+                    notSubscribed: true,
+                };
+            }
+            return {
+                success: false,
+                error: `OpenCode Go API error ${failure.status}: ${sanitizeMessage(failure.detail, accessToken)}`,
+                facts: failureFacts(failure),
+            };
+        }
+        if (failure.kind === "invalid_json") {
+            return contractError(`body is not valid JSON: ${sanitizeMessage(failure.detail, accessToken)}`);
+        }
+        return {
+            success: false,
+            error: sanitizeMessage(failure.detail, accessToken),
+            facts: failureFacts(failure),
+        };
+    }
+    const root = asRecord(reply.json);
+    if (!root)
+        return contractError("root must be an object");
+    const usage = asRecord(root.usage);
+    if (!usage)
+        return contractError("usage must be an object");
+    return normalizeWindows((windowKey) => normalizeWindow(windowKey, usage[windowKey], accessToken));
+}
+function asMicroCents(value) {
+    const parsed = typeof value === "string" ? Number(value) : typeof value === "number" ? value : Number.NaN;
+    return Number.isFinite(parsed) ? parsed : null;
+}
+function normalizeConsoleMeter(windowKey, meter, fallbackResetsAtIso) {
+    const limit = asMicroCents(meter.limitMicroCents);
+    const used = asMicroCents(meter.usedMicroCents);
+    if (limit === null || used === null || limit < 0 || used < 0) {
+        return contractError(`console ${windowKey} meter microcents are invalid`);
+    }
+    const percent = limit === 0
+        ? used > 0
+            ? 100
+            : 0
+        : Math.min(100, Math.max(0, Math.round((used / limit) * 100)));
+    const resetsAt = typeof meter.resetsAt === "string" && meter.resetsAt ? meter.resetsAt : fallbackResetsAtIso;
+    const resetTime = resetsAt ? Date.parse(resetsAt) : Number.NaN;
+    if (!Number.isFinite(resetTime)) {
+        return contractError(`console ${windowKey} resetsAt is missing or invalid`);
+    }
+    return {
+        status: percent >= 100 ? "rate-limited" : "ok",
+        usagePercent: percent,
+        percentRemaining: 100 - percent,
+        resetTimeIso: new Date(resetTime).toISOString(),
+    };
+}
+/**
+ * Read OpenCode Go subscription windows from the Console API.
+ *
+ * The Console tracks Go plan access (five-hour, weekly, and monthly meters)
+ * for the member that owns the OAuth credential, so this works for fresh
+ * accounts without any pre-2.0 workspace API key. The request goes to the
+ * login's Console server, scoped to the login's org when it has one.
+ */
+export async function queryOpenCodeGoConsoleStatus(credential, options = {}) {
+    const reply = await requestJson(`${consoleBaseUrl(credential)}/api/go/status`, {
+        method: "GET",
+        headers: consoleHeaders(credential),
+        secrets: [credential.accessToken],
+        timeoutMs: options.requestTimeoutMs,
+    });
+    if (!reply.ok) {
+        const { failure } = reply;
+        // 404 on this member-scoped route is read as "no Go subscription".
+        // 403 is kept ambiguous (it could be an access/permission issue on
+        // the console side rather than a subscription state), so callers
+        // fall back instead of showing a not-subscribed state.
+        if (failure.kind === "http" && failure.status === 404) {
+            return {
+                success: false,
+                error: "OpenCode Go subscription not found for this console account (404)",
+                facts: failureFacts(failure, "no_plan"),
+                notSubscribed: true,
+            };
+        }
+        if (failure.kind === "http") {
+            return {
+                success: false,
+                error: `OpenCode Console API error ${failure.status} (/api/go/status)`,
+                facts: failureFacts(failure),
+            };
+        }
+        if (failure.kind === "invalid_json")
+            return contractError("console response is not valid JSON");
+        return {
+            success: false,
+            error: sanitizeMessage(failure.detail, credential.accessToken),
+            facts: failureFacts(failure),
+        };
+    }
+    const root = asRecord(reply.json);
+    if (reply.json !== null && !root)
+        return contractError("console root must be an object");
+    const access = asRecord(root?.access);
+    if (!access) {
+        return {
+            success: false,
+            error: "OpenCode Go subscription is not active",
+            notSubscribed: true,
+        };
+    }
+    const meters = asRecord(access.meters);
+    if (!meters)
+        return contractError("console access meters are missing");
+    const endsAt = typeof access.endsAt === "string" ? access.endsAt : null;
+    return normalizeWindows((windowKey) => {
+        const meterKey = CONSOLE_METER_KEYS[windowKey];
+        const meter = asRecord(meters[meterKey]);
+        if (!meter)
+            return contractError(`console ${meterKey} meter is missing`);
+        return normalizeConsoleMeter(windowKey, meter, endsAt);
+    });
+}
 //# sourceMappingURL=opencode-go.js.map

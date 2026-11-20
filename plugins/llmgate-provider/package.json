@@ -6,9 +6,9 @@
   "scripts": {
     "test": "node --test"
   },
-  "main": "./index.js",
+  "main": "./server.js",
   "exports": {
-    ".": "./index.js"
+    ".": "./server.js"
   },
   "oc-plugin": [
     "server"
@@ -17,7 +17,9 @@
     "@napi-rs/keyring": "^1.3.0"
   },
   "files": [
-    "index.js",
+    "server.js",
+    "index.v1.js",
+    "model-metadata.js",
     "README.md"
   ],
   "license": "MIT"

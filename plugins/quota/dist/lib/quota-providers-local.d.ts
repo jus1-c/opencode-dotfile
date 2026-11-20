@@ -1,55 +1,48 @@
-import type { QuotaToastEntry } from "./entries.js";
-import type { OpencodeRuntimeDirs } from "./opencode-runtime-paths.js";
+import type { ProviderRow } from "../providers/contract.js";
 import type { OpenCodeMessage } from "./opencode-storage.js";
-import type { LocalEstimateQuotaProviderDefinition } from "./quota-providers.js";
+import { type LocalEstimateQuotaProviderDefinition, type LocalEstimateWindow } from "./quota-providers.js";
 import { type TokenBuckets } from "./token-buckets.js";
-export declare const QUOTA_PROVIDER_LOCAL_STATE_VERSION: 1;
-export interface LocalQuotaProviderMessage {
+/** OpenCode's completed assistant messages in a time range. */
+export type ReadCompletedMessages = (params: {
+    completedSinceMs: number;
+    completedUntilMs: number;
+}) => Promise<OpenCodeMessage[]>;
+/** A completed request: the message it came from and when it completed. */
+interface CountedRequest {
     id: string;
     atMs: number;
-    providerId: string;
     modelId: string;
     tokens: TokenBuckets;
 }
-export interface LocalQuotaProviderStateV1 {
-    version: typeof QUOTA_PROVIDER_LOCAL_STATE_VERSION;
-    definitionId: string;
-    providerId: string;
-    updatedAt: number;
-    messages: LocalQuotaProviderMessage[];
+/** One window's requests: when it resets and, for a UTC day, when it started. */
+export interface WindowCount {
+    window: LocalEstimateWindow;
+    /** Oldest first. */
+    requests: CountedRequest[];
+    resetsAt?: string;
+    windowStartedAt?: string;
 }
-export type LocalQuotaProviderStateHealth = "missing" | "healthy" | "malformed" | "version_mismatch";
-export interface LocalQuotaProviderStateDiagnostics {
-    path: string;
-    exists: boolean;
-    health: LocalQuotaProviderStateHealth;
-    version: number | null;
-    lastUpdatedAt: number | null;
-}
-export interface LocalEstimateResult {
-    entries: QuotaToastEntry[];
-    state: LocalQuotaProviderStateV1;
-    unpricedMessageCount: number;
-}
-interface LocalStateDependencies {
+/**
+ * This machine's completed requests to `providerIds` (and `modelIds`, when given) in each
+ * window, read from OpenCode's own messages since the longest window began. With
+ * `requireModelId`, a message that names no model is left out. A message counts once. A rolling window resets when its oldest request leaves it; a UTC day at midnight UTC.
+ */
+export declare function countRequestWindows(params: {
+    providerIds: readonly string[];
+    modelIds?: readonly string[];
+    requireModelId?: boolean;
+    windows: readonly LocalEstimateWindow[];
+    nowMs: number;
+    readMessages?: ReadCompletedMessages;
+}): Promise<WindowCount[]>;
+/**
+ * A local estimate's rows: each window's requests out of its limit and, with a USD budget, the
+ * spend out of the budget. Each key is the part of the row id after `custom.<definition id>.`.
+ */
+export declare function collectLocalQuotaProviderEstimate(definition: LocalEstimateQuotaProviderDefinition, dependencies?: {
     nowMs?: number;
-    runtimeDirs?: OpencodeRuntimeDirs;
-    readMessages?: (params: {
-        completedSinceMs: number;
-        completedUntilMs: number;
-    }) => Promise<OpenCodeMessage[]>;
-    readText?: (path: string) => Promise<string>;
-    writeState?: (path: string, state: LocalQuotaProviderStateV1) => Promise<void>;
-}
-export declare function getLocalQuotaProviderStatePath(definitionId: string, runtimeDirs?: OpencodeRuntimeDirs): string;
-export declare function syncLocalQuotaProviderState(definition: LocalEstimateQuotaProviderDefinition, dependencies?: LocalStateDependencies): Promise<LocalQuotaProviderStateV1>;
-export declare function computeLocalQuotaProviderEstimate(params: {
-    definition: LocalEstimateQuotaProviderDefinition;
-    state: LocalQuotaProviderStateV1;
-    nowMs?: number;
-}): LocalEstimateResult;
-export declare function collectLocalQuotaProviderEstimate(definition: LocalEstimateQuotaProviderDefinition, dependencies?: LocalStateDependencies): Promise<LocalEstimateResult>;
-export declare function inspectLocalQuotaProviderState(definition: LocalEstimateQuotaProviderDefinition, dependencies?: Pick<LocalStateDependencies, "runtimeDirs" | "readText">): Promise<LocalQuotaProviderStateDiagnostics>;
-export declare function __resetLocalQuotaProviderStateForTests(): void;
+    readMessages?: ReadCompletedMessages;
+}): Promise<{
+    rows: ProviderRow[];
+}>;
 export {};
-//# sourceMappingURL=quota-providers-local.d.ts.map

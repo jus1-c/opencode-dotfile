@@ -23,4 +23,3 @@
  * resolveEnvTemplate("literal-value")        // => "literal-value"
  */
 export declare function resolveEnvTemplate(value: string, allowedEnvVars?: readonly string[]): string | null;
-//# sourceMappingURL=env-template.d.ts.map

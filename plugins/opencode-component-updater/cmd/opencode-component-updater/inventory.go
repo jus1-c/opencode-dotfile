@@ -12,12 +12,20 @@ import (
 )
 
 type openCodeConfig struct {
-	MCP      mcpConfig `json:"mcp"`
-	Plugins  []any     `json:"plugins"`
+	MCP     map[string]mcpEntry `json:"mcp"`
+	Servers map[string]mcpEntry `json:"-"`
+	Plugin  []any               `json:"plugin"`
+	Plugins []any               `json:"plugins"`
 }
 
-type mcpConfig struct {
-	Servers map[string]mcpEntry `json:"servers"`
+type rawOpenCodeConfig struct {
+	MCP     json.RawMessage `json:"mcp"`
+	Plugin  []any           `json:"plugin"`
+	Plugins []any           `json:"plugins"`
+}
+
+type tuiConfig struct {
+	Plugin []any `json:"plugin"`
 }
 
 type cliConfig struct {
@@ -30,8 +38,12 @@ type mcpEntry struct {
 }
 
 func discoverComponents(configRoot string) (map[string]component, error) {
-	var openConfig openCodeConfig
-	if err := readOptionalJSON(filepath.Join(configRoot, "opencode.json"), &openConfig); err != nil {
+	openConfig, err := readOpenCodeConfig(filepath.Join(configRoot, "opencode.json"))
+	if err != nil {
+		return nil, err
+	}
+	var tui tuiConfig
+	if err := readOptionalJSON(filepath.Join(configRoot, "tui.json"), &tui); err != nil {
 		return nil, err
 	}
 	var cli cliConfig
@@ -42,14 +54,22 @@ func discoverComponents(configRoot string) (map[string]component, error) {
 	mcpRoot := filepath.Join(configRoot, "mcps")
 	pluginRoot := filepath.Join(configRoot, "plugins")
 	components := map[string]component{}
-	for name, entry := range openConfig.MCP.Servers {
-		var target *string
-		if entry.Type == "local" {
-			target = commandOwner(entry.Command, mcpRoot)
-		}
-		components["mcp."+name] = discoveredComponent("mcp", name, target)
+	// V2 nests servers under mcp.servers; V1 kept them directly under mcp.
+	for name, entry := range openConfig.Servers {
+		components["mcp."+name] = discoveredMCPServer(name, entry, mcpRoot)
 	}
-	for _, raw := range append(openConfig.Plugins, cli.Plugins...) {
+	for name, entry := range openConfig.MCP {
+		if _, found := components["mcp."+name]; found {
+			continue
+		}
+		components["mcp."+name] = discoveredMCPServer(name, entry, mcpRoot)
+	}
+	// V2 uses `plugins` in opencode.json and cli.json; V1 used `plugin` plus tui.json.
+	specs := append([]any{}, openConfig.Plugins...)
+	specs = append(specs, cli.Plugins...)
+	specs = append(specs, openConfig.Plugin...)
+	specs = append(specs, tui.Plugin...)
+	for _, raw := range specs {
 		spec := pluginSpec(raw)
 		target := ownerTarget(localPath(spec, configRoot), pluginRoot)
 		name := pluginName(spec, target)
@@ -86,6 +106,46 @@ func discoverComponents(configRoot string) (map[string]component, error) {
 	return components, nil
 }
 
+func discoveredMCPServer(name string, entry mcpEntry, mcpRoot string) component {
+	var target *string
+	if entry.Type == "local" {
+		target = commandOwner(entry.Command, mcpRoot)
+	}
+	return discoveredComponent("mcp", name, target)
+}
+
+// readOpenCodeConfig accepts both shapes of the mcp block, including a file
+// that mixes them: V2 nests servers under mcp.servers while V1 kept them
+// directly under mcp.
+func readOpenCodeConfig(path string) (openCodeConfig, error) {
+	var raw rawOpenCodeConfig
+	if err := readOptionalJSON(path, &raw); err != nil {
+		return openCodeConfig{}, err
+	}
+	result := openCodeConfig{Plugin: raw.Plugin, Plugins: raw.Plugins, MCP: map[string]mcpEntry{}}
+	if len(raw.MCP) == 0 {
+		return result, nil
+	}
+	var block map[string]json.RawMessage
+	if err := json.Unmarshal(raw.MCP, &block); err != nil {
+		return openCodeConfig{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	for name, contents := range block {
+		if name == "servers" {
+			if err := json.Unmarshal(contents, &result.Servers); err != nil {
+				return openCodeConfig{}, fmt.Errorf("parse %s mcp.servers: %w", path, err)
+			}
+			continue
+		}
+		var entry mcpEntry
+		if err := json.Unmarshal(contents, &entry); err != nil {
+			return openCodeConfig{}, fmt.Errorf("parse %s mcp.%s: %w", path, name, err)
+		}
+		result.MCP[name] = entry
+	}
+	return result, nil
+}
+
 func readOptionalJSON(path string, destination any) error {
 	contents, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -102,7 +162,6 @@ func readOptionalJSON(path string, destination any) error {
 
 func discoveredComponent(kind, name string, target *string) component {
 	item := component{Scope: "global", Kind: kind, Name: name, Target: target}
-	item.Source.Mode = "auto"
 	item.Policy.Apply = "none"
 	if target != nil {
 		item.Policy.Apply = "manual"
@@ -143,6 +202,12 @@ func pluginSpec(raw any) string {
 	}
 	if values, ok := raw.([]any); ok && len(values) > 0 {
 		if value, ok := values[0].(string); ok {
+			return value
+		}
+	}
+	// V2 object form: {"package": "...", "options": {...}}
+	if object, ok := raw.(map[string]any); ok {
+		if value, ok := object["package"].(string); ok {
 			return value
 		}
 	}

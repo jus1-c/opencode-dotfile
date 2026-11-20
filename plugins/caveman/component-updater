@@ -137,7 +137,9 @@ def update():
     subprocess.run(["git", "-C", source, "checkout", "--quiet", "--detach", "FETCH_HEAD"], check=True)
     with tempfile.TemporaryDirectory() as home:
         env = os.environ | {"HOME": home, "XDG_CONFIG_HOME": str(Path(home) / ".config")}
-        install_script = source / "bin/install.js" if (source / "bin/install.js").exists() else source / "cli/install.js"
+        install_script = next((path for name in ("installer", "bin", "cli") if (path := source / name / "install.js").is_file()), None)
+        if install_script is None:
+            raise SystemExit("Caveman installer not found in installer/, bin/, or cli/")
         subprocess.run(["node", install_script, "--only", "opencode", "--non-interactive", "--force", "--no-mcp-shrink"], env=env, check=True)
         installed = Path(home) / ".config/opencode"
         payload = stage / "payload"

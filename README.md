@@ -9,8 +9,8 @@ Personal [OpenCode](https://opencode.ai) harness, packaged to reinstall on any m
 | `opencode.json` | V2 global config: MCP servers, providers, plugins. Secrets referenced via `{env:VAR}` |
 | `cli.json` | V2 global CLI/TUI settings and plugins |
 | `AGENTS.md` | Global agent rules (Context7 workflow, coding guidelines, math output) |
-| `skills/` | Local skills: karpathy-guidelines, context7-library-check, opencode-component-install, windows-disk-forensics |
-| `plugins/` | Local plugins: caveman, quota, rtk, headroom, headroom-ctl, llmgate-provider, vilao-provider, taste-skill, superpowers, opencode-component-updater |
+| `skills/` | Local skills: coding workflow, CTF publishing, Draw.io, and OpenCode component maintenance |
+| `plugins/` | Local plugins: caveman, CTF skills, quota, RTK, reverse-skill, providers, taste-skill, superpowers, and updater components |
 | `mcps/` | MCP install scripts + requirements lockfiles. Venvs/binaries are generated, not committed |
 | `component-updater/` | Manifest template driving the component-updater plugin |
 | `install.sh` | One-shot bootstrap |
@@ -27,26 +27,27 @@ SKIP=ghidra-mcp ./install.sh # skip the ~2GB Ghidra toolchain
 
 `install.sh`:
 
-1. Backs up an existing `~/.config/opencode` to `~/.config/opencode.bak-<date>`
+1. Refuses to replace an existing non-symlink `~/.config/opencode`
 2. Symlinks this repo to `~/.config/opencode`
-3. Renders `component-updater/components.json` from the `__HOME__` template
-4. Creates `secrets.env` from `.env.example`
-5. Installs npm deps (root + npm-sourced plugins)
-6. Builds each MCP venv with uv (per-MCP Python version from its `component-updater` CONFIG; uv downloads the interpreter if missing)
-7. Ghidra MCP: runs its self-updater (downloads JDK/Maven/Ghidra; needs `gh` CLI)
-8. Enables `frida-game-hacking` only when `FRIDA_PYTHON` is set
+3. Renders updater config outside repo when the repo is symlinked
+4. Creates `~/.config/opencode-secrets.env` from `.env.example`
+5. Installs locked npm dependencies and builds the Vilao provider
+6. Restores pinned CTF, taste, reverse-skill, RTK, and updater runtimes
+7. Creates or syncs MCP venvs with uv from locked requirements
+8. Leaves Ghidra setup for its updater and warns when its runtime is absent
+9. Enables `frida-game-hacking` through ignored local `opencode.jsonc` only when `FRIDA_PYTHON` is set
 
 ## Secrets
 
 ```bash
-$EDITOR ~/.config/opencode/secrets.env   # fill in the keys
+$EDITOR ~/.config/opencode-secrets.env   # fill in the keys
 # add to ~/.zshrc:
-[ -f "$HOME/.config/opencode/secrets.env" ] && source "$HOME/.config/opencode/secrets.env"
+[ -f "$HOME/.config/opencode-secrets.env" ] && source "$HOME/.config/opencode-secrets.env"
 ```
 
-Variables: `VIRUSTOTAL_API_KEY`, `CONTEXT7_API_KEY`, `ANYSEARCH_BEARER`, `KIROBOT_CLAUDE_API_KEY`, `KIROBOT_GPT_API_KEY`. Optional: `FRIDA_PYTHON` + `FRIDA_MIRROR` + `FRIDA_MIRROR_WIN` (WSL frida-game-hacking), `TSHARK_PATH`/`CAPINFOS_PATH` overrides.
+Variables: `VIRUSTOTAL_API_KEY`, `CONTEXT7_API_KEY`, `ANYSEARCH_BEARER`, `GITHUB_TOKEN`, `KIROBOT_CLAUDE_API_KEY`, `KIROBOT_GPT_API_KEY`. Optional: `FRIDA_PYTHON` + `FRIDA_MIRROR` + `FRIDA_MIRROR_WIN` (WSL frida-game-hacking), `TSHARK_PATH`/`CAPINFOS_PATH` overrides.
 
-`secrets.env` is gitignored. Never commit real values.
+`opencode-secrets.env` is outside repo. Never commit real values.
 
 ## Machine-local data (NOT in this repo)
 
@@ -55,13 +56,12 @@ Auth and session state live outside the config dir and must be recreated per mac
 - `~/.local/share/opencode/auth.json`, `auth-v2.json`, `account.json` — provider logins (`opencode auth login` / llmgate login flow)
 - `~/.local/share/opencode/llmgate-login.v1.json` — llmgate-provider login
 - `~/.local/share/opencode/opencode.db` — session history
-- `~/.headroom/memory.db` — headroom-memory data
+- CTF scope config points `OPENCODE_CONFIG` at `plugins/ctf-skills/ctf-skills.json` while inside `OPENCODE_CTF_ROOT`
 
 ## External tool prerequisites
 
-- `opencode` CLI, `node`/`npm`, `python3`, `uv`, `ripgrep`, `gh` (ghidra updater)
+- `opencode` CLI, `node`/`npm`, `bun`, `python3`, `uv`, `ripgrep`, `gh` (ghidra updater)
 - `codegraph` binary (codegraph MCP)
-- `headroom` binary + `uv tool install headroom-ai` (headroom plugins/MCP)
 - `tshark`/`capinfos` (network-forensics MCP; absolute paths in `opencode.json` — adjust if yours live in `/usr/bin`)
 
 ## OpenCode V2

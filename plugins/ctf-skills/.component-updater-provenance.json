@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "remote": "https://github.com/ljagiello/ctf-skills.git",
+  "commit": "20d182d9377f0467830f314bb0f843cae4dbf55e",
+  "skills": [
+    "ctf-pwn",
+    "ctf-reverse",
+    "ctf-forensics",
+    "ctf-malware",
+    "solve-challenge",
+    "ctf-writeup"
+  ]
+}

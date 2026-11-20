@@ -5,22 +5,39 @@
  * Legacy premium-request reports are available only when explicitly selected
  * for an eligible Copilot Pro or Pro+ annual plan.
  */
-import type { AuthData, CopilotBillingModel, CopilotQuotaConfig, CopilotResult } from "./types.js";
-type CopilotAuthKeyName = "github-copilot" | "copilot" | "copilot-chat" | "github-copilot-chat";
+import { type CredentialRow } from "./opencode-auth.js";
+import { type ResolvedAuthIdentity } from "./resolved-auth-identity.js";
+import type { CopilotBillingModel, CopilotQuotaConfig, CopilotResult } from "./types.js";
+/** Integration ids that can hold the Copilot OAuth login, in precedence order. */
+export declare const COPILOT_AUTH_KEYS: readonly ["github-copilot", "copilot", "copilot-chat", "github-copilot-chat"];
+type CopilotAuthKeyName = (typeof COPILOT_AUTH_KEYS)[number];
 type CopilotPatTokenKind = "github_pat" | "ghp" | "ghu" | "ghs" | "other";
-type EffectiveCopilotAuthSource = "pat" | "oauth" | "none";
-type CopilotQuotaApi = "github_ai_credit_api" | "github_legacy_premium_request_api" | "github_billing_api" | "copilot_internal_user" | "none";
-type CopilotBillingMode = "user_quota" | "organization_usage" | "enterprise_usage" | "none";
-type CopilotRemainingTotalsState = "available" | "value_only_without_denominator" | "not_available_from_org_usage" | "not_available_from_enterprise_usage" | "reported_by_copilot_internal_user" | "unavailable";
-type CopilotDeployment = "github.com" | "ghe.com" | "invalid" | "none";
-type CopilotEnterpriseHostSource = "pat" | "oauth" | "none";
 interface BillingPeriodQuery {
     year: number;
     month: number;
 }
-export type CopilotPatState = "absent" | "invalid" | "valid";
-export interface CopilotPatReadResult {
-    state: CopilotPatState;
+interface UserBillingTarget {
+    scope: "user";
+    username?: string;
+    billingPeriod: BillingPeriodQuery;
+}
+interface OrganizationBillingTarget {
+    scope: "organization";
+    organization: string;
+    username?: string;
+    billingPeriod: BillingPeriodQuery;
+}
+interface EnterpriseBillingTarget {
+    scope: "enterprise";
+    enterprise: string;
+    organization?: string;
+    username?: string;
+    billingPeriod: BillingPeriodQuery;
+}
+type ManagedBillingTarget = OrganizationBillingTarget | EnterpriseBillingTarget;
+type CopilotBillingTarget = UserBillingTarget | ManagedBillingTarget;
+interface CopilotPatReadResult {
+    state: "absent" | "invalid" | "valid";
     checkedPaths: string[];
     selectedPath?: string;
     config?: CopilotQuotaConfig;
@@ -36,28 +53,29 @@ export interface CopilotQuotaAuthDiagnostics {
         hasAccessToken: boolean;
         hasEnterpriseUrl: boolean;
     };
-    deployment: CopilotDeployment;
+    deployment: "github.com" | "ghe.com" | "invalid" | "none";
     apiHost: string | null;
-    enterpriseHostSource: CopilotEnterpriseHostSource;
-    enterpriseHostError?: string;
-    effectiveSource: EffectiveCopilotAuthSource;
+    enterpriseHostSource: "pat" | "oauth" | "none";
+    effectiveSource: "pat" | "oauth" | "none";
     override: "pat_overrides_oauth" | "none";
-    quotaApi: CopilotQuotaApi;
-    billingMode: CopilotBillingMode;
-    billingScope: "user" | "organization" | "enterprise" | "none";
+    quotaApi: "github_ai_credit_api" | "github_legacy_premium_request_api" | "copilot_internal_user" | "none";
+    billingMode: "user_quota" | "organization_usage" | "enterprise_usage" | "none";
+    billingScope: CopilotBillingTarget["scope"] | "none";
     billingApiAccessLikely: boolean;
-    remainingTotalsState: CopilotRemainingTotalsState;
+    remainingTotalsState: "available" | "value_only_without_denominator" | "not_available_from_org_usage" | "not_available_from_enterprise_usage" | "reported_by_copilot_internal_user" | "unavailable";
     queryPeriod?: BillingPeriodQuery;
-    usernameFilter?: string;
-    billingTargetError?: string;
-    tokenCompatibilityError?: string;
     billingModel?: CopilotBillingModel;
     budgetApi: "organization_budgets" | "enterprise_budgets" | "not_available";
     oauthAccountingState: "available_via_copilot_internal_user" | "invalid_enterprise_host" | "not_configured";
 }
-export declare function getCopilotPatConfigCandidatePaths(): string[];
-export declare function readQuotaConfigWithMeta(): CopilotPatReadResult;
-export declare function getCopilotQuotaAuthDiagnostics(authData: AuthData | null): CopilotQuotaAuthDiagnostics;
+/** What Copilot can check: the PAT config, and every OpenCode Copilot OAuth login. */
+export type CopilotLogins = {
+    pat: CopilotPatReadResult;
+    oauth: CredentialRow[];
+};
+/** Any PAT config, even an invalid one, is authoritative over OAuth. */
+export declare function readCopilotLogins(): Promise<CopilotLogins>;
+export declare function getCopilotQuotaAuthDiagnostics(logins: CopilotLogins): CopilotQuotaAuthDiagnostics;
 /**
  * Query GitHub Copilot accounting.
  *
@@ -66,8 +84,8 @@ export declare function getCopilotQuotaAuthDiagnostics(authData: AuthData | null
  */
 export declare function queryCopilotQuota(options?: {
     requestTimeoutMs?: number;
+    login?: CredentialRow;
 }): Promise<CopilotResult>;
-export declare function hasCopilotQuotaRuntimeAvailable(): Promise<boolean>;
-export declare function formatCopilotQuota(result: CopilotResult): string | null;
+/** Who Copilot is signed in as: the PAT config, or every OAuth login it checks. */
+export declare function copilotLoginsIdentity(logins: CopilotLogins): Promise<ResolvedAuthIdentity | null>;
 export {};
-//# sourceMappingURL=copilot.d.ts.map

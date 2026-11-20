@@ -1,6 +1,7 @@
 import { readFile } from "fs/promises";
 import { join } from "path";
-import { getOpencodeRuntimeDirCandidates } from "./opencode-runtime-paths.js";
+import { isRecord } from "./json-guards.js";
+import { getOpencodeRuntimeDirs } from "./opencode-runtime-paths.js";
 const MIMO_COOKIE_ENV = "MIMO_USAGE_COOKIE";
 const RETAINED_COOKIE_NAMES = [
     "api-platform_serviceToken",
@@ -10,11 +11,10 @@ const RETAINED_COOKIE_NAMES = [
 ];
 const RETAINED_COOKIE_NAME_SET = new Set(RETAINED_COOKIE_NAMES);
 const REQUIRED_COOKIE_NAMES = ["api-platform_serviceToken", "userId"];
-function getConfigCandidatePaths() {
-    const { configDirs } = getOpencodeRuntimeDirCandidates();
-    return configDirs.map((dir) => join(dir, "opencode-quota", "mimo.json"));
+function getConfigPath() {
+    return join(getOpencodeRuntimeDirs().configDir, "opencode-quota", "mimo.json");
 }
-export function normalizeMimoCookieHeader(raw) {
+function normalizeMimoCookieHeader(raw) {
     if (raw.includes("\r") || raw.includes("\n"))
         return null;
     const withoutPrefix = raw.trim().replace(/^cookie\s*:\s*/iu, "");
@@ -45,82 +45,50 @@ export function normalizeMimoCookieHeader(raw) {
         return value === undefined ? [] : [`${name}=${value}`];
     }).join("; ");
 }
-async function readConfigFile(path) {
+function resolveCookie(raw, source) {
+    const cookie = normalizeMimoCookieHeader(raw);
+    if (!cookie)
+        return { state: "invalid", source, error: "Invalid cookie header" };
+    return { state: "configured", config: { cookie }, source };
+}
+async function resolveMimoConfigFile(path) {
+    const invalid = (error) => ({
+        state: "invalid",
+        source: path,
+        error,
+    });
+    let data;
     try {
-        const data = await readFile(path, "utf8");
-        let parsed;
-        try {
-            parsed = JSON.parse(data);
-        }
-        catch {
-            return { state: "invalid", error: "Failed to parse JSON" };
-        }
-        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-            return { state: "invalid", error: "Config file must contain a JSON object" };
-        }
-        const record = parsed;
-        return { state: "loaded", cookie: record.cookie, keys: Object.keys(record) };
+        data = await readFile(path, "utf8");
     }
     catch (error) {
-        if (error?.code === "ENOENT") {
-            return { state: "missing" };
-        }
-        return { state: "invalid", error: "Failed to read config file" };
+        if (error?.code === "ENOENT")
+            return { state: "none" };
+        return invalid("Failed to read config file");
     }
+    let parsed;
+    try {
+        parsed = JSON.parse(data);
+    }
+    catch {
+        return invalid("Failed to parse JSON");
+    }
+    if (!isRecord(parsed))
+        return invalid("Config file must contain a JSON object");
+    const keys = Object.keys(parsed);
+    if (keys.length !== 1 || keys[0] !== "cookie") {
+        return invalid("Config file must contain only the cookie field");
+    }
+    if (typeof parsed.cookie !== "string")
+        return invalid("Config cookie field must be a string");
+    return resolveCookie(parsed.cookie, path);
 }
-export function resolveMimoConfigFromEnv(env = process.env) {
-    if (env[MIMO_COOKIE_ENV] === undefined)
-        return null;
-    const cookie = normalizeMimoCookieHeader(env[MIMO_COOKIE_ENV] ?? "");
-    if (!cookie) {
-        return {
-            state: "invalid",
-            source: `env:${MIMO_COOKIE_ENV}`,
-            error: "Invalid cookie header",
-        };
-    }
-    return {
-        state: "configured",
-        config: { cookie },
-        source: `env:${MIMO_COOKIE_ENV}`,
-    };
-}
-export async function resolveMimoConfig() {
-    const envResult = resolveMimoConfigFromEnv();
-    if (envResult)
-        return envResult;
-    for (const path of getConfigCandidatePaths()) {
-        const fileResult = await readConfigFile(path);
-        if (fileResult.state === "missing")
-            continue;
-        if (fileResult.state === "invalid") {
-            return { state: "invalid", source: path, error: fileResult.error };
-        }
-        if (fileResult.keys.length !== 1 || fileResult.keys[0] !== "cookie") {
-            return {
-                state: "invalid",
-                source: path,
-                error: "Config file must contain only the cookie field",
-            };
-        }
-        if (typeof fileResult.cookie !== "string") {
-            return {
-                state: "invalid",
-                source: path,
-                error: "Config cookie field must be a string",
-            };
-        }
-        const cookie = normalizeMimoCookieHeader(fileResult.cookie);
-        if (!cookie) {
-            return { state: "invalid", source: path, error: "Invalid cookie header" };
-        }
-        return {
-            state: "configured",
-            config: { cookie },
-            source: path,
-        };
-    }
-    return { state: "none" };
+/** A set environment variable wins over the config file, even when it is invalid. */
+async function resolveMimoConfig() {
+    const envCookie = process.env[MIMO_COOKIE_ENV];
+    if (envCookie !== undefined)
+        return resolveCookie(envCookie, `env:${MIMO_COOKIE_ENV}`);
+    return resolveMimoConfigFile(getConfigPath());
 }
 let cachedConfig = null;
 let cachedAt = 0;
@@ -141,7 +109,7 @@ export async function getMimoConfigDiagnostics() {
         state: resolved.state,
         source: "source" in resolved ? resolved.source : null,
         error: "error" in resolved ? resolved.error : null,
-        checkedPaths: getConfigCandidatePaths(),
+        checkedPaths: [getConfigPath()],
     };
 }
 //# sourceMappingURL=mimo-config.js.map

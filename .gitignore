@@ -1,5 +1,7 @@
 # secrets / machine-local
 secrets.env
+secrets/
+opencode.jsonc
 *.bak
 .caveman-active
 
@@ -15,8 +17,13 @@ mcps/ghidra-mcp/runtime/
 mcps/ghidra-mcp/ghidra
 mcps/ghidra-mcp/source/target/
 mcps/ghidra-mcp/source/logs/
-mcps/cloakbrowser/runtime/node_modules/
 mcps/.component-updater-stage-*/
+plugins/ctf-skills/skills/
+plugins/reverse-skill/repo/
+plugins/rtk/bin/
+plugins/taste-skill/skills/
+plugins/*/node_modules/
+mcps/*/runtime/node_modules/
 
 # sdd scratch
 .superpowers/

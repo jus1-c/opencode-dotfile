@@ -36,17 +36,35 @@ def update():
     subprocess.run(["git", "-C", source, "remote", "add", "origin", REMOTE], check=True)
     subprocess.run(["git", "-C", source, "fetch", "--quiet", "--depth", "1", "origin", latest], check=True)
     subprocess.run(["git", "-C", source, "checkout", "--quiet", "--detach", "FETCH_HEAD"], check=True)
-    subprocess.run(["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false"], cwd=source, check=True)
+    # Upstream devDependencies conflict on solid-js: @opentui/solid pins 1.9.12
+    # while babel-preset-solid needs ^1.9.16. Only the build needs those, so
+    # accept the mismatch instead of failing the whole update.
+    subprocess.run([
+        "npm", "install", "--ignore-scripts", "--no-audit", "--no-fund",
+        "--package-lock=false", "--legacy-peer-deps",
+    ], cwd=source, check=True)
     subprocess.run(["npm", "run", "build"], cwd=source, check=True)
     for name in ["package.json", "README.md", "LICENSE", "dist"]:
         shutil.move(source / name, stage / name)
     package = json.loads((stage / "package.json").read_text())
-    plugin_version = package["devDependencies"].pop("@opencode-ai/plugin")
-    package.setdefault("dependencies", {})["@opencode-ai/plugin"] = plugin_version
+    # The built code imports @opencode/plugin, @opentui/solid, @opentui/core and
+    # solid-js at runtime, but upstream declares them as dev or peer dependencies.
+    # Promote each one to a pinned runtime dependency (dev pin wins) because npm
+    # resolves only production deps here. Dev and peer ranges are dropped after.
+    dev_dependencies = package.get("devDependencies") or {}
+    runtime_dependencies = package.get("peerDependencies") or {}
+    for name in runtime_dependencies:
+        package.setdefault("dependencies", {})[name] = dev_dependencies.get(name) or runtime_dependencies[name]
+    if "@opencode/plugin" not in (package.get("dependencies") or {}):
+        raise SystemExit("Quota package no longer declares @opencode/plugin; review staged runtime dependencies")
+    package.pop("devDependencies", None)
+    package.pop("peerDependencies", None)
+    package.pop("peerDependenciesMeta", None)
+    package.pop("scripts", None)
     (stage / "package.json").write_text(json.dumps(package, indent=2) + "\n")
     subprocess.run([
         "npm", "install", "--ignore-scripts", "--omit=dev", "--no-bin-links",
-        "--no-audit", "--no-fund", "--package-lock=false",
+        "--no-audit", "--no-fund", "--package-lock=false", "--legacy-peer-deps",
     ], cwd=stage, check=True)
     shutil.rmtree(stage / "node_modules/.bin", ignore_errors=True)
     shutil.rmtree(source)

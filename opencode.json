@@ -1,6 +1,7 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "snapshots": false,
+  "update": "auto",
   "mcp": {
     "servers": {
       "log-analyzer": {
@@ -113,15 +114,6 @@
         ],
         "disabled": false
       },
-      "codegraph": {
-        "type": "local",
-        "command": [
-          "codegraph",
-          "serve",
-          "--mcp"
-        ],
-        "disabled": false
-      },
       "markitdown": {
         "type": "local",
         "command": [
@@ -148,19 +140,6 @@
         },
         "disabled": true
       },
-      "headroom-memory": {
-        "type": "local",
-        "command": [
-          "{env:HOME}/.local/share/uv/tools/headroom-ai/bin/python",
-          "-m",
-          "headroom.memory.mcp_server",
-          "--db",
-          "{env:HOME}/.headroom/memory.db",
-          "--user",
-          "{env:USER}"
-        ],
-        "disabled": false
-      },
       "anysearch": {
         "type": "remote",
         "url": "https://api.anysearch.com/mcp",
@@ -175,49 +154,60 @@
         },
         "disabled": false
       },
-      "cloakbrowser": {
+      "agent-browser": {
         "type": "local",
         "command": [
           "node",
-          "{env:HOME}/.config/opencode/mcps/cloakbrowser/bin/launcher.js"
+          "{env:HOME}/.config/opencode/mcps/agent-browser/runtime/node_modules/agent-browser/bin/agent-browser.js",
+          "mcp"
         ],
         "timeout": {
           "startup": 300000,
           "catalog": 300000,
           "execution": 300000
         },
-        "environment": {
-          "PLAYWRIGHT_MCP_HEADLESS": "false",
-          "PLAYWRIGHT_MCP_OUTPUT_DIR": "/tmp/opencode/cloakbrowser-artifacts",
-          "PLAYWRIGHT_MCP_USER_DATA_DIR": "{env:HOME}/.local/state/opencode/cloakbrowser-profile"
+        "disabled": false
+      },
+      "github": {
+        "type": "remote",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "oauth": false,
+        "headers": {
+          "Authorization": "Bearer {env:GITHUB_TOKEN}",
+          "X-MCP-Toolsets": "default,actions"
+        },
+        "timeout": {
+          "startup": 300000,
+          "catalog": 300000,
+          "execution": 300000
         },
         "disabled": false
       },
-      "headroom-ctl": {
+      "codegraph": {
         "type": "local",
         "command": [
-          "node",
-          "{env:HOME}/.config/opencode/mcps/headroom-ctl/bin/headroom-ctl.js"
+          "codegraph",
+          "serve",
+          "--mcp"
         ],
-        "disabled": false
+        "disabled": false,
+        "codemode": false
       }
     }
   },
   "plugins": [
-    "file://{env:HOME}/.config/opencode/plugins/quota",
-    "file://{env:HOME}/.config/opencode/plugins/caveman/plugin.js",
-    "file://{env:HOME}/.config/opencode/plugins/headroom/dist/entry.opencode.js",
-    "file://{env:HOME}/.config/opencode/plugins/headroom-ctl/plugin.ts",
-    "file://{env:HOME}/.config/opencode/plugins/goal/node_modules/@prevalentware/opencode-goal-plugin",
-    "file://{env:HOME}/.config/opencode/plugins/llmgate-provider",
-    "file://{env:HOME}/.config/opencode/plugins/ponytail/node_modules/@dietrichgebert/ponytail",
-    "file://{env:HOME}/.config/opencode/plugins/rtk/plugin.ts",
-    "file://{env:HOME}/.config/opencode/plugins/opencode-pty/node_modules/opencode-pty",
-    "file://{env:HOME}/.config/opencode/plugins/opencode-dir/node_modules/opencode-dir",
-    "file://{env:HOME}/.config/opencode/plugins/opencode-md-table-formatter/node_modules/@franlol/opencode-md-table-formatter",
-    "file://{env:HOME}/.config/opencode/plugins/vilao-provider",
-    "file://{env:HOME}/.config/opencode/plugins/superpowers/.opencode/plugins/superpowers.js",
-    "file://{env:HOME}/.config/opencode/plugins/taste-skill"
+    "./plugins/quota",
+    "./plugins/caveman",
+    "./plugins/goal",
+    "./plugins/ponytail",
+    "./plugins/superpowers",
+    "./plugins/rtk",
+    "./plugins/opencode-dir",
+    "./plugins/opencode-mcp-manager",
+    "./plugins/opencode-pty",
+    "./plugins/vilao-provider",
+    "./plugins/llmgate-provider",
+    "./plugins/prompt-attachment-guard"
   ],
   "permissions": [
     {
@@ -237,6 +227,11 @@
     "vilao": {},
     "kirobot_claude": {
       "name": "KiroBot (Claude)",
+      "package": "aisdk:@ai-sdk/openai-compatible",
+      "settings": {
+        "apiKey": "{env:KIROBOT_CLAUDE_API_KEY}",
+        "baseURL": "https://api.xpiki.com/v1"
+      },
       "models": {
         "claude-opus-5": {
           "name": "Claude Opus 5",
@@ -246,14 +241,7 @@
             "output": 128000
           },
           "capabilities": {
-            "tools": true,
-            "input": [
-              "text",
-              "image"
-            ],
-            "reasoning": {
-              "supported": true
-            }
+            "tools": true
           },
           "variants": [
             {
@@ -296,14 +284,7 @@
             "output": 128000
           },
           "capabilities": {
-            "tools": true,
-            "input": [
-              "text",
-              "image"
-            ],
-            "reasoning": {
-              "supported": true
-            }
+            "tools": true
           },
           "variants": [
             {
@@ -346,14 +327,7 @@
             "output": 128000
           },
           "capabilities": {
-            "tools": true,
-            "input": [
-              "text",
-              "image"
-            ],
-            "reasoning": {
-              "supported": true
-            }
+            "tools": true
           },
           "variants": [
             {
@@ -396,14 +370,7 @@
             "output": 128000
           },
           "capabilities": {
-            "tools": true,
-            "input": [
-              "text",
-              "image"
-            ],
-            "reasoning": {
-              "supported": true
-            }
+            "tools": true
           },
           "variants": [
             {
@@ -446,15 +413,7 @@
             "output": 128000
           },
           "capabilities": {
-            "tools": true,
-            "temperature": true,
-            "input": [
-              "text",
-              "image"
-            ],
-            "reasoning": {
-              "supported": true
-            }
+            "tools": true
           },
           "variants": [
             {
@@ -491,15 +450,7 @@
             "output": 64000
           },
           "capabilities": {
-            "tools": true,
-            "temperature": true,
-            "input": [
-              "text",
-              "image"
-            ],
-            "reasoning": {
-              "supported": true
-            }
+            "tools": true
           }
         },
         "claude-fable-5": {
@@ -510,14 +461,7 @@
             "output": 128000
           },
           "capabilities": {
-            "tools": true,
-            "input": [
-              "text",
-              "image"
-            ],
-            "reasoning": {
-              "supported": true
-            }
+            "tools": true
           },
           "variants": [
             {
@@ -552,15 +496,15 @@
             }
           ]
         }
-      },
-      "package": "aisdk:@ai-sdk/openai-compatible",
-      "settings": {
-        "apiKey": "{env:KIROBOT_CLAUDE_API_KEY}",
-        "baseURL": "https://api.xpiki.com/v1"
       }
     },
     "kirobot_gpt": {
       "name": "KiroBot (GPT)",
+      "package": "aisdk:@ai-sdk/openai-compatible",
+      "settings": {
+        "apiKey": "{env:KIROBOT_GPT_API_KEY}",
+        "baseURL": "https://api.xpiki.com/v1"
+      },
       "models": {
         "gpt-6-astra": {
           "name": "GPT 6 Astra",
@@ -569,14 +513,7 @@
             "output": 128000
           },
           "capabilities": {
-            "tools": true,
-            "input": [
-              "text",
-              "image"
-            ],
-            "reasoning": {
-              "supported": true
-            }
+            "tools": true
           },
           "variants": [
             {
@@ -611,21 +548,14 @@
             }
           ]
         },
-        "gpt-5.6-sol": {
-          "name": "GPT 5.6 Sol",
+        "gpt-6-sol": {
+          "name": "GPT 6 Sol",
           "limit": {
             "context": 1000000,
             "output": 128000
           },
           "capabilities": {
-            "tools": true,
-            "input": [
-              "text",
-              "image"
-            ],
-            "reasoning": {
-              "supported": true
-            }
+            "tools": true
           },
           "variants": [
             {
@@ -660,70 +590,14 @@
             }
           ]
         },
-        "gpt-5.6-terra": {
-          "name": "GPT 5.6 Terra",
+        "gpt-6-luna": {
+          "name": "GPT 6 Luna",
           "limit": {
             "context": 1000000,
             "output": 128000
           },
           "capabilities": {
-            "tools": true,
-            "input": [
-              "text",
-              "image"
-            ],
-            "reasoning": {
-              "supported": true
-            }
-          },
-          "variants": [
-            {
-              "id": "low",
-              "settings": {
-                "reasoningEffort": "low"
-              }
-            },
-            {
-              "id": "medium",
-              "settings": {
-                "reasoningEffort": "medium"
-              }
-            },
-            {
-              "id": "high",
-              "settings": {
-                "reasoningEffort": "high"
-              }
-            },
-            {
-              "id": "xhigh",
-              "settings": {
-                "reasoningEffort": "xhigh"
-              }
-            },
-            {
-              "id": "max",
-              "settings": {
-                "reasoningEffort": "max"
-              }
-            }
-          ]
-        },
-        "gpt-5.6-luna": {
-          "name": "GPT 5.6 Luna",
-          "limit": {
-            "context": 1000000,
-            "output": 128000
-          },
-          "capabilities": {
-            "tools": true,
-            "input": [
-              "text",
-              "image"
-            ],
-            "reasoning": {
-              "supported": true
-            }
+            "tools": true
           },
           "variants": [
             {
@@ -758,12 +632,116 @@
             }
           ]
         }
-      },
+      }
+    },
+    "oxionai": {
+      "name": "Oxion AI",
       "package": "aisdk:@ai-sdk/openai-compatible",
       "settings": {
-        "apiKey": "{env:KIROBOT_GPT_API_KEY}",
-        "baseURL": "https://api.xpiki.com/v1"
+        "apiKey": "{env:OXIONAI_API_KEY}",
+        "baseURL": "https://oxionai.com/v1"
+      },
+      "models": {
+        "claude-opus-5.5": {
+          "name": "Claude Opus 5.5",
+          "limit": {
+            "context": 1000000,
+            "output": 128000
+          },
+          "capabilities": {
+            "tools": true
+          },
+          "variants": [
+            {
+              "id": "low",
+              "settings": {
+                "reasoningEffort": "low"
+              }
+            },
+            {
+              "id": "medium",
+              "settings": {
+                "reasoningEffort": "medium"
+              }
+            },
+            {
+              "id": "high",
+              "settings": {
+                "reasoningEffort": "high"
+              }
+            },
+            {
+              "id": "xhigh",
+              "settings": {
+                "reasoningEffort": "xhigh"
+              }
+            },
+            {
+              "id": "max",
+              "settings": {
+                "reasoningEffort": "max"
+              }
+            }
+          ]
+        }
       }
-    }
-  }
+    },
+    "fallback": {
+      "name": "Fallback",
+      "package": "aisdk:@ai-sdk/openai-compatible",
+      "settings": {
+        "apiKey": "{env:FALLBACK_API_KEY}",
+        "baseURL": "https://api.vilao.ai/v1"
+      },
+      "models": {
+        "chib/deepseek-v4.1-flash": {
+          "name": "chib/deepseek-v4.1-flash",
+          "limit": {
+            "context": 1000000,
+            "output": 128000
+          },
+          "capabilities": {
+            "tools": true
+          },
+          "variants": [
+            {
+              "id": "low",
+              "settings": {
+                "reasoningEffort": "low"
+              }
+            },
+            {
+              "id": "medium",
+              "settings": {
+                "reasoningEffort": "medium"
+              }
+            },
+            {
+              "id": "high",
+              "settings": {
+                "reasoningEffort": "high"
+              }
+            },
+            {
+              "id": "xhigh",
+              "settings": {
+                "reasoningEffort": "xhigh"
+              }
+            },
+            {
+              "id": "max",
+              "settings": {
+                "reasoningEffort": "max"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "openrouter": {}
+  },
+  "skills": [
+    "{env:HOME}/.config/opencode/plugins/taste-skill/skills",
+    "{env:HOME}/.config/opencode/plugins/reverse-skill/skills"
+  ]
 }

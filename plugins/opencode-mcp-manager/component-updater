@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""opencode-mcp-manager component-updater adapter.
+
+Managed by opencode-component-updater. Implements the contract from
+plugins/opencode-component-updater/README.md:
+
+  check        -> schema-1 result written to OPENCODE_UPDATER_CHECK_RESULT
+  update       -> build payload inside OPENCODE_UPDATER_STAGE only
+  healthcheck  -> validate staged payload before apply
+
+Source is GitHub. Set OPENCODE_MCP_MANAGER_GITHUB (e.g. jus1-c/opencode-mcp-manager)
+and optionally OPENCODE_MCP_MANAGER_GITHUB_BRANCH (default main).
+Falls back to a local git clone via OPENCODE_MCP_MANAGER_SOURCE.
+"""
+
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+GITHUB_REPO = os.environ.get(
+    "OPENCODE_MCP_MANAGER_GITHUB",
+    "jus1-c/opencode-mcp-manager" if not os.environ.get("OPENCODE_MCP_MANAGER_SOURCE") else None,
+)
+GITHUB_BRANCH = os.environ.get("OPENCODE_MCP_MANAGER_GITHUB_BRANCH", "main")
+SOURCE = (
+    Path(os.environ["OPENCODE_MCP_MANAGER_SOURCE"])
+    if os.environ.get("OPENCODE_MCP_MANAGER_SOURCE")
+    else None
+)
+TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
+PROVENANCE = ".component-updater-provenance.json"
+ENTRYPOINTS = ("dist/server.js", "dist/tui.js")
+BUILD_INPUTS = (
+    "package.json",
+    "bun.lock",
+    "tsconfig.json",
+    "tsconfig.build.json",
+    "src",
+)
+MANAGED_PATHS = ["package.json", "dist", PROVENANCE]
+
+
+def run(*command, cwd=None):
+    return subprocess.check_output(
+        [str(value) for value in command], cwd=cwd, text=True
+    ).strip()
+
+
+def source_head():
+    if GITHUB_REPO:
+        endpoint = "https://api.github.com/repos/" + GITHUB_REPO + "/commits/" + urllib.parse.quote(GITHUB_BRANCH, safe="")
+        request = urllib.request.Request(endpoint, headers={"Accept": "application/vnd.github+json", "User-Agent": "opencode-component-updater"})
+        token = os.environ.get("GITHUB_TOKEN")
+        if token:
+            request.add_header("Authorization", "Bearer " + token)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                sha = json.load(response).get("sha", "")
+        except Exception as error:
+            raise SystemExit(f"failed to resolve GitHub HEAD: {error}") from error
+        if len(sha) != 40:
+            raise SystemExit("failed to resolve GitHub HEAD commit")
+        return sha
+    if SOURCE is None:
+        raise SystemExit("OPENCODE_MCP_MANAGER_SOURCE is required without GitHub source")
+    commit = run("git", "-C", SOURCE, "rev-parse", "HEAD")
+    if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+        raise SystemExit("source repository HEAD is not a resolved commit")
+    return commit
+
+
+def _checkout_commit(commit):
+    """Shallow-fetch exact commit from GitHub into a temp directory."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="mcp-manager-"))
+    run("git", "init", cwd=tmpdir)
+    run("git", "remote", "add", "origin",
+        f"https://github.com/{GITHUB_REPO}.git", cwd=tmpdir)
+    run("git", "fetch", "--depth", "1", "origin", commit, cwd=tmpdir)
+    run("git", "checkout", "FETCH_HEAD", cwd=tmpdir)
+    return tmpdir
+
+
+def provenance(root=TARGET):
+    path = root / PROVENANCE
+    return json.loads(path.read_text()) if path.is_file() else None
+
+
+def entrypoints_present(root):
+    return all((root / relative).is_file() for relative in ENTRYPOINTS)
+
+
+def copy_safe_tree(source, destination):
+    info = source.lstat()
+    if stat.S_ISLNK(info.st_mode) or not (
+        stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
+    ):
+        raise SystemExit(f"unsupported source entry: {source}")
+    if stat.S_ISREG(info.st_mode):
+        if info.st_nlink > 1:
+            raise SystemExit(f"hardlinked source entry: {source}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        destination.chmod(stat.S_IMODE(info.st_mode))
+        return
+    destination.mkdir(parents=True, exist_ok=False)
+    destination.chmod(stat.S_IMODE(info.st_mode))
+    for child in sorted(source.iterdir(), key=lambda path: path.name):
+        copy_safe_tree(child, destination / child.name)
+
+
+def check():
+    latest = source_head()
+    installed = provenance()
+    if installed is None:
+        if any(path.name != Path(__file__).name for path in TARGET.iterdir()):
+            raise SystemExit(
+                "opencode-mcp-manager provenance is missing; refusing to replace unmanaged files"
+            )
+        current = "0.0.0"
+        status = "update-available"
+        summary = f"install {latest[:12]}"
+    else:
+        current = installed.get("commit", "0.0.0")
+        status = (
+            "current"
+            if current == latest and entrypoints_present(TARGET)
+            else "update-available"
+        )
+        summary = current if status == "current" else f"{current[:12]} -> {latest[:12]}"
+    result = {
+        "schemaVersion": 1,
+        "status": status,
+        "current": current,
+        "latest": latest,
+        "summary": summary,
+        "sourceCommit": latest,
+    }
+    Path(os.environ["OPENCODE_UPDATER_CHECK_RESULT"]).write_text(json.dumps(result) + "\n")
+
+
+def update():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    commit = os.environ["OPENCODE_UPDATER_SOURCE_COMMIT"]
+
+    if GITHUB_REPO:
+        source_dir = _checkout_commit(commit)
+        own_source_dir = True
+    else:
+        if SOURCE is None:
+            raise SystemExit("OPENCODE_MCP_MANAGER_SOURCE is required without GitHub source")
+        if source_head() != commit:
+            raise SystemExit("source repository HEAD does not match update plan")
+        source_dir = SOURCE
+        own_source_dir = False
+
+    try:
+        for relative in BUILD_INPUTS:
+            copy_safe_tree(source_dir / relative, stage / relative)
+
+        run("bun", "install", "--frozen-lockfile", cwd=stage)
+        run("bun", "run", "build", cwd=stage)
+        if not entrypoints_present(stage):
+            raise SystemExit("staged build is missing plugin entrypoints")
+
+        source_label = f"github:{GITHUB_REPO}" if GITHUB_REPO else str(SOURCE)
+        metadata = {
+            "schemaVersion": 1,
+            "commit": commit,
+            "source": source_label,
+        }
+        (stage / PROVENANCE).write_text(json.dumps(metadata, indent=2) + "\n")
+        manifest = {
+            "schemaVersion": 2,
+            "planSha256": os.environ["OPENCODE_UPDATER_PLAN_SHA256"],
+            "paths": MANAGED_PATHS,
+        }
+        Path(os.environ["OPENCODE_UPDATER_MANIFEST"]).write_text(json.dumps(manifest) + "\n")
+    finally:
+        if own_source_dir:
+            shutil.rmtree(source_dir, ignore_errors=True)
+
+
+def healthcheck():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    metadata = provenance(stage)
+    if metadata is None or metadata.get("commit") != os.environ["OPENCODE_UPDATER_SOURCE_COMMIT"]:
+        raise SystemExit("staged payload does not match update plan")
+    if not entrypoints_present(stage):
+        raise SystemExit("staged payload is missing plugin entrypoints")
+    package = json.loads((stage / "package.json").read_text())
+    if package.get("name") != "opencode-mcp-manager" or package.get("type") != "module":
+        raise SystemExit("staged package is invalid")
+    for relative in ENTRYPOINTS:
+        run("node", "--input-type=module", "-e", f"await import({json.dumps((stage / relative).as_uri())})")
+
+
+def main():
+    actions = {"check": check, "update": update, "healthcheck": healthcheck}
+    if len(sys.argv) != 2 or sys.argv[1] not in actions:
+        raise SystemExit("usage: component-updater check|update|healthcheck")
+    actions[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()

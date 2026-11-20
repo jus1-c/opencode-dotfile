@@ -26,7 +26,11 @@ cd "$(dirname "$0")/.."
 fail=0
 for p in "${PATTERNS[@]}"; do
   # --glob skips this script itself and docs that legitimately show the pattern syntax
-  hits=$(rg -n --hidden -g '!.git' -g '!scripts/verify-no-secrets.sh' -g '!.superpowers' -e "$p" . 2>/dev/null | rg -v '<you>' || true)
+  hits=$(rg -n --hidden -g '!.git' -g '!scripts/verify-no-secrets.sh' -g '!.superpowers' -g '!**/.bootstrap-*' -e "$p" . 2>/dev/null | rg -v '<you>' || true)
+  if [[ "$p" == '(?i)c:[\\\\/]users' ]]; then
+    # These vendored comments document generic example paths, not local user paths.
+    hits=$(printf '%s\n' "$hits" | rg -v '^(\./)?plugins/quota/dist/lib/home-dir-display\.js:[0-9]+:[[:space:]]+\*.*[Aa]lice|^(\./)?plugins/superpowers/skills/subagent-driven-development/scripts/sdd-workspace:[0-9]+:[[:space:]]*#.*C:/Users/\.\.\.' || true)
+  fi
   if [[ -n "$hits" ]]; then
     echo "LEAK pattern [$p]:"
     echo "$hits" | head -20

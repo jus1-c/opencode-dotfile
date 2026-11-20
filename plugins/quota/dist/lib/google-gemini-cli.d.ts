@@ -1,50 +1,13 @@
-import type { AuthData, GeminiCliAuthSourceKey, GeminiCliResult } from "./types.js";
-export declare const DEFAULT_GEMINI_CLI_AUTH_CACHE_MAX_AGE_MS = 5000;
-type RefreshParts = {
-    refreshToken: string;
-    projectId?: string;
-    managedProjectId?: string;
+import type { GoogleQuotaFlavor } from "./google-oauth-quota.js";
+import type { GeminiCliAuthSourceKey, GeminiCliQuotaBucket } from "./types.js";
+export declare const GEMINI_CLI_AUTH_KEYS: readonly ["google-gemini-cli", "gemini-cli", "opencode-gemini-auth", "gemini", "google"];
+export type RetrieveUserQuotaResponse = {
+    buckets?: {
+        remainingAmount?: string;
+        remainingFraction?: number;
+        resetTime?: string;
+        tokenType?: string;
+        modelId?: string;
+    }[];
 };
-export type GeminiCliAccount = {
-    sourceKey: GeminiCliAuthSourceKey;
-    refreshToken: string;
-    projectId: string;
-    email?: string;
-    accessToken?: string;
-    expiresAt?: number;
-};
-export type GeminiCliAuthPresence = {
-    state: "missing";
-    sourceKey?: undefined;
-    accountCount: 0;
-    validAccountCount: 0;
-} | {
-    state: "present";
-    sourceKey: GeminiCliAuthSourceKey;
-    accountCount: number;
-    validAccountCount: number;
-} | {
-    state: "invalid";
-    sourceKey?: GeminiCliAuthSourceKey;
-    accountCount: number;
-    validAccountCount: number;
-    error: string;
-};
-type ConfigClient = {
-    config?: {
-        get?: () => Promise<{
-            data?: unknown;
-        }>;
-    };
-};
-export declare function parseGeminiCliRefreshParts(refresh: string | undefined): RefreshParts;
-export declare function resolveGeminiCliAccounts(auth: AuthData | null | undefined, configuredProjectId?: string): GeminiCliAccount[];
-export declare function resolveGeminiCliConfiguredProjectId(client?: ConfigClient): Promise<string | undefined>;
-export declare function inspectGeminiCliAuthPresence(client?: ConfigClient): Promise<GeminiCliAuthPresence>;
-export declare function hasGeminiCliQuotaRuntimeAvailable(client?: ConfigClient): Promise<boolean>;
-export declare function queryGeminiCliQuota(client?: ConfigClient, options?: {
-    requestTimeoutMs?: number;
-}): Promise<GeminiCliResult>;
-export declare function clearGeminiCliRuntimeCacheForTests(): void;
-export {};
-//# sourceMappingURL=google-gemini-cli.d.ts.map
+export declare const GEMINI_CLI_FLAVOR: GoogleQuotaFlavor<GeminiCliAuthSourceKey, RetrieveUserQuotaResponse, GeminiCliQuotaBucket>;

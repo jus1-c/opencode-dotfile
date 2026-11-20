@@ -1,21 +1,21 @@
 /**
  * Error thrown when a session is not found.
  *
- * With OpenCode >=1.2, sessions/messages live in SQLite (`opencode.db`).
- * This is thrown by iterAssistantMessagesForSession when the database is
- * missing/unreadable, the session id is invalid, or the session row does
- * not exist.
+ * OpenCode 2 stores sessions and messages in SQLite (`opencode.db`) under the
+ * `session_v2` and `session_message` tables. This is thrown by
+ * iterAssistantMessagesForSession when the database is missing/unreadable, the
+ * session id is invalid, or the session row does not exist.
  */
 export declare class SessionNotFoundError extends Error {
     readonly sessionID: string;
     readonly checkedPath: string;
     constructor(sessionID: string, checkedPath: string);
 }
-export interface OpenCodeTokenCache {
+interface OpenCodeTokenCache {
     read: number;
     write: number;
 }
-export interface OpenCodeTokens {
+interface OpenCodeTokens {
     input: number;
     output: number;
     reasoning?: number;
@@ -28,13 +28,15 @@ export interface OpenCodeMessage {
     providerID?: string;
     modelID?: string;
     tokens?: OpenCodeTokens;
+    /** True when the stored message has token usage metadata, even when its values are all zero. */
+    hasUsageMetadata?: boolean;
+    /** OpenCode's structured assistant error type, e.g. `aborted` for an interrupted step. */
+    errorType?: string;
     cost?: number;
     time?: {
         created?: number;
         completed?: number;
     };
-    agent?: string;
-    mode?: string;
 }
 export interface OpenCodeSessionInfo {
     id: string;
@@ -45,16 +47,12 @@ export interface OpenCodeSessionInfo {
         updated?: number;
     };
 }
-export type OpenCodeDbStats = {
+type OpenCodeDbStats = {
     dbPath: string;
     sessionCount: number;
     messageCount: number;
     assistantMessageCount: number;
 };
-export declare function getOpenCodeDataDirCandidates(): string[];
-export declare function getOpenCodeDataDir(): string;
-export declare function getOpenCodeDbPathCandidates(): string[];
-export declare function getOpenCodeDbPath(): string;
 export declare function getOpenCodeDbStats(): Promise<OpenCodeDbStats>;
 export declare function iterAssistantMessages(params: {
     sinceMs?: number;
@@ -71,20 +69,18 @@ export declare function iterCompletedAssistantMessages(params: {
     completedUntilMs?: number;
 }): Promise<OpenCodeMessage[]>;
 /**
- * Read assistant messages for a specific session only.
+ * Reads the rows that used tokens, at most `pageSize` at a time so the caller can let other
+ * work run between pages: assistant messages and compactions that recorded usage, by creation
+ * time, without the copies a fork starts with. `role` is the row type ("assistant" or
+ * "compaction"). With `sessionIDs`, reads only those sessions, one after another.
  */
-export declare function iterAssistantMessagesForSession(params: {
-    sessionID: string;
+export declare function readUsageMessagePages(params: {
     sinceMs?: number;
     untilMs?: number;
-}): Promise<OpenCodeMessage[]>;
-/**
- * Read assistant messages for a specific set of sessions.
- */
-export declare function iterAssistantMessagesForSessions(params: {
-    sessionIDs: string[];
-    sinceMs?: number;
-    untilMs?: number;
-}): Promise<OpenCodeMessage[]>;
+    sessionIDs?: readonly string[];
+    pageSize: number;
+}): AsyncGenerator<OpenCodeMessage[]>;
 export declare function readAllSessionsIndex(): Promise<Record<string, OpenCodeSessionInfo>>;
-//# sourceMappingURL=opencode-storage.d.ts.map
+/** The ids of a session and all its subagent sessions, depth first, children oldest first. */
+export declare function resolveSessionTree(rootSessionID: string): Promise<string[]>;
+export {};

@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"time"
+	"strings"
+
+	"charm.land/lipgloss/v2"
 )
 
 func printStatus(value paths, out io.Writer) error {
@@ -22,77 +24,60 @@ func printStatus(value paths, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if exists {
-		fmt.Fprintf(out, "Config: %s\n", value.ConfigPath)
-	} else {
-		fmt.Fprintf(out, "Config: missing (%s)\n", value.ConfigPath)
-	}
-	fmt.Fprintf(out, "OpenCode processes: %d\n", len(processes))
-	fmt.Fprintf(out, "Journal: %s\n", fileState(value.JournalPath))
-	fmt.Fprintf(out, "Backups: %d\n", backupCount(value.BackupRoot))
-	if cached.SelfUpdate != nil {
-		printSelfUpdateStatus(out, *cached.SelfUpdate)
-	}
+	configState := value.ConfigPath
 	if !exists {
-		return nil
+		configState = "missing (" + value.ConfigPath + ")"
 	}
-	for _, id := range managedComponentIDs(value, loaded.Components) {
-		item := loaded.Components[id]
-		entry := cached.Components[componentKey(id, item)]
-		good := entry.LastGood
-		displayed := displayedCheck(entry)
-		status := "not checked"
-		summary := "Not checked"
-		if !item.Enabled {
-			status = "disabled"
-			summary = "Disabled"
-		} else if displayed != nil {
-			status = displayed.Status
-			summary = displayed.Summary
-		}
-		fmt.Fprintf(out, "\n%s\n  status: %s\n  summary: %s\n", id, status, summary)
-		if good != nil {
-			fmt.Fprintf(out, "  installed: %s\n  cached latest: %s\n  last good check: %s\n", fallback(good.Current, "unknown"), fallback(good.Latest, "unknown"), timestamp(good.CheckedAt))
-		}
-		if entry.LastAttempt != nil && (good == nil || entry.LastAttempt.CheckedAt != good.CheckedAt) {
-			fmt.Fprintf(out, "  last attempt: %s (%s)\n", timestamp(entry.LastAttempt.CheckedAt), entry.LastAttempt.Summary)
-		}
-		if entry.LastApplied != nil {
-			fmt.Fprintf(out, "  last applied: %s\n  last backup: %s\n", timestamp(entry.LastApplied.AppliedAt), fallback(entry.LastApplied.Backup, "none"))
+	sections := []string{strings.Join([]string{
+		statusField("Config", configState),
+		statusField("Processes", fmt.Sprint(len(processes))),
+		statusField("Live mode", liveModeLabel()),
+		statusField("Journal", fileState(value.JournalPath)),
+		statusField("Backups", fmt.Sprint(backupCount(value.BackupRoot))),
+	}, "\n")}
+	if cached.SelfUpdate != nil {
+		sections = append(sections, componentStatusBlock(selfUpdateComponentID, *cached.SelfUpdate))
+	}
+	if exists {
+		for _, id := range managedComponentIDs(value, loaded.Components) {
+			item := loaded.Components[id]
+			entry := cached.Components[componentKey(id, item)]
+			if !item.Enabled {
+				entry.LastGood = &checkResult{Status: "disabled", Summary: "Disabled"}
+			}
+			sections = append(sections, componentStatusBlock(id, entry))
 		}
 	}
+	writeStyled(out, panel("Component Status", strings.Join(sections, "\n"+dimStyle.Render(strings.Repeat("─", clamp(outputWidth(out)-8, 20, 88)))+"\n"), outputWidth(out), surface))
 	return nil
 }
 
-// displayedCheck prefers the last verified result but falls back to the most
-// recent attempt so a component whose first check failed is not shown as
-// "not checked".
-func displayedCheck(entry componentState) *checkResult {
-	if entry.LastGood != nil {
-		return entry.LastGood
-	}
-	return entry.LastAttempt
+func printSelfUpdateStatus(out io.Writer, entry componentState) {
+	writeStyled(out, componentStatusBlock(selfUpdateComponentID, entry))
 }
 
-func printSelfUpdateStatus(out io.Writer, entry componentState) {
+func componentStatusBlock(id string, entry componentState) string {
 	good := entry.LastGood
-	displayed := displayedCheck(entry)
 	status := "not checked"
 	summary := "Not checked"
-	if displayed != nil {
-		status = displayed.Status
-		summary = displayed.Summary
-	}
-	fmt.Fprintf(out, "\n%s\n  status: %s\n  summary: %s\n", selfUpdateComponentID, status, summary)
 	if good != nil {
-		fmt.Fprintf(out, "  installed: %s\n  cached latest: %s\n  last good check: %s\n", fallback(good.Current, "unknown"), fallback(good.Latest, "unknown"), timestamp(good.CheckedAt))
+		status = good.Status
+		summary = good.Summary
+	}
+	heading := componentStyle.Render(id) + "  " + statusBadge(status)
+	lines := []string{heading, labelStyle.Render(summary)}
+	if good != nil && good.Status != "disabled" {
+		current := displayVersion(fallback(good.Current, "unknown"))
+		latest := displayVersion(fallback(good.Latest, "unknown"))
+		lines = append(lines, statusField("Version", current+" → "+latest), statusField("Checked", humanTimestamp(good.CheckedAt)))
 	}
 	if entry.LastAttempt != nil && (good == nil || entry.LastAttempt.CheckedAt != good.CheckedAt) {
-		fmt.Fprintf(out, "  last attempt: %s (%s)\n", timestamp(entry.LastAttempt.CheckedAt), entry.LastAttempt.Summary)
+		lines = append(lines, statusField("Last attempt", humanTimestamp(entry.LastAttempt.CheckedAt)+" • "+entry.LastAttempt.Summary))
 	}
 	if entry.LastApplied != nil {
-		fmt.Fprintf(out, "  last applied: %s\n  last backup: %s\n", timestamp(entry.LastApplied.AppliedAt), fallback(entry.LastApplied.Backup, "none"))
+		lines = append(lines, statusField("Last applied", humanTimestamp(entry.LastApplied.AppliedAt)), statusField("Last backup", fallback(entry.LastApplied.Backup, "none")))
 	}
+	return strings.Join(lines, "\n")
 }
 
 func printDoctor(value paths, out io.Writer) error {
@@ -101,17 +86,20 @@ func printDoctor(value paths, out io.Writer) error {
 		return err
 	}
 	processes, processErr := findOpenCodeProcesses()
-	fmt.Fprintf(out, "config: %s\n", doctorState(exists, value.ConfigPath))
-	fmt.Fprintf(out, "state: %s\n", fileState(value.StatePath))
-	fmt.Fprintf(out, "journal: %s\n", fileState(value.JournalPath))
-	fmt.Fprintf(out, "binary directory in PATH: %t\n", pathContainsExecutable())
-	fmt.Fprintf(out, "updater plugin directory: %s\n", doctorState(fileState(value.PluginRoot) == "present", value.PluginRoot))
+	lines := []string{
+		doctorLine(exists, "config", doctorState(exists, value.ConfigPath)),
+		doctorLine(fileState(value.StatePath) == "present", "state", fileState(value.StatePath)),
+		doctorLine(fileState(value.JournalPath) == "present", "journal", fileState(value.JournalPath)),
+		doctorLine(pathContainsExecutable(), "binary in PATH", fmt.Sprint(pathContainsExecutable())),
+		doctorLine(fileState(value.PluginRoot) == "present", "updater plugin", doctorState(fileState(value.PluginRoot) == "present", value.PluginRoot)),
+		doctorLine(detectLiveService().Reload, "live reload", liveModeLabel()),
+	}
 	if processErr != nil {
-		fmt.Fprintf(out, "opencode processes: error: %v\n", processErr)
+		lines = append(lines, "", doctorLine(false, "OpenCode processes", processErr.Error()))
 	} else {
-		fmt.Fprintf(out, "opencode processes: %d\n", len(processes))
+		lines = append(lines, "", labelStyle.Render(fmt.Sprintf("OpenCode processes: %d", len(processes))))
 		for _, process := range processes {
-			fmt.Fprintf(out, "  pid %d: %s\n", process.PID, fallback(process.Executable, process.Command))
+			lines = append(lines, fmt.Sprintf("  %s  %s", componentStyle.Render(fmt.Sprintf("pid %-7d", process.PID)), dimStyle.Render(fallback(process.Executable, process.Command))))
 		}
 	}
 	if exists {
@@ -123,15 +111,30 @@ func printDoctor(value paths, out io.Writer) error {
 			}
 			info, err := os.Stat(*item.Target)
 			if err != nil {
-				fmt.Fprintf(out, "component %s target: error: %v\n", id, err)
+				lines = append(lines, doctorLine(false, id, "target: "+err.Error()))
 				continue
 			}
 			if !info.IsDir() {
-				fmt.Fprintf(out, "component %s target: not a directory\n", id)
+				lines = append(lines, doctorLine(false, id, "target is not a directory"))
+			} else {
+				lines = append(lines, doctorLine(true, id, "target ok"))
 			}
 		}
 	}
+	writeStyled(out, panel("Doctor", strings.Join(lines, "\n"), outputWidth(out), surface))
 	return nil
+}
+
+func statusField(label, value string) string {
+	return fmt.Sprintf("%-13s %s", labelStyle.Render(label), bodyStyle.Render(value))
+}
+
+func doctorLine(ok bool, label, detail string) string {
+	symbol, color := "✗", red
+	if ok {
+		symbol, color = "✓", green
+	}
+	return lipgloss.NewStyle().Bold(true).Foreground(color).Render(symbol) + "  " + fmt.Sprintf("%-16s %s", labelStyle.Render(label), bodyStyle.Render(detail))
 }
 
 func backupCount(root string) int {
@@ -181,11 +184,16 @@ func fallback(value, defaultValue string) string {
 	return value
 }
 
-func timestamp(value int64) string {
-	if value <= 0 {
-		return "never"
+// liveModeLabel describes whether component changes can be applied without a
+// restart.
+func liveModeLabel() string {
+	if service := detectLiveService(); service.Reload {
+		return "live reload (OpenCode " + service.Version + ")"
 	}
-	return time.UnixMilli(value).UTC().Format(time.RFC3339)
+	if allowRunning || os.Getenv("OPENCODE_COMPONENT_UPDATER_ALLOW_RUNNING") == "1" {
+		return "forced (--allow-running)"
+	}
+	return "requires OpenCode exit"
 }
 
 func sortedStrings(values []string) []string {

@@ -35,6 +35,9 @@ type defaults struct {
 	CheckTimeoutMS     int `json:"checkTimeoutMs"`
 	UpdateTimeoutMS    int `json:"updateTimeoutMs"`
 	MaxOutputBytes     int `json:"maxOutputBytes"`
+	CheckConcurrency   int `json:"checkConcurrency"`
+	StageConcurrency   int `json:"stageConcurrency"`
+	ArchiveConcurrency int `json:"archiveConcurrency"`
 }
 
 type config struct {
@@ -44,27 +47,32 @@ type config struct {
 }
 
 type component struct {
-	Scope   string  `json:"scope"`
-	Kind    string  `json:"kind"`
-	Name    string  `json:"name"`
-	Target  *string `json:"target"`
+	Scope   string  `json:"scope,omitempty"`
+	Kind    string  `json:"kind,omitempty"`
+	Name    string  `json:"name,omitempty"`
+	Target  *string `json:"target,omitempty"`
 	Enabled bool    `json:"enabled"`
 	Source  struct {
-		Mode string `json:"mode"`
-	} `json:"source"`
+		Mode  string `json:"mode,omitempty"`
+		Type  string `json:"type,omitempty"`
+		URL   string `json:"url,omitempty"`
+		Name  string `json:"name,omitempty"`
+		Track string `json:"track,omitempty"`
+		Path  string `json:"path,omitempty"`
+	} `json:"source,omitempty"`
 	Policy struct {
-		Apply          string   `json:"apply"`
-		Dirty          string   `json:"dirty"`
-		AllowedPaths   []string `json:"allowedPaths"`
-		ProtectedPaths []string `json:"protectedPaths"`
-	} `json:"policy"`
+		Apply          string   `json:"apply,omitempty"`
+		Dirty          string   `json:"dirty,omitempty"`
+		AllowedPaths   []string `json:"allowedPaths,omitempty"`
+		ProtectedPaths []string `json:"protectedPaths,omitempty"`
+	} `json:"policy,omitempty"`
 	Check struct {
-		Command []string `json:"command"`
-	} `json:"check"`
+		Command []string `json:"command,omitempty"`
+	} `json:"check,omitempty"`
 	Update struct {
-		Command     []string `json:"command"`
-		Healthcheck []string `json:"healthcheck"`
-	} `json:"update"`
+		Command     []string `json:"command,omitempty"`
+		Healthcheck []string `json:"healthcheck,omitempty"`
+	} `json:"update,omitempty"`
 }
 
 type sourceInfo struct {
@@ -72,15 +80,16 @@ type sourceInfo struct {
 	Name    string `json:"name,omitempty"`
 	URL     string `json:"url,omitempty"`
 	Root    string `json:"root,omitempty"`
+	Path    string `json:"path,omitempty"`
+	Install string `json:"install,omitempty"`
+	Track   string `json:"track,omitempty"`
 	Current string `json:"current,omitempty"`
 	Dirty   bool   `json:"dirty,omitempty"`
 }
 
-// artifactInfo pins a published release download so apply cannot silently use a
-// different build than the one the check resolved.
 type artifactInfo struct {
-	URL       string `json:"url,omitempty"`
-	Integrity string `json:"integrity,omitempty"`
+	URL       string `json:"url"`
+	Integrity string `json:"integrity"`
 }
 
 type checkResult struct {
@@ -91,11 +100,9 @@ type checkResult struct {
 	Latest            string        `json:"latest,omitempty"`
 	Source            *sourceInfo   `json:"source,omitempty"`
 	Artifact          *artifactInfo `json:"artifact,omitempty"`
-	// SourceCommit is provenance only. Registry releases are identified by their
-	// published version and artifact, never by this commit.
-	SourceCommit      string `json:"sourceCommit,omitempty"`
-	SourceFingerprint string `json:"sourceFingerprint,omitempty"`
-	ConfigFingerprint string `json:"configFingerprint,omitempty"`
+	SourceCommit      string        `json:"sourceCommit,omitempty"`
+	SourceFingerprint string        `json:"sourceFingerprint,omitempty"`
+	ConfigFingerprint string        `json:"configFingerprint,omitempty"`
 }
 
 type appliedRecord struct {
@@ -126,7 +133,7 @@ func resolvePaths() (paths, error) {
 	configHome := envOr("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	stateHome := envOr("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
 	opencodeRoot := envOr("OPENCODE_CONFIG_DIR", filepath.Join(configHome, "opencode"))
-	configPath := envOr("OPENCODE_COMPONENT_UPDATER_CONFIG", filepath.Join(opencodeRoot, "component-updater", "components.json"))
+  configPath := envOr("OPENCODE_COMPONENT_UPDATER_CONFIG", filepath.Join(configHome, "opencode-component-updater", "components.json"))
 	stateRoot := envOr("OPENCODE_COMPONENT_UPDATER_STATE_DIR", filepath.Join(stateHome, "opencode", "component-updater"))
 	pluginRoot := envOr("OPENCODE_COMPONENT_UPDATER_PLUGIN_DIR", filepath.Join(opencodeRoot, "plugins", "opencode-component-updater"))
 
@@ -179,6 +186,9 @@ func defaultDefaults() defaults {
 		CheckTimeoutMS:     60_000,
 		UpdateTimeoutMS:    1_800_000,
 		MaxOutputBytes:     65_536,
+		CheckConcurrency:   16,
+		StageConcurrency:   8,
+		ArchiveConcurrency: 4,
 	}
 }
 
@@ -212,9 +222,31 @@ func normalizeConfig(input config) (config, error) {
 	if output.Defaults.MaxOutputBytes <= 0 {
 		output.Defaults.MaxOutputBytes = fallback.MaxOutputBytes
 	}
+	for _, item := range []struct {
+		value    *int
+		fallback int
+	}{
+		{&output.Defaults.CheckConcurrency, fallback.CheckConcurrency},
+		{&output.Defaults.StageConcurrency, fallback.StageConcurrency},
+		{&output.Defaults.ArchiveConcurrency, fallback.ArchiveConcurrency},
+	} {
+		if *item.value <= 0 {
+			*item.value = item.fallback
+		}
+	}
 	for id, item := range output.Components {
-		if id == "" || item.Name == "" {
-			return config{}, fmt.Errorf("component id and name are required")
+		kind, name, found := strings.Cut(id, ".")
+		if !found || name == "" {
+			return config{}, fmt.Errorf("component id must be kind.name: %s", id)
+		}
+		if item.Kind == "" {
+			item.Kind = kind
+		}
+		if item.Name == "" {
+			item.Name = name
+		}
+		if item.Kind != kind || item.Name != name {
+			return config{}, fmt.Errorf("component %s identity conflicts with its id", id)
 		}
 		if item.Kind != "mcp" && item.Kind != "plugin" {
 			return config{}, fmt.Errorf("component %s must have kind mcp or plugin", id)
@@ -225,11 +257,49 @@ func normalizeConfig(input config) (config, error) {
 		if item.Scope == "" {
 			item.Scope = "global"
 		}
-		if item.Source.Mode == "" {
-			item.Source.Mode = "auto"
+		if item.Source.Mode == "auto" {
+			item.Source.Mode = ""
+		}
+		if item.Source.Type != "" && item.Source.Type != "git" && item.Source.Type != "npm" && item.Source.Type != "pypi" && item.Source.Type != "script" {
+			return config{}, fmt.Errorf("component %s has unsupported source type", id)
+		}
+		if item.Source.Track == "" && item.Source.Type == "git" {
+			item.Source.Track = "release"
+		}
+		if item.Source.Track != "" && item.Source.Track != "release" && item.Source.Track != "head" {
+			return config{}, fmt.Errorf("component %s has unsupported Git track", id)
+		}
+		if item.Source.Path != "" {
+			if _, err := normalizeRelativePath(item.Source.Path); err != nil {
+				return config{}, fmt.Errorf("component %s source path: %w", id, err)
+			}
+		}
+		if item.Source.Type == "git" && item.Source.URL == "" {
+			return config{}, fmt.Errorf("component %s Git source requires url", id)
+		}
+		if item.Source.Type != "git" && item.Source.Track != "" {
+			return config{}, fmt.Errorf("component %s track is only valid for Git", id)
+		}
+		if item.Source.Type != "git" && item.Source.URL != "" {
+			return config{}, fmt.Errorf("component %s url is only valid for Git", id)
+		}
+		if item.Source.Type != "npm" && item.Source.Type != "pypi" && item.Source.Name != "" {
+			return config{}, fmt.Errorf("component %s source name is only valid for npm/PyPI", id)
+		}
+		if item.Source.Type == "git" && item.Source.Path == "" {
+			return config{}, fmt.Errorf("component %s Git source requires path", id)
+		}
+		if (item.Source.Type == "npm" || item.Source.Type == "pypi") && item.Source.Name == "" {
+			return config{}, fmt.Errorf("component %s %s source requires name", id, item.Source.Type)
+		}
+		if item.Source.Type != "" && (len(item.Check.Command) > 0 || len(item.Update.Command) > 0 || len(item.Update.Healthcheck) > 0) {
+			return config{}, fmt.Errorf("component %s cannot mix source type with legacy commands", id)
 		}
 		if item.Policy.Apply == "" {
 			item.Policy.Apply = "manual"
+			if item.Source.Type != "" {
+				item.Policy.Apply = "manifest"
+			}
 		}
 		if item.Policy.Apply != "manifest" && item.Policy.Apply != "manual" && item.Policy.Apply != "none" {
 			return config{}, fmt.Errorf("component %s has unsupported apply policy", id)
@@ -473,7 +543,7 @@ func componentFingerprint(item component) string {
 }
 
 func sourceFingerprint(source sourceInfo) string {
-	return hashBytes([]byte(strings.Join([]string{source.Type, source.Name, source.URL, source.Root}, "\x00")))
+	return hashBytes([]byte(strings.Join([]string{source.Type, source.Name, source.URL, source.Root, source.Path, source.Install, source.Track}, "\x00")))
 }
 
 func hashBytes(value []byte) string {

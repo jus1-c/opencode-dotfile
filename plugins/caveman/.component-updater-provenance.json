@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "remote": "https://github.com/JuliusBrussee/caveman.git",
-  "version": "2.7.0",
-  "commit": "8b0c1d3699b8d83e87fe4605b378da20c41555e0",
+  "version": "4.1.0",
+  "commit": "1e91f1306d602d4ca23618701b1185575ae1869b",
   "links": [
     "commands/caveman-commit.md",
     "commands/caveman-compress.md",
@@ -10,13 +10,17 @@
     "commands/caveman-review.md",
     "commands/caveman-stats.md",
     "commands/caveman.md",
+    "commands/megacave.md",
+    "commands/ultracave.md",
     "skills/cavecrew",
     "skills/caveman",
     "skills/caveman-commit",
     "skills/caveman-compress",
     "skills/caveman-help",
     "skills/caveman-review",
-    "skills/caveman-stats"
+    "skills/caveman-stats",
+    "skills/megacave",
+    "skills/ultracave"
   ],
   "excludedInstallerRoots": [
     "agents"

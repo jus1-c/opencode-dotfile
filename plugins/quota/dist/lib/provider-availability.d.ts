@@ -5,19 +5,8 @@ export declare function isAnyProviderIdAvailable(params: {
     candidateIds: readonly string[];
     fallbackOnError: boolean;
 }): Promise<boolean>;
-export declare function isAnyProviderIdWithModelsAvailable(params: {
-    ctx: Pick<QuotaProviderContext, "client">;
-    candidateIds: readonly string[];
-    fallbackOnError: boolean;
-}): Promise<boolean>;
 export declare function isCanonicalProviderAvailable(params: {
     ctx: Pick<QuotaProviderContext, "resolveRuntimeProviderIds">;
     providerId: CanonicalQuotaProviderId;
     fallbackOnError: boolean;
 }): Promise<boolean>;
-export declare function isCanonicalProviderWithModelsAvailable(params: {
-    ctx: Pick<QuotaProviderContext, "client">;
-    providerId: CanonicalQuotaProviderId;
-    fallbackOnError: boolean;
-}): Promise<boolean>;
-//# sourceMappingURL=provider-availability.d.ts.map

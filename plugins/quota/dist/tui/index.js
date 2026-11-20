@@ -1,0 +1,294 @@
+import { memo as _$memo } from "@opentui/solid";
+import { createComponent as _$createComponent } from "@opentui/solid";
+/** @jsxImportSource @opentui/solid */
+/**
+ * OpenCode Quota's TUI plugin. It draws the server's quota snapshot: the Quota panel in the
+ * session sidebar, the status line under the message box (and on Home when turned on), the
+ * toasts, and the quota window that `/quota`, `/quota_usage`, `/quota_status` and
+ * `/quota_settings` open above the message box (`window/`).
+ * It reads all settings through the quota RPC; plugin storage keeps only the sidebar state.
+ *
+ * The quota slash commands typed in the prompt run in the TUI: on Enter, before OpenCode submits
+ * the prompt, a prompt that starts with /quota, /quota_usage, /quota_status or /quota_settings is
+ * cleared and runs its TUI action with the rest of the prompt as its arguments. So no report
+ * shows in the chat, and on Home no session is created for one. The "/" list names each once:
+ * the server lists /quota, /quota_usage and /quota_status, the TUI /quota_settings.
+ * The 4.x and 5.x names run here too: each /tokens_* opens the Usage tab on its range while
+ * `system.oldCommands` is on (the server lists them then), and names its /quota_usage range while
+ * it is off (an open TUI's "/" list keeps them until OpenCode restarts).
+ */
+import { Plugin } from "@opencode/plugin/tui";
+import { getOwner, onCleanup, Show } from "solid-js";
+import { OLD_USAGE_COMMANDS, parseUsageArguments } from "../core/usage-ranges.js";
+import { QuotaRpc } from "../rpc.js";
+import { createQuotaClient, ownFolderEvents, quotaCallOptions, reportFailure } from "./client.js";
+import { createFileDisplay } from "./display.js";
+import { KEY_LAYERS } from "./key-layers.js";
+import { createServerSettings } from "./server-settings.js";
+import { SidebarPanel } from "./sidebar.js";
+import { HomeFooter, StatusLine, statusLineShows } from "./status-line.js";
+import { createToastShow } from "./toast-colors.js";
+import { createToasts, TOAST_TITLE } from "./toasts.js";
+import { listenForTurns } from "./turn-events.js";
+import { createSettingsEditor } from "./window/settings.js";
+import { createQuotaWindow } from "./window/shell.js";
+
+/** What the plugin needs from OpenCode's TUI context, besides the window's needs. */
+
+const plugin = Plugin.define({
+  // OpenCode names this plugin's storage files after its id (`plugin.<id>.<key>.json`), so the
+  // id may hold only letters, digits, ".", "_" and "-".
+  id: "slkiser.opencode-quota",
+  setup(context) {
+    const api = context;
+    // Plugin storage is first read when a surface draws, never during setup.
+    const server = createServerSettings({
+      settings: () => api.client.rpc(QuotaRpc).settings({}, quotaCallOptions(api)),
+      saveSettings: input => api.client.rpc(QuotaRpc).saveSettings(input, quotaCallOptions(api))
+    });
+    const display = createFileDisplay(server);
+    let sidebarStore;
+    const sidebarState = () => {
+      sidebarStore ??= api.storage.store("sidebar", {
+        initial: {
+          open: true
+        }
+      });
+      return sidebarStore;
+    };
+    const isChildSession = sessionID => Boolean(api.data.session.get(sessionID)?.parentID);
+    let conversionShown = false;
+    // `client`, `location` and `data` are read from OpenCode's context at each use, never copied.
+    const quotaHost = {
+      get client() {
+        return api.client;
+      },
+      get location() {
+        return api.location;
+      },
+      get data() {
+        return api.data;
+      },
+      acceptsEventFrom: ownFolderEvents(api)
+    };
+    const quota = createQuotaClient(quotaHost, snapshot => {
+      const current = quota.snapshot()?.settings;
+      if (current) server.receive(current);
+      toasts.showResetNotices(snapshot);
+      if (snapshot.settingsConverted && !conversionShown) {
+        conversionShown = true;
+        api.ui.toast.show({
+          variant: "info",
+          title: TOAST_TITLE,
+          message: "Your 4.x or 5.x settings are now in settings.jsonc, details in /quota_status",
+          duration: 15_000
+        });
+      }
+    });
+    /** The app slot's Solid owner while it is mounted: colored toasts are made under it. */
+    let appOwner;
+    const showToast = createToastShow({
+      show: toast => api.ui.toast.show(toast),
+      theme: () => api.theme,
+      display: display.shown,
+      owner: () => appOwner,
+      root: () => api.renderer.root
+    });
+    const toasts = createToasts({
+      show: showToast,
+      display: display.shown,
+      terminalWidth: () => api.renderer.width,
+      quota,
+      isChildSession
+    });
+    const settings = createSettingsEditor(api, display, toasts);
+    const host = {
+      theme: () => api.theme,
+      display: display.shown,
+      quota,
+      editing: settings
+    };
+    const quotaWindow = createQuotaWindow(api, host, settings);
+    /** `/quota_usage [range]`: the Usage tab, on the typed range or Today; a wrong range says why. */
+    const openUsage = argumentsText => {
+      const parsed = parseUsageArguments(argumentsText);
+      if (parsed.ok) quotaWindow.openUsage(parsed);else api.ui.toast.show({
+        variant: "warning",
+        title: TOAST_TITLE,
+        message: parsed.error
+      });
+    };
+    /** A 4.x or 5.x `/tokens_*` command: `/quota_usage` on its range, or a hint while off. */
+    const oldUsage = (range, argumentsText) => {
+      if (server.value("system.oldCommands") === true) {
+        openUsage(`${range} ${argumentsText}`.trim());
+        return;
+      }
+      const now = range === "between" ? "between YYYY-MM-DD YYYY-MM-DD" : range;
+      api.ui.toast.show({
+        variant: "info",
+        title: TOAST_TITLE,
+        message: `Use /quota_usage ${now}. The old /tokens_* names turn on in /quota_status.`
+      });
+    };
+    const quotaCommands = {
+      quota: () => quotaWindow.open("limits"),
+      quota_usage: openUsage,
+      quota_status: () => quotaWindow.open("system"),
+      quota_settings: () => quotaWindow.open("settings"),
+      ...Object.fromEntries(Object.entries(OLD_USAGE_COMMANDS).map(([name, range]) => [name, argumentsText => oldUsage(range, argumentsText)]))
+    };
+    let disposeMount;
+    const disposeApp = api.ui.slot({
+      append: "app",
+      render: () => {
+        // OpenCode mounts this slot again when it reconnects to its server, which can also
+        // happen right after it starts. Leaving a mount drops its keymap layers and event
+        // listeners, so each mount stops the last one's and registers everything again.
+        disposeMount?.();
+        const owner = getOwner() ?? undefined;
+        appOwner = owner;
+        const stopQuota = quota.start();
+        // Load settings on Home too, including switches for otherwise hidden surfaces.
+        queueMicrotask(() => {
+          try {
+            quota.watch()();
+          } catch (error) {
+            reportFailure(error);
+          }
+        });
+        api.keymap.layer(() => ({
+          mode: "global",
+          commands: [{
+            id: "quota.limits",
+            title: "Quota limits",
+            group: "OpenCode Quota",
+            palette: true,
+            run: () => quotaWindow.open("limits")
+          }, {
+            id: "quota.usage",
+            title: "Quota usage: tokens and API cost",
+            group: "OpenCode Quota",
+            palette: true,
+            run: () => quotaWindow.open("usage")
+          }, {
+            id: "quota.status",
+            title: "Quota status report",
+            group: "OpenCode Quota",
+            palette: true,
+            run: () => quotaWindow.open("system")
+          }, {
+            id: "quota.settings",
+            title: "Quota: settings",
+            group: "OpenCode Quota",
+            palette: true,
+            // The server lists /quota, /quota_usage and /quota_status; this one is TUI-only.
+            slash: {
+              name: "quota_settings"
+            },
+            run: () => quotaWindow.open("settings")
+          }]
+        }));
+        // The typed quota commands. Above OpenCode's textarea layer, which submits the prompt on
+        // Enter; without a mode, so it is off while the "/" list or a dialog is open.
+        api.keymap.layer(() => ({
+          priority: KEY_LAYERS.typedCommand,
+          commands: [{
+            bind: "return",
+            // Synchronous on purpose: a returned promise counts as handled.
+            run: () => {
+              const editor = api.renderer.currentFocusedEditor;
+              const trimmed = editor?.plainText.trim() ?? "";
+              if (!editor || !trimmed.startsWith("/")) return false;
+              // As in OpenCode, the command name ends at the first whitespace.
+              const name = trimmed.slice(1).split(/\s/, 1)[0] ?? "";
+              if (!Object.hasOwn(quotaCommands, name)) return false;
+              editor.clear();
+              quotaCommands[name](trimmed.slice(1 + name.length).trim());
+            }
+          }]
+        }));
+        const stopTurns = listenForTurns((type, handler) => api.data.on(type, handler), {
+          afterTurn: (trigger, sessionID) => {
+            void toasts.afterTurn(trigger, sessionID).catch(reportFailure);
+          },
+          stepEnded: sessionID => {
+            if (!isChildSession(sessionID)) void quota.refresh("turn", sessionID);
+          }
+        });
+        let disposed = false;
+        const dispose = () => {
+          if (disposed) return;
+          disposed = true;
+          if (disposeMount === dispose) disposeMount = undefined;
+          if (appOwner === owner) appOwner = undefined;
+          stopQuota();
+          toasts.cancel();
+          stopTurns();
+        };
+        disposeMount = dispose;
+        onCleanup(dispose);
+        return null;
+      }
+    });
+    const disposeSidebar = api.ui.slot({
+      append: "sidebar.content",
+      render: props => {
+        const [state, update] = sidebarState();
+        return _$createComponent(SidebarPanel, {
+          host: host,
+          get sessionID() {
+            return props.sessionID;
+          },
+          open: () => state.open,
+          setOpen: open => {
+            void update(draft => {
+              draft.open = open;
+            }).catch(reportFailure);
+          }
+        });
+      }
+    });
+    const disposePrompt = api.ui.slot({
+      append: "prompt.footer",
+      // Home has a message box too; Home's status line sits in its own footer instead.
+      render: props => _$createComponent(Show, {
+        get when() {
+          return _$memo(() => !!props.sessionID)() && statusLineShows(host);
+        },
+        get children() {
+          return _$createComponent(StatusLine, {
+            host: host,
+            get sessionID() {
+              return props.sessionID;
+            },
+            terminalWidth: () => api.renderer.width
+          });
+        }
+      })
+    });
+    const disposeHome = api.ui.slot({
+      append: "home.footer.status",
+      render: () => _$createComponent(HomeFooter, {
+        host: host
+      })
+    });
+    const disposeWindow = api.ui.slot({
+      append: "session.composer.top",
+      render: props => _$createComponent(quotaWindow.Slot, {
+        get sessionID() {
+          return props.sessionID;
+        }
+      })
+    });
+    return () => {
+      disposeMount?.();
+      disposeApp();
+      disposeSidebar();
+      disposePrompt();
+      disposeHome();
+      disposeWindow();
+    };
+  }
+});
+export default plugin;

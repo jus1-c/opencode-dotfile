@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+TARGET = Path(os.environ.get("OPENCODE_UPDATER_TARGET", Path(__file__).parent))
+REMOTE = "https://github.com/ljagiello/ctf-skills.git"
+PROVENANCE = ".component-updater-provenance.json"
+SKILLS = [
+    "ctf-pwn",
+    "ctf-reverse",
+    "ctf-forensics",
+    "ctf-malware",
+    "solve-challenge",
+    "ctf-writeup",
+]
+EXTRA_DIRS = ["scripts"]
+EXTRA_FILES = ["LICENSE"]
+MANAGED_PATHS = ["skills", PROVENANCE]
+UNINSTALLED_ENTRIES = {Path(__file__).name, "scope.zsh"}
+
+
+def run(*command, cwd=None):
+    return subprocess.check_output([str(value) for value in command], cwd=cwd, text=True).strip()
+
+
+def head_commit():
+    return run("git", "ls-remote", REMOTE, "HEAD").split()[0]
+
+
+def provenance(root=TARGET):
+    path = root / PROVENANCE
+    return json.loads(path.read_text()) if path.is_file() else None
+
+
+def is_uninstalled_target():
+    return {path.name for path in TARGET.iterdir()} <= UNINSTALLED_ENTRIES
+
+
+def copy_safe_tree(source, destination):
+    info = source.lstat()
+    if stat.S_ISLNK(info.st_mode) or (not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode)):
+        raise SystemExit(f"unsupported source entry: {source}")
+    if stat.S_ISREG(info.st_mode):
+        if info.st_nlink > 1:
+            raise SystemExit(f"hardlinked source entry: {source}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        destination.chmod(stat.S_IMODE(info.st_mode))
+        return
+    destination.mkdir(parents=True, exist_ok=False)
+    destination.chmod(stat.S_IMODE(info.st_mode))
+    for child in sorted(source.iterdir(), key=lambda path: path.name):
+        copy_safe_tree(child, destination / child.name)
+
+
+def assert_clean_tree(root):
+    for path in sorted(root.rglob("*")):
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise SystemExit(f"symbolic entry: {path}")
+        if not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode):
+            raise SystemExit(f"unsupported entry: {path}")
+        if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+            raise SystemExit(f"hardlinked entry: {path}")
+
+
+def frontmatter_name(skill_md):
+    with open(skill_md) as handle:
+        for line in handle:
+            if line.startswith("name:"):
+                return line.split(":", 1)[1].strip().strip("'\"")
+            if line.strip() and not line.startswith("---") and ":" not in line:
+                break
+    return None
+
+
+def verify_payload(root):
+    skills_root = root / "skills"
+    for name in SKILLS:
+        skill_md = skills_root / name / "SKILL.md"
+        if not skill_md.is_file():
+            raise SystemExit(f"missing SKILL.md for {name}")
+        if frontmatter_name(skill_md) != name:
+            raise SystemExit(f"frontmatter name mismatch for {name}")
+    for name in EXTRA_DIRS:
+        if not (skills_root / name).is_dir():
+            raise SystemExit(f"missing support directory: {name}")
+    if not (skills_root / "scripts" / "install_ctf_tools.sh").is_file():
+        raise SystemExit("missing scripts/install_ctf_tools.sh")
+    for name in EXTRA_FILES:
+        if not (skills_root / name).is_file():
+            raise SystemExit(f"missing support file: {name}")
+    assert_clean_tree(skills_root)
+
+
+def check():
+    commit = head_commit()
+    installed = provenance()
+    if installed is None:
+        if not is_uninstalled_target():
+            raise SystemExit("ctf-skills provenance is missing; refusing to replace unmanaged files")
+        current = "0" * 40
+        status = "update-available"
+        summary = "install latest"
+    else:
+        current = installed.get("commit")
+        if not isinstance(current, str) or len(current) != 40:
+            raise SystemExit("ctf-skills provenance has no commit")
+        status = "current" if current == commit else "update-available"
+        summary = current if status == "current" else f"{current[:12]} -> {commit[:12]}"
+    result = {
+        "schemaVersion": 1,
+        "status": status,
+        "current": current,
+        "latest": commit,
+        "summary": summary,
+        "sourceCommit": commit,
+    }
+    Path(os.environ["OPENCODE_UPDATER_CHECK_RESULT"]).write_text(json.dumps(result) + "\n")
+
+
+def update():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    commit = os.environ["OPENCODE_UPDATER_SOURCE_COMMIT"]
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "source"
+        subprocess.run(["git", "init", "--quiet", source], check=True)
+        subprocess.run(["git", "-C", source, "remote", "add", "origin", REMOTE], check=True)
+        subprocess.run(["git", "-C", source, "fetch", "--quiet", "--depth", "1", "origin", commit], check=True)
+        subprocess.run(["git", "-C", source, "checkout", "--quiet", "--detach", "FETCH_HEAD"], check=True)
+        if run("git", "-C", source, "rev-parse", "HEAD") != commit:
+            raise SystemExit("checked out ctf-skills commit does not match update plan")
+        skills_stage = stage / "skills"
+        for name in SKILLS:
+            copy_safe_tree(source / name, skills_stage / name)
+        for name in EXTRA_DIRS:
+            copy_safe_tree(source / name, skills_stage / name)
+        for name in EXTRA_FILES:
+            copy_safe_tree(source / name, skills_stage / name)
+    verify_payload(stage)
+    metadata = {
+        "schemaVersion": 1,
+        "remote": REMOTE,
+        "commit": commit,
+        "skills": SKILLS,
+    }
+    (stage / PROVENANCE).write_text(json.dumps(metadata, indent=2) + "\n")
+    manifest = {
+        "schemaVersion": 2,
+        "planSha256": os.environ["OPENCODE_UPDATER_PLAN_SHA256"],
+        "paths": MANAGED_PATHS,
+    }
+    Path(os.environ["OPENCODE_UPDATER_MANIFEST"]).write_text(json.dumps(manifest) + "\n")
+
+
+def healthcheck():
+    stage = Path(os.environ["OPENCODE_UPDATER_STAGE"])
+    metadata = provenance(stage)
+    if metadata is None or metadata.get("commit") != os.environ["OPENCODE_UPDATER_SOURCE_COMMIT"]:
+        raise SystemExit("staged ctf-skills payload does not match update plan")
+    if metadata.get("remote") != REMOTE:
+        raise SystemExit("staged ctf-skills provenance remote is unexpected")
+    verify_payload(stage)
+
+
+def main():
+    actions = {"check": check, "update": update, "healthcheck": healthcheck}
+    if len(sys.argv) != 2 or sys.argv[1] not in actions:
+        raise SystemExit("usage: component-updater check|update|healthcheck")
+    actions[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()

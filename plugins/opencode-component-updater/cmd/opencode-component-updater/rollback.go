@@ -14,7 +14,9 @@ import (
 	"sort"
 	"strings"
 
+	"charm.land/bubbles/v2/list"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 type backupChoice struct {
@@ -256,6 +258,9 @@ func extractArchive(archive, destination string) error {
 		if err != nil {
 			return err
 		}
+		if err := assertNoSymlinkParents(destination, path); err != nil {
+			return fmt.Errorf("unsafe archive path %s: %w", relative, err)
+		}
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(path, 0o700); err != nil {
@@ -281,6 +286,16 @@ func extractArchive(archive, destination string) error {
 			if closeErr != nil {
 				return closeErr
 			}
+		case tar.TypeSymlink:
+			if header.Linkname == "" {
+				return fmt.Errorf("empty archive symlink: %s", header.Name)
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				return err
+			}
+			if err := os.Symlink(header.Linkname, path); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("unsupported archive entry: %s", header.Name)
 		}
@@ -288,14 +303,33 @@ func extractArchive(archive, destination string) error {
 }
 
 type backupSelectorModel struct {
-	choices  []backupChoice
-	cursor   int
+	list     list.Model
 	selected *backupChoice
 	err      error
+	width    int
+	height   int
 }
 
 func selectBackupTUI(choices []backupChoice) (backupChoice, error) {
-	model := backupSelectorModel{choices: choices}
+	items := make([]list.Item, len(choices))
+	for index, choice := range choices {
+		items[index] = backupListItem{choice}
+	}
+	delegate := list.NewDefaultDelegate()
+	delegate.Styles.NormalTitle = componentStyle
+	delegate.Styles.NormalDesc = dimStyle
+	delegate.Styles.SelectedTitle = lipgloss.NewStyle().Bold(true).Foreground(mauve).BorderLeft(true).BorderStyle(lipgloss.ThickBorder()).BorderForeground(mauve).PaddingLeft(1)
+	delegate.Styles.SelectedDesc = lipgloss.NewStyle().Foreground(subtext).BorderLeft(true).BorderStyle(lipgloss.ThickBorder()).BorderForeground(mauve).PaddingLeft(1)
+	selector := list.New(items, delegate, 72, 18)
+	selector.Title = "Backups"
+	selector.SetShowTitle(false)
+	selector.SetStatusBarItemName("backup", "backups")
+	selector.Styles.StatusBar = dimStyle
+	selector.Styles.PaginationStyle = dimStyle
+	selector.Styles.HelpStyle = helpStyle
+	selector.Styles.ActivePaginationDot = lipgloss.NewStyle().Foreground(mauve)
+	selector.Styles.InactivePaginationDot = dimStyle
+	model := backupSelectorModel{list: selector, width: 80, height: 24}
 	final, err := tea.NewProgram(model, tea.WithOutput(os.Stderr)).Run()
 	if err != nil {
 		return backupChoice{}, err
@@ -315,37 +349,50 @@ func (model backupSelectorModel) Init() tea.Cmd {
 }
 
 func (model backupSelectorModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
-	if key, ok := message.(tea.KeyPressMsg); ok {
+	switch typed := message.(type) {
+	case tea.WindowSizeMsg:
+		model.width = typed.Width
+		model.height = typed.Height
+		model.resize()
+		return model, nil
+	case tea.KeyPressMsg:
+		key := typed
 		switch key.String() {
-		case "up", "k":
-			if model.cursor > 0 {
-				model.cursor--
-			}
-		case "down", "j":
-			if model.cursor < len(model.choices)-1 {
-				model.cursor++
-			}
 		case "enter":
-			selected := model.choices[model.cursor]
-			model.selected = &selected
-			return model, tea.Quit
+			if item, ok := model.list.SelectedItem().(backupListItem); ok {
+				selected := item.backupChoice
+				model.selected = &selected
+				return model, tea.Quit
+			}
 		case "q", "esc", "ctrl+c":
+			if model.list.SettingFilter() {
+				break
+			}
 			model.err = errors.New("rollback cancelled")
 			return model, tea.Quit
 		}
 	}
-	return model, nil
+	var command tea.Cmd
+	model.list, command = model.list.Update(message)
+	return model, command
 }
 
 func (model backupSelectorModel) View() tea.View {
-	lines := []string{"Select backup to restore", ""}
-	for index, choice := range model.choices {
-		marker := " "
-		if index == model.cursor {
-			marker = ">"
-		}
-		lines = append(lines, fmt.Sprintf("%s %s  %s -> %s  %s", marker, choice.Metadata.ComponentID, choice.Metadata.From, choice.Metadata.To, timestamp(choice.Metadata.CreatedAt)))
-	}
-	lines = append(lines, "", "up/down: select    enter: restore    q: exit")
-	return tea.NewView(strings.Join(lines, "\n") + "\n")
+	return tea.NewView(panel("Select Backup to Restore", model.list.View(), model.panelWidth(), surface) + "\n")
+}
+
+func (model backupSelectorModel) panelWidth() int {
+	return clamp(model.width-2, 20, 100)
+}
+
+func (model *backupSelectorModel) resize() {
+	model.list.SetSize(clamp(model.panelWidth()-6, 16, 94), clamp(model.height-8, 8, 24))
+}
+
+type backupListItem struct{ backupChoice }
+
+func (item backupListItem) Title() string       { return item.Metadata.ComponentID }
+func (item backupListItem) FilterValue() string { return item.Metadata.ComponentID }
+func (item backupListItem) Description() string {
+	return fmt.Sprintf("%s → %s  •  %s", item.Metadata.From, item.Metadata.To, humanTimestamp(item.Metadata.CreatedAt))
 }
